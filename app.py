@@ -2,128 +2,57 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
 
-st.set_page_config(page_title="TQQQ QUANT", page_icon="📊", layout="centered")
-
-st.title("📊 TQQQ QUANT")
-st.caption("TQQQ 분할매수 전략을 계산·검증하는 교육용 도구")
-
-investment = st.number_input("💰 투자금액 (원)", min_value=100000, value=10000000, step=100000)
-
-strategy = st.selectbox(
-    "📌 매매 전략",
-    ["5% 낙폭 분할매수", "7% 낙폭 분할매수", "10% 낙폭 분할매수"]
-)
-
-@st.cache_data(ttl=900)
-def get_data():
-    d = yf.download(["TQQQ","QQQ"], period="max", auto_adjust=True, progress=False)["Close"]
-    return d.dropna()
-
-def calc_rsi(s, n=14):
-    delta = s.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - 100/(1+rs)
-
+st.set_page_config(page_title='TQQQ / 코코레 QUANT', page_icon='📈')
+st.title('📈 TQQQ / 코코레 QUANT')
+st.caption('낙폭 단계 + 현재 보유금액 기준 추가매수 계산')
+market = st.radio('시장 선택',['🇺🇸 미국장 — TQQQ','🇰🇷 한국장 — 코코레'],horizontal=True)
+if '🇺🇸' in market:
+    symbol, reference, currency = 'TQQQ','QQQ','$'
+    amount = st.number_input('총 투자금 (USD)',min_value=0.0,value=10000.0,step=500.0)
+else:
+    symbol, reference, currency = '233740.KS','229200.KS','원'
+    amount = st.number_input('총 투자금 (KRW)',min_value=0.0,value=10000000.0,step=100000.0)
+strategy=st.selectbox('낙폭 단계',['5% 간격','7% 간격','10% 간격'])
+step={'5% 간격':.05,'7% 간격':.07,'10% 간격':.10}[strategy]
+@st.cache_data(ttl=1800)
+def load_data(ticker):
+    df=yf.download(ticker,period='max',auto_adjust=False,progress=False)
+    if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.get_level_values(0)
+    return df.dropna()
 try:
-    data = get_data()
-    data["MA200"] = data["QQQ"].rolling(200).mean()
-    data["RSI"] = calc_rsi(data["QQQ"])
-    data["PEAK"] = data["TQQQ"].cummax()
-    data["DD"] = data["TQQQ"] / data["PEAK"] - 1
-
-    x = data.iloc[-1]
-    tqqq = float(x["TQQQ"])
-    qqq = float(x["QQQ"])
-    ma200 = float(x["MA200"])
-    rsi = float(x["RSI"])
-    dd = float(x["DD"])
-
-    c1, c2 = st.columns(2)
-    c1.metric("TQQQ", f"${tqqq:,.2f}")
-    c2.metric("고점 대비", f"{dd:.1%}")
-
-    c3, c4 = st.columns(2)
-    c3.metric("QQQ", f"${qqq:,.2f}")
-    c4.metric("QQQ RSI", f"{rsi:.1f}")
-
-    trend = qqq > ma200
-    st.info("🟢 QQQ 200일선 위 — 상승 추세" if trend else "🔴 QQQ 200일선 아래 — 매수 중단 구간")
-
-    step = {"5% 낙폭 분할매수": 0.05, "7% 낙폭 분할매수": 0.07, "10% 낙폭 분할매수": 0.10}[strategy]
-    level = int(max(0, np.floor(abs(dd) / step)))
-    # 단계별 목표 비중: 1단계 20%, 2단계 40% ... 최대 100%
-    weight = min(level * 0.20, 1.0) if dd <= -step else 0.0
-    if not trend:
-        weight = 0.0
-    if rsi >= 75:
-        weight *= 0.5
-
-    buy_amount = investment * weight
-    next_level = -(level + 1) * step
-    next_price = tqqq * (1 + (next_level - dd)) if level >= 0 else tqqq * (1-step)
-
-    st.divider()
-    st.subheader("🎯 현재 판단")
-
-    if not trend:
-        st.error("🔴 매수 중단 — QQQ가 200일선 아래입니다.")
-    elif weight == 0:
-        st.warning(f"🔵 관망 — 다음 매수 기준은 고점 대비 {step:.0%} 이상 하락입니다.")
-    elif weight <= 0.4:
-        st.success(f"🟢 1차/초기 분할매수 구간")
-    else:
-        st.success(f"🟢 추가 분할매수 구간")
-
-    a,b = st.columns(2)
-    a.metric("현재 목표 투자비중", f"{weight:.0%}")
-    b.metric("계산상 매수금액", f"{buy_amount:,.0f}원")
-
-    st.write(f"**다음 단계 기준:** 고점 대비 약 {next_level:.0%}")
-    st.caption(f"다음 기준 가격은 단순 계산값이며 실제 주문가격을 의미하지 않습니다.")
-
-    st.divider()
-    st.subheader("📈 간단 백테스트")
-
-    # 선택 전략의 낙폭 단계 전략을 과거에 적용
-    d = data.copy()
-    d["trend"] = d["QQQ"] > d["MA200"]
-    d["level"] = np.floor(np.maximum(0, -d["DD"]) / step)
-    d["weight"] = np.minimum(d["level"] * 0.20, 1.0)
-    d.loc[~d["trend"], "weight"] = 0
-    d.loc[d["RSI"] >= 75, "weight"] *= 0.5
-    d.loc[d["MA200"].isna(), "weight"] = 0
-
-    ret = d["TQQQ"].pct_change().fillna(0)
-    d["strategy_ret"] = d["weight"].shift(1).fillna(0) * ret
-    d["strategy_value"] = investment * (1 + d["strategy_ret"]).cumprod()
-    d["hold_value"] = investment * (1 + ret).cumprod()
-
-    peak = d["strategy_value"].cummax()
-    mdd = (d["strategy_value"] / peak - 1).min()
-    years = max((d.index[-1]-d.index[0]).days / 365.25, 1/365.25)
-    cagr = (d["strategy_value"].iloc[-1] / investment) ** (1/years) - 1
-    hold_cagr = (d["hold_value"].iloc[-1] / investment) ** (1/years) - 1
-
-    a,b,c = st.columns(3)
-    a.metric("퀀트 CAGR", f"{cagr:.1%}")
-    b.metric("TQQQ 보유 CAGR", f"{hold_cagr:.1%}")
-    c.metric("퀀트 MDD", f"{mdd:.1%}")
-
-    st.line_chart(d[["strategy_value","hold_value"]].rename(columns={
-        "strategy_value":"퀀트 전략", "hold_value":"TQQQ 단순보유"
-    }))
-
-    with st.expander("⚠️ 꼭 읽어주세요"):
-        st.write(
-            "이 도구는 교육·백테스트용입니다. 레버리지 ETF인 TQQQ는 큰 손실과 높은 변동성이 발생할 수 있습니다. "
-            "백테스트 결과가 미래 수익을 보장하지 않으며, 세금·환율·수수료·슬리피지 등은 충분히 반영되지 않습니다. "
-            "자동주문 기능은 포함하지 않습니다."
-        )
-
+    lev,ref=load_data(symbol),load_data(reference)
+    if lev.empty or ref.empty: st.error('데이터를 불러오지 못했습니다.'); st.stop()
+    lev['PEAK']=lev['Close'].cummax(); lev['DD']=lev['Close']/lev['PEAK']-1
+    ref['MA200']=ref['Close'].rolling(200).mean()
+    d=ref['Close'].diff(); gain=d.clip(lower=0).rolling(14).mean(); loss=(-d.clip(upper=0)).rolling(14).mean()
+    rs=gain/loss.replace(0,np.nan); ref['RSI']=100-(100/(1+rs))
+    latest,r=lev.iloc[-1],ref.iloc[-1]
+    price,peak,dd=float(latest['Close']),float(latest['PEAK']),float(latest['DD'])
+    ma200,rsi=float(r['MA200']),float(r['RSI'])
+    stage=max(0,int(np.floor(abs(dd)/step+1e-9))); target_weight=min(stage*.20,1.0)
+    if not np.isnan(ma200) and float(r['Close'])<ma200: target_weight=0.0
+    if not np.isnan(rsi) and rsi>=75: target_weight*=.5
+    target_amount=amount*target_weight
+    st.subheader('현재 상태'); c1,c2=st.columns(2); c1.metric('현재 가격',f'{price:,.2f} {currency}'); c2.metric('고점 대비 낙폭',f'{dd*100:.2f}%')
+    c3,c4=st.columns(2); c3.metric('RSI(14)',f'{rsi:.1f}'); c4.metric('200일선',f'{ma200:,.2f}')
+    st.divider(); st.subheader('💰 실제 매수 계산')
+    held=st.number_input(f'현재 보유금액 ({currency})',min_value=0.0,max_value=float(amount),value=0.0,step=500.0 if currency=='$' else 100000.0)
+    additional=max(0.0,target_amount-held)
+    a,b=st.columns(2); a.metric('목표 투자금',f'{target_amount:,.0f} {currency}'); b.metric('추가 매수금액',f'{additional:,.0f} {currency}')
+    if additional>0: st.success(f'🟢 현재 기준 추가 매수: {additional:,.0f} {currency}')
+    else: st.warning('🟡 현재 목표 비중을 이미 충족했습니다. 추가 매수 없음')
+    st.divider(); st.subheader('📊 낙폭별 매수 단계')
+    rows=[]
+    for i in range(1,6):
+        level=-step*i; weight=min(i*.20,1.0); threshold=peak*(1+level)
+        rows.append({'단계':i,'낙폭':f'{level*100:.0f}%','목표비중':f'{weight*100:.0f}%','목표금액':f'{amount*weight:,.0f} {currency}','해당 가격':f'{threshold:,.2f} {currency}'})
+    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+    st.info('같은 낙폭에 머무르는 날에는 현재 보유금액을 기준으로 중복 매수하지 않습니다. 더 큰 낙폭 단계로 내려가 목표금액이 증가할 때만 추가 매수금액이 생깁니다.')
+    st.subheader('📌 오늘의 판단')
+    if target_weight==0: st.error('⛔ 목표 투자비중 0% — 매수 대기')
+    elif additional>0: st.success(f'🟢 목표 투자비중 {target_weight*100:.0f}% — {additional:,.0f} {currency} 추가 매수 가능')
+    else: st.warning('🟡 목표 투자비중은 충족 — 추가 매수 없음')
+    st.caption('교육/백테스트용입니다. 실제 주문을 자동 실행하지 않습니다. 세금·수수료·환율·슬리피지는 별도입니다.')
 except Exception as e:
-    st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 실행해 주세요.")
-    st.exception(e)
+    st.error('데이터 처리 중 오류가 발생했습니다.'); st.caption(str(e))
