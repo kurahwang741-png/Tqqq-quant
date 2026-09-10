@@ -2,6 +2,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from datetime import date
+from io import StringIO
 
 st.set_page_config(
     page_title="TQQQ / 코코레 QUANT V7",
@@ -619,23 +621,155 @@ try:
             )
 
     # ------------------------------------------------------------
+    # 실제 운용 기록
+    # ------------------------------------------------------------
+    st.divider()
+    st.subheader("🗂️ 실제 매매 기록")
+    st.caption(
+        "매수·매도 기록으로 보유 차수와 평균단가를 자동 계산합니다. "
+        "Streamlit Cloud 재부팅에 대비해 아래 CSV 백업을 보관해 주세요."
+    )
+
+    if "live_trades" not in st.session_state:
+        st.session_state.live_trades = []
+
+    uploaded_log = st.file_uploader(
+        "기존 매매기록 CSV 불러오기",
+        type=["csv"],
+        key="trade_log_upload",
+    )
+
+    if uploaded_log is not None:
+        upload_key = (uploaded_log.name, uploaded_log.size)
+        if st.session_state.get("loaded_trade_log") != upload_key:
+            try:
+                restored = pd.read_csv(uploaded_log)
+                needed = {"날짜", "구분", "가격", "금액"}
+                if needed.issubset(restored.columns):
+                    st.session_state.live_trades = restored.to_dict("records")
+                    st.session_state.loaded_trade_log = upload_key
+                    st.success("매매기록을 불러왔습니다.")
+                else:
+                    st.error("CSV 형식이 맞지 않습니다.")
+            except Exception as ex:
+                st.error(f"매매기록을 읽지 못했습니다: {ex}")
+
+    trade_log = pd.DataFrame(st.session_state.live_trades)
+
+    # 현재 보유상태 자동 계산
+    live_qty = 0.0
+    live_cost = 0.0
+    live_buys = 0
+
+    if not trade_log.empty:
+        for _, rec in trade_log.iterrows():
+            side = str(rec.get("구분", ""))
+            px = float(rec.get("가격", 0) or 0)
+            amount = float(rec.get("금액", 0) or 0)
+
+            if side == "매수" and px > 0 and amount > 0:
+                live_qty += amount / px
+                live_cost += amount
+                live_buys += 1
+            elif side == "전량매도":
+                live_qty = 0.0
+                live_cost = 0.0
+                live_buys = 0
+
+    auto_avg_price = live_cost / live_qty if live_qty > 0 else 0.0
+    auto_stage = min(live_buys, tranche_count)
+
+    log1, log2, log3 = st.columns(3)
+    log1.metric("자동 보유 차수", f"{auto_stage}차")
+    log2.metric(
+        "자동 평균단가",
+        f"{currency}{auto_avg_price:,.2f}" if live_qty > 0 else "-",
+    )
+    log3.metric("투입금액", f"{currency}{live_cost:,.0f}")
+
+    with st.expander("➕ 매수/매도 기록 입력", expanded=False):
+        record_date = st.date_input("거래일", value=date.today())
+        record_price = st.number_input(
+            f"실제 체결가격 ({unit})",
+            min_value=0.0,
+            value=float(best_df["TRADE"].iloc[-1]),
+            step=1.0 if currency == "$" else 10.0,
+            key="record_price",
+        )
+        default_amount = float(investment) / tranche_count
+        record_amount = st.number_input(
+            f"매수금액 ({unit})",
+            min_value=0.0,
+            value=default_amount,
+            step=100.0 if currency == "$" else 10000.0,
+            key="record_amount",
+        )
+
+        b1, b2 = st.columns(2)
+
+        if b1.button("🟢 매수 기록", use_container_width=True):
+            if auto_stage >= tranche_count:
+                st.warning("설정한 분할매수 횟수를 이미 모두 사용했습니다.")
+            elif record_price <= 0 or record_amount <= 0:
+                st.warning("체결가격과 매수금액을 입력해 주세요.")
+            else:
+                st.session_state.live_trades.append(
+                    {
+                        "날짜": str(record_date),
+                        "구분": "매수",
+                        "가격": float(record_price),
+                        "금액": float(record_amount),
+                    }
+                )
+                st.rerun()
+
+        if b2.button("🔴 전량매도 기록", use_container_width=True):
+            if live_qty <= 0:
+                st.warning("현재 기록상 보유 수량이 없습니다.")
+            elif record_price <= 0:
+                st.warning("매도 체결가격을 입력해 주세요.")
+            else:
+                proceeds = live_qty * float(record_price)
+                st.session_state.live_trades.append(
+                    {
+                        "날짜": str(record_date),
+                        "구분": "전량매도",
+                        "가격": float(record_price),
+                        "금액": float(proceeds),
+                    }
+                )
+                st.rerun()
+
+    trade_log = pd.DataFrame(st.session_state.live_trades)
+
+    if not trade_log.empty:
+        st.dataframe(trade_log, use_container_width=True, hide_index=True)
+
+        csv_bytes = trade_log.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "💾 매매기록 CSV 백업",
+            data=csv_bytes,
+            file_name="quant_trade_log.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        if st.button("🗑️ 매매기록 전체 초기화", use_container_width=True):
+            st.session_state.live_trades = []
+            st.session_state.pop("loaded_trade_log", None)
+            st.rerun()
+
+    # ------------------------------------------------------------
     # 오늘의 실제 매매 신호
     # ------------------------------------------------------------
     st.divider()
     st.subheader("🚦 오늘의 매매 신호")
     st.caption(
-        "1위 전략 기준입니다. 오늘 처음 시작하면 과거 여러 차수가 이미 충족돼도 "
-        "한 번에 1차수만 안내합니다."
+        "1위 전략 기준입니다. 위 실제 매매 기록에서 보유 차수와 평균단가를 자동으로 읽습니다. "
+        "오늘 처음 시작하면 과거 여러 차수가 이미 충족돼도 한 번에 1차수만 안내합니다."
     )
 
-    live_stage = st.number_input(
-        "현재 실제 보유 차수",
-        min_value=0,
-        max_value=tranche_count,
-        value=0,
-        step=1,
-        help="오늘 처음 시작이면 0",
-    )
+    live_stage = auto_stage
 
     latest = best_df.iloc[-1]
     signal_price = float(latest["SIGNAL"])
@@ -647,14 +781,7 @@ try:
     live_trend_ok = bool(latest["TREND_OK"])
     tranche_budget = float(investment) / tranche_count
 
-    avg_buy_price = None
-    if live_stage > 0:
-        avg_buy_price = st.number_input(
-            f"현재 실제 매수 ETF 평균단가 ({unit})",
-            min_value=0.0,
-            value=float(trade_price),
-            step=1.0 if currency == "$" else 10.0,
-        )
+    avg_buy_price = auto_avg_price if live_stage > 0 else None
 
     filter_ok = entry_allowed(latest, best_use_ma, best_rsi)
 
