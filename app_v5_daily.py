@@ -4,13 +4,13 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V6",
+    page_title="TQQQ / 코코레 QUANT V7",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / 코코레 QUANT V6")
-st.caption("일봉 전용 · 낙폭 분할매수 + 추세/RSI 필터 자동 비교 + 오늘의 매매 신호")
+st.title("📈 TQQQ / 코코레 QUANT V7")
+st.caption("일봉 전용 · 신호 ETF와 실제 매수 ETF 분리 비교 + 추세/RSI 필터 + 오늘의 신호")
 
 market = st.radio(
     "시장",
@@ -19,21 +19,19 @@ market = st.radio(
 )
 
 if market.startswith("🇺🇸"):
-    asset = "TQQQ"
-    ref = "QQQ"
     currency = "$"
+    unit = "달러"
     default_investment = 10000.0
     min_investment = 1000.0
     step_investment = 1000.0
-    unit = "달러"
+    default_tps = [0.10, 0.15, 0.20]
 else:
-    asset = "233740.KS"
-    ref = "229200.KS"
     currency = "₩"
+    unit = "원"
     default_investment = 10_000_000.0
     min_investment = 100_000.0
     step_investment = 100_000.0
-    unit = "원"
+    default_tps = [0.05, 0.10, 0.15]
 
 investment = st.number_input(
     f"💰 초기 투자금액 ({unit})",
@@ -42,9 +40,7 @@ investment = st.number_input(
     step=step_investment,
 )
 
-st.info(
-    "분봉은 사용하지 않습니다. 모든 백테스트와 매수·익절 판단은 일봉 종가 기준입니다."
-)
+st.info("모든 계산은 일봉 종가 기준입니다. 장중 체결가격과는 차이가 날 수 있습니다.")
 
 with st.expander("⚙️ 백테스트 설정", expanded=False):
     anchor_mode = st.selectbox(
@@ -62,8 +58,8 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
 
     take_profits = st.multiselect(
         "비교할 익절률",
-        [0.05, 0.10, 0.15, 0.20, 0.25, 0.30],
-        default=[0.10, 0.15, 0.20],
+        [0.05, 0.07, 0.10, 0.15, 0.20, 0.25, 0.30],
+        default=default_tps,
         format_func=lambda x: f"{x:.0%}",
     )
 
@@ -76,7 +72,7 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
     )
 
     st.markdown("**필터 자동 비교**")
-    use_ma_candidates = st.checkbox("QQQ/코스닥150 200일선 필터 비교", value=True)
+    use_ma_candidates = st.checkbox("200일선 필터 비교", value=True)
     use_rsi_candidates = st.checkbox("RSI 필터 비교", value=True)
 
     rsi_thresholds = st.multiselect(
@@ -93,16 +89,15 @@ run_backtest = st.button(
     use_container_width=True,
 )
 
-if "backtest_result" not in st.session_state:
-    st.session_state.backtest_result = None
-    st.session_state.backtest_sims = None
-    st.session_state.backtest_params = None
+for key in ["backtest_result", "backtest_sims", "backtest_params"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
 
 @st.cache_data(ttl=900)
-def get_data(asset_symbol: str, ref_symbol: str) -> pd.DataFrame:
+def download_close(symbols):
     raw = yf.download(
-        [asset_symbol, ref_symbol],
+        symbols,
         period="max",
         interval="1d",
         auto_adjust=True,
@@ -124,22 +119,14 @@ def get_data(asset_symbol: str, ref_symbol: str) -> pd.DataFrame:
         if "Close" not in raw.columns:
             raise ValueError("종가(Close) 데이터를 찾지 못했습니다.")
         close = raw[["Close"]].copy()
-        close.columns = [asset_symbol]
 
     if isinstance(close, pd.Series):
         close = close.to_frame()
 
-    if asset_symbol not in close.columns or ref_symbol not in close.columns:
-        if len(close.columns) >= 2:
-            close = close.iloc[:, :2]
-            close.columns = [asset_symbol, ref_symbol]
-        else:
-            raise ValueError("두 종목의 가격 데이터를 모두 받지 못했습니다.")
-
-    return close[[asset_symbol, ref_symbol]].dropna()
+    return close
 
 
-def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def calc_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
@@ -147,15 +134,24 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def anchor_series(s: pd.Series, mode: str) -> pd.Series:
+def anchor_series(series, mode):
     if mode == "최근 60거래일 고점":
-        return s.rolling(60, min_periods=1).max()
+        return series.rolling(60, min_periods=1).max()
     if mode == "최근 120거래일 고점":
-        return s.rolling(120, min_periods=1).max()
-    return s.cummax()
+        return series.rolling(120, min_periods=1).max()
+    return series.cummax()
 
 
-def entry_allowed(row, use_ma: bool, rsi_max):
+def filter_name(use_ma, rsi_max):
+    parts = []
+    if use_ma:
+        parts.append("200일선")
+    if rsi_max is not None:
+        parts.append(f"RSI≤{int(rsi_max)}")
+    return "기본" if not parts else " + ".join(parts)
+
+
+def entry_allowed(row, use_ma, rsi_max):
     if use_ma and not bool(row["TREND_OK"]):
         return False
 
@@ -168,12 +164,12 @@ def entry_allowed(row, use_ma: bool, rsi_max):
 
 
 def simulate(
-    df: pd.DataFrame,
-    initial_cash: float,
-    step_pct: float,
-    take_profit: float,
-    n_tranches: int,
-    use_ma: bool,
+    df,
+    initial_cash,
+    step_pct,
+    take_profit,
+    n_tranches,
+    use_ma,
     rsi_max,
 ):
     cash = float(initial_cash)
@@ -186,35 +182,41 @@ def simulate(
     tranche_budget = initial_cash / n_tranches
 
     for dt, row in df.iterrows():
-        price = float(row["ASSET"])
+        signal_price = float(row["SIGNAL"])
+        trade_price = float(row["TRADE"])
         anchor = float(row["ANCHOR"])
 
-        if not np.isfinite(price) or price <= 0:
+        if (
+            not np.isfinite(signal_price)
+            or not np.isfinite(trade_price)
+            or signal_price <= 0
+            or trade_price <= 0
+            or anchor <= 0
+        ):
             continue
 
-        drawdown = max(0.0, 1 - price / anchor) if anchor > 0 else 0.0
+        drawdown = max(0.0, 1 - signal_price / anchor)
 
-        # 목표수익 도달 시 전량 익절
+        # 익절은 실제 매수한 ETF의 평균단가 기준
         if shares > 0:
             avg_price = total_cost / shares
-            pnl_pct = price / avg_price - 1
+            pnl_pct = trade_price / avg_price - 1
 
             if pnl_pct >= take_profit:
-                proceeds = shares * price
+                proceeds = shares * trade_price
                 realized = proceeds - total_cost
+                first_buy_date = entries[0][0] if entries else dt
+
                 cash += proceeds
 
                 trades.append(
                     {
                         "매도일": pd.Timestamp(dt),
                         "평균매수가": avg_price,
-                        "매도가": price,
+                        "매도가": trade_price,
                         "수익률": pnl_pct,
                         "실현손익": realized,
-                        "보유일수": (
-                            (pd.Timestamp(dt) - pd.Timestamp(entries[0][0])).days
-                            if entries else 0
-                        ),
+                        "보유일수": (pd.Timestamp(dt) - pd.Timestamp(first_buy_date)).days,
                         "매수횟수": len(entries),
                     }
                 )
@@ -224,28 +226,34 @@ def simulate(
                 entries = []
                 next_level = 1
 
-        # 진입 필터를 통과할 때만 매수
         allowed = entry_allowed(row, use_ma, rsi_max)
 
-        # 과거 백테스트는 충족된 단계까지 매수하되,
-        # 실제 '오늘 신호'는 아래에서 한 번에 1차수만 안내
         if allowed:
             while next_level <= n_tranches and drawdown >= step_pct * next_level:
                 budget = min(tranche_budget, cash)
-
                 if budget <= 0:
                     break
 
-                qty = budget / price
+                qty = budget / trade_price
                 shares += qty
                 total_cost += budget
                 cash -= budget
-                entries.append((pd.Timestamp(dt), price, budget, next_level))
+                entries.append(
+                    (pd.Timestamp(dt), trade_price, budget, next_level)
+                )
                 next_level += 1
 
-        equity = cash + shares * price
+        equity = cash + shares * trade_price
         equity_rows.append(
-            (pd.Timestamp(dt), equity, cash, shares, price, drawdown)
+            (
+                pd.Timestamp(dt),
+                equity,
+                cash,
+                shares,
+                signal_price,
+                trade_price,
+                drawdown,
+            )
         )
 
     if not equity_rows:
@@ -253,20 +261,25 @@ def simulate(
 
     eq = pd.DataFrame(
         equity_rows,
-        columns=["Date", "Equity", "Cash", "Shares", "Price", "Drawdown"],
+        columns=[
+            "Date",
+            "Equity",
+            "Cash",
+            "Shares",
+            "SignalPrice",
+            "TradePrice",
+            "Drawdown",
+        ],
     ).set_index("Date")
 
     final_value = float(eq["Equity"].iloc[-1])
     total_return = final_value / initial_cash - 1
 
-    years = max(
-        (eq.index[-1] - eq.index[0]).days / 365.25,
-        1 / 365.25,
-    )
-
+    years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1 / 365.25)
     cagr = (
         (final_value / initial_cash) ** (1 / years) - 1
-        if final_value > 0 else -1.0
+        if final_value > 0
+        else -1.0
     )
 
     peak = eq["Equity"].cummax()
@@ -277,20 +290,35 @@ def simulate(
 
     win_rate = (
         float((trades_df["실현손익"] > 0).mean())
-        if trade_count else np.nan
+        if trade_count
+        else np.nan
     )
 
     avg_hold = (
         float(trades_df["보유일수"].mean())
-        if trade_count else np.nan
+        if trade_count
+        else np.nan
     )
 
+    closed_max_hold = (
+        float(trades_df["보유일수"].max())
+        if trade_count
+        else 0.0
+    )
+
+    ongoing_hold = 0.0
     avg_entry = np.nan
     unrealized_pct = np.nan
 
-    if shares > 0:
+    if shares > 0 and entries:
         avg_entry = total_cost / shares
-        unrealized_pct = float(df["ASSET"].iloc[-1]) / avg_entry - 1
+        current_trade_price = float(df["TRADE"].iloc[-1])
+        unrealized_pct = current_trade_price / avg_entry - 1
+        ongoing_hold = (
+            pd.Timestamp(df.index[-1]) - pd.Timestamp(entries[0][0])
+        ).days
+
+    max_hold = max(closed_max_hold, ongoing_hold)
 
     return {
         "final_value": final_value,
@@ -300,6 +328,7 @@ def simulate(
         "trade_count": trade_count,
         "win_rate": win_rate,
         "avg_hold": avg_hold,
+        "max_hold": max_hold,
         "equity": eq,
         "trades": trades_df,
         "cash": cash,
@@ -311,51 +340,48 @@ def simulate(
     }
 
 
-def filter_name(use_ma: bool, rsi_max):
-    parts = []
-
-    if use_ma:
-        parts.append("200일선")
-    if rsi_max is not None:
-        parts.append(f"RSI≤{int(rsi_max)}")
-
-    return "기본" if not parts else " + ".join(parts)
-
-
 try:
-    with st.spinner("가격 데이터를 불러오는 중..."):
-        data = get_data(asset, ref)
+    # ------------------------------------------------------------
+    # 데이터 / 비교할 운용 방식
+    # ------------------------------------------------------------
+    if market.startswith("🇺🇸"):
+        symbols = ["TQQQ", "QQQ"]
+        close = download_close(symbols).dropna()
 
-    data = data.rename(columns={asset: "ASSET", ref: "REF"})
-    data = data.dropna(subset=["ASSET", "REF"])
+        modes = [
+            {
+                "mode": "TQQQ 신호 → TQQQ 매수",
+                "signal_symbol": "TQQQ",
+                "trade_symbol": "TQQQ",
+                "ref_symbol": "QQQ",
+            }
+        ]
+    else:
+        symbols = ["233740.KS", "229200.KS"]
+        close = download_close(symbols).dropna()
 
-    data["ANCHOR"] = anchor_series(data["ASSET"], anchor_mode)
-    data["DD"] = data["ASSET"] / data["ANCHOR"] - 1
-    data["MA200"] = data["REF"].rolling(200).mean()
-    data["RSI14"] = calc_rsi(data["REF"], 14)
-    data["TREND_OK"] = data["REF"] > data["MA200"]
+        modes = [
+            {
+                "mode": "① 코코레 신호 → 코코레 매수",
+                "signal_symbol": "233740.KS",
+                "trade_symbol": "233740.KS",
+                "ref_symbol": "229200.KS",
+            },
+            {
+                "mode": "② 코코레 신호 → 코스닥150 본주 매수",
+                "signal_symbol": "233740.KS",
+                "trade_symbol": "229200.KS",
+                "ref_symbol": "229200.KS",
+            },
+            {
+                "mode": "③ 코스닥150 본주 신호 → 본주 매수",
+                "signal_symbol": "229200.KS",
+                "trade_symbol": "229200.KS",
+                "ref_symbol": "229200.KS",
+            },
+        ]
 
-    # 200일선이 계산 가능한 시점부터 비교
-    data = data.dropna(subset=["MA200", "RSI14"]).copy()
-
-    if data.empty:
-        raise ValueError("지표 계산 후 사용할 데이터가 없습니다.")
-
-    price = float(data["ASSET"].iloc[-1])
-    dd_now = float(data["DD"].iloc[-1])
-    rsi_now = float(data["RSI14"].iloc[-1])
-    trend_ok_now = bool(data["TREND_OK"].iloc[-1])
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(asset, f"{currency}{price:,.2f}")
-    c2.metric("고점 대비", f"{dd_now:.1%}")
-    c3.metric(f"{ref} RSI", f"{rsi_now:.1f}")
-    c4.metric("200일선", "위" if trend_ok_now else "아래")
-
-    if not buy_steps or not take_profits:
-        st.warning("매수 간격과 익절률을 각각 하나 이상 선택해 주세요.")
-        st.stop()
-
+    # 필터 조합
     filter_candidates = [(False, None)]
 
     if use_ma_candidates:
@@ -364,88 +390,147 @@ try:
     if use_rsi_candidates:
         for rsi_max in rsi_thresholds:
             filter_candidates.append((False, float(rsi_max)))
-
             if use_ma_candidates:
                 filter_candidates.append((True, float(rsi_max)))
 
     # 중복 제거
-    seen = set()
-    unique_candidates = []
-    for item in filter_candidates:
-        if item not in seen:
-            unique_candidates.append(item)
-            seen.add(item)
-
-    st.divider()
-    st.subheader("🏆 전략 + 필터 자동 비교")
+    filter_candidates = list(dict.fromkeys(filter_candidates))
 
     current_params = (
+        market,
+        float(investment),
+        anchor_mode,
         tuple(buy_steps),
         tuple(take_profits),
         tranche_count,
-        anchor_mode,
         use_ma_candidates,
         use_rsi_candidates,
         tuple(rsi_thresholds),
-        asset,
-        ref,
-        float(investment),
     )
+
+    # 현재 지표 표시용: 코코레 시장에서는 코코레 낙폭 + 본주 RSI/200일선
+    current_signal_symbol = modes[0]["signal_symbol"]
+    current_ref_symbol = modes[0]["ref_symbol"]
+
+    temp = pd.DataFrame(index=close.index)
+    temp["SIGNAL"] = close[current_signal_symbol]
+    temp["REF"] = close[current_ref_symbol]
+    temp["ANCHOR"] = anchor_series(temp["SIGNAL"], anchor_mode)
+    temp["DD"] = temp["SIGNAL"] / temp["ANCHOR"] - 1
+    temp["MA200"] = temp["REF"].rolling(200).mean()
+    temp["RSI14"] = calc_rsi(temp["REF"], 14)
+    temp["TREND_OK"] = temp["REF"] > temp["MA200"]
+    temp = temp.dropna()
+
+    if temp.empty:
+        raise ValueError("지표 계산 후 사용할 데이터가 없습니다.")
+
+    current_signal_price = float(temp["SIGNAL"].iloc[-1])
+    current_dd = float(temp["DD"].iloc[-1])
+    current_rsi = float(temp["RSI14"].iloc[-1])
+    current_trend_ok = bool(temp["TREND_OK"].iloc[-1])
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    if market.startswith("🇺🇸"):
+        c1.metric("TQQQ", f"${current_signal_price:,.2f}")
+    else:
+        c1.metric("코코레", f"₩{current_signal_price:,.0f}")
+
+    c2.metric("고점 대비", f"{current_dd:.1%}")
+    c3.metric("RSI", f"{current_rsi:.1f}")
+    c4.metric("200일선", "위" if current_trend_ok else "아래")
+
+    if market.startswith("🇰🇷"):
+        st.caption(
+            "① 레버리지 직접매수 / ② 코코레는 신호만 사용하고 본주 매수 / "
+            "③ 본주 신호로 본주 매수를 같은 조건에서 비교합니다."
+        )
+
+    if not buy_steps or not take_profits:
+        st.warning("매수 간격과 익절률을 각각 하나 이상 선택해 주세요.")
+        st.stop()
+
+    st.divider()
+    st.subheader("🏆 전략 자동 비교")
 
     if run_backtest:
         results = []
         sims = {}
 
-        progress = st.progress(0)
-        status = st.empty()
-
-        total_jobs = max(
-            1,
-            len(buy_steps) * len(take_profits) * len(unique_candidates)
+        total_jobs = (
+            len(modes)
+            * len(buy_steps)
+            * len(take_profits)
+            * len(filter_candidates)
         )
         done_jobs = 0
 
+        progress = st.progress(0)
+        status = st.empty()
+
         with st.spinner("백테스트 계산 중..."):
-            for step_pct in buy_steps:
-                for tp in take_profits:
-                    for use_ma, rsi_max in unique_candidates:
-                        sim = simulate(
-                            data,
-                            float(investment),
-                            step_pct,
-                            tp,
-                            tranche_count,
-                            use_ma,
-                            rsi_max,
-                        )
+            for mode in modes:
+                df = pd.DataFrame(index=close.index)
+                df["SIGNAL"] = close[mode["signal_symbol"]]
+                df["TRADE"] = close[mode["trade_symbol"]]
+                df["REF"] = close[mode["ref_symbol"]]
 
-                        fname = filter_name(use_ma, rsi_max)
-                        name = f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / {fname}"
+                df["ANCHOR"] = anchor_series(df["SIGNAL"], anchor_mode)
+                df["MA200"] = df["REF"].rolling(200).mean()
+                df["RSI14"] = calc_rsi(df["REF"], 14)
+                df["TREND_OK"] = df["REF"] > df["MA200"]
+                df = df.dropna()
 
-                        sims[name] = sim
-                        results.append(
-                            {
-                                "전략": name,
-                                "매수간격": step_pct,
-                                "익절률": tp,
-                                "필터": fname,
-                                "MA200": use_ma,
-                                "RSI상한": rsi_max,
-                                "최종자산": sim["final_value"],
-                                "누적수익률": sim["total_return"],
-                                "CAGR": sim["cagr"],
-                                "MDD": sim["mdd"],
-                                "완료매매": sim["trade_count"],
-                                "승률": sim["win_rate"],
-                                "평균보유일": sim["avg_hold"],
+                for step_pct in buy_steps:
+                    for tp in take_profits:
+                        for use_ma, rsi_max in filter_candidates:
+                            sim = simulate(
+                                df,
+                                float(investment),
+                                step_pct,
+                                tp,
+                                tranche_count,
+                                use_ma,
+                                rsi_max,
+                            )
+
+                            fname = filter_name(use_ma, rsi_max)
+                            strategy_name = (
+                                f"{mode['mode']} | "
+                                f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / {fname}"
+                            )
+
+                            sims[strategy_name] = {
+                                "sim": sim,
+                                "mode": mode,
+                                "df": df,
+                                "step_pct": step_pct,
+                                "tp": tp,
+                                "use_ma": use_ma,
+                                "rsi_max": rsi_max,
                             }
-                        )
 
-                        done_jobs += 1
-                        progress.progress(done_jobs / total_jobs)
-                        status.caption(
-                            f"계산 중... {done_jobs}/{total_jobs}"
-                        )
+                            results.append(
+                                {
+                                    "전략": strategy_name,
+                                    "운용방식": mode["mode"],
+                                    "매수간격": step_pct,
+                                    "익절률": tp,
+                                    "필터": fname,
+                                    "최종자산": sim["final_value"],
+                                    "누적수익률": sim["total_return"],
+                                    "CAGR": sim["cagr"],
+                                    "MDD": sim["mdd"],
+                                    "최대보유일": sim["max_hold"],
+                                    "완료매매": sim["trade_count"],
+                                    "승률": sim["win_rate"],
+                                }
+                            )
+
+                            done_jobs += 1
+                            progress.progress(done_jobs / max(total_jobs, 1))
+                            status.caption(f"계산 중... {done_jobs}/{total_jobs}")
 
         result = (
             pd.DataFrame(results)
@@ -468,37 +553,80 @@ try:
         st.stop()
 
     if st.session_state.backtest_params != current_params:
-        st.warning(
-            "설정을 변경했습니다. 새 조건으로 보려면 **🚀 백테스트 실행**을 다시 눌러 주세요."
-        )
+        st.warning("설정을 변경했습니다. 새 조건으로 보려면 **🚀 백테스트 실행**을 다시 눌러 주세요.")
 
     winner = result.iloc[0]
     winner_name = winner["전략"]
-    best = sims[winner_name]
+    winner_bundle = sims[winner_name]
 
-    best_step = float(winner["매수간격"])
-    best_tp = float(winner["익절률"])
-    best_use_ma = bool(winner["MA200"])
-    best_rsi = (
-        None if pd.isna(winner["RSI상한"])
-        else float(winner["RSI상한"])
+    best = winner_bundle["sim"]
+    best_mode = winner_bundle["mode"]
+    best_df = winner_bundle["df"]
+    best_step = float(winner_bundle["step_pct"])
+    best_tp = float(winner_bundle["tp"])
+    best_use_ma = bool(winner_bundle["use_ma"])
+    best_rsi = winner_bundle["rsi_max"]
+
+    st.success(f"🥇 최종자산 1위: **{winner['운용방식']}**")
+    st.write(
+        f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
+        f"{filter_name(best_use_ma, best_rsi)}**"
     )
 
-    st.success(f"🥇 최종자산 1위: **{winner_name}**")
+    # ------------------------------------------------------------
+    # 운용 방식별 최고 전략 비교
+    # ------------------------------------------------------------
+    if market.startswith("🇰🇷"):
+        st.subheader("🥊 3가지 운용 방식 비교")
+
+        mode_best = (
+            result.sort_values("최종자산", ascending=False)
+            .groupby("운용방식", as_index=False)
+            .first()
+        )
+
+        mv = mode_best[
+            ["운용방식", "최종자산", "CAGR", "MDD", "최대보유일", "매수간격", "익절률", "필터"]
+        ].copy()
+
+        mv["최종자산"] = mv["최종자산"].map(lambda x: f"₩{x:,.0f}")
+        mv["CAGR"] = mv["CAGR"].map(lambda x: f"{x:.1%}")
+        mv["MDD"] = mv["MDD"].map(lambda x: f"{x:.1%}")
+        mv["최대보유일"] = mv["최대보유일"].map(lambda x: f"{x:.0f}일")
+        mv["매수간격"] = mv["매수간격"].map(lambda x: f"{x:.0%}")
+        mv["익절률"] = mv["익절률"].map(lambda x: f"{x:.0%}")
+
+        st.dataframe(mv, use_container_width=True, hide_index=True)
+
+        # ②번과 ①번 차이를 한눈에 보여주기
+        m1 = mode_best[mode_best["운용방식"].str.startswith("①")]
+        m2 = mode_best[mode_best["운용방식"].str.startswith("②")]
+
+        if not m1.empty and not m2.empty:
+            a = m1.iloc[0]
+            b = m2.iloc[0]
+
+            d1, d2 = st.columns(2)
+            d1.metric(
+                "②의 CAGR 차이",
+                f"{b['CAGR'] - a['CAGR']:+.1%}",
+                help="① 코코레 직접매수와 비교한 차이",
+            )
+            d2.metric(
+                "②의 MDD 개선",
+                f"{b['MDD'] - a['MDD']:+.1%}",
+                help="양수일수록 최대낙폭이 덜 심한 것",
+            )
 
     # ------------------------------------------------------------
-    # 오늘부터 실제로 시작하는 사용자를 위한 매매 신호
+    # 오늘의 실제 매매 신호
     # ------------------------------------------------------------
     st.divider()
     st.subheader("🚦 오늘의 매매 신호")
     st.caption(
-        "과거 백테스트 포지션을 이어받지 않습니다. "
-        "오늘부터 새로 시작하는 기준으로 한 번에 1차수씩만 안내합니다."
+        "1위 전략 기준입니다. 오늘 처음 시작하면 과거 여러 차수가 이미 충족돼도 "
+        "한 번에 1차수만 안내합니다."
     )
-
-    live_anchor = float(data["ANCHOR"].iloc[-1])
-    live_drawdown = max(0.0, 1 - price / live_anchor)
-    live_tranche_budget = float(investment) / tranche_count
 
     live_stage = st.number_input(
         "현재 실제 보유 차수",
@@ -506,172 +634,133 @@ try:
         max_value=tranche_count,
         value=0,
         step=1,
-        help="오늘 처음 시작이면 0. 이미 1번 매수했다면 1, 두 번 매수했다면 2를 선택하세요.",
+        help="오늘 처음 시작이면 0",
     )
+
+    latest = best_df.iloc[-1]
+    signal_price = float(latest["SIGNAL"])
+    trade_price = float(latest["TRADE"])
+    live_anchor = float(latest["ANCHOR"])
+    live_dd = max(0.0, 1 - signal_price / live_anchor)
+
+    live_rsi = float(latest["RSI14"])
+    live_trend_ok = bool(latest["TREND_OK"])
+    tranche_budget = float(investment) / tranche_count
 
     avg_buy_price = None
-
     if live_stage > 0:
         avg_buy_price = st.number_input(
-            f"현재 평균 매수가 ({unit})",
+            f"현재 실제 매수 ETF 평균단가 ({unit})",
             min_value=0.0,
-            value=float(price),
-            step=1.0 if currency == "$" else 100.0,
-            help="실제 계좌 평균 매수가를 입력하면 익절 신호까지 계산합니다.",
+            value=float(trade_price),
+            step=1.0 if currency == "$" else 10.0,
         )
 
-    latest_row = data.iloc[-1]
-    live_filter_ok = entry_allowed(
-        latest_row,
-        best_use_ma,
-        best_rsi,
-    )
+    filter_ok = entry_allowed(latest, best_use_ma, best_rsi)
+
+    filter_reasons = []
+    if best_use_ma and not live_trend_ok:
+        filter_reasons.append("200일선 아래")
+    if best_rsi is not None and live_rsi > best_rsi:
+        filter_reasons.append(f"RSI {live_rsi:.1f} > {best_rsi:.0f}")
 
     next_stage = int(live_stage) + 1
-
-    next_buy_price = (
+    next_signal_price = (
         live_anchor * (1 - best_step * next_stage)
-        if next_stage <= tranche_count else None
+        if next_stage <= tranche_count
+        else None
     )
 
     signal = "대기"
-    signal_detail = ""
-    signal_amount = 0.0
-
-    filter_reasons = []
-
-    if best_use_ma and not trend_ok_now:
-        filter_reasons.append("기준지수가 200일선 아래")
-
-    if best_rsi is not None and rsi_now > best_rsi:
-        filter_reasons.append(f"RSI {rsi_now:.1f} > {best_rsi:.0f}")
+    detail = ""
 
     if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
-        target_sell_price = avg_buy_price * (1 + best_tp)
+        target_sell = avg_buy_price * (1 + best_tp)
 
-        if price >= target_sell_price:
+        if trade_price >= target_sell:
             signal = "익절"
-            signal_detail = (
-                f"현재가가 익절 기준 {currency}{target_sell_price:,.2f} 이상입니다. "
-                "보유분 전량 익절 신호입니다."
+            detail = (
+                f"실제 매수 ETF 현재가가 익절 기준 "
+                f"{currency}{target_sell:,.2f} 이상입니다."
             )
-
-        elif next_stage <= tranche_count and live_drawdown >= best_step * next_stage:
-            if live_filter_ok:
+        elif next_stage <= tranche_count and live_dd >= best_step * next_stage:
+            if filter_ok:
                 signal = f"{next_stage}차 매수"
-                signal_amount = live_tranche_budget
-                signal_detail = (
-                    f"낙폭 {live_drawdown:.1%}가 {next_stage}차 기준 "
-                    f"{best_step * next_stage:.1%}에 도달했고 필터도 통과했습니다."
-                )
+                detail = "가격 조건과 필터를 모두 통과했습니다."
             else:
-                signal_detail = (
-                    f"가격 조건은 {next_stage}차 매수 구간이지만 "
-                    f"필터 때문에 대기합니다: {', '.join(filter_reasons)}"
-                )
-
+                detail = "가격 조건은 충족했지만 필터 때문에 대기: " + ", ".join(filter_reasons)
         elif next_stage <= tranche_count:
-            signal_detail = (
-                f"다음 {next_stage}차 매수 기준은 약 "
-                f"{currency}{next_buy_price:,.2f}입니다."
+            detail = (
+                f"다음 {next_stage}차 신호가격: "
+                f"{currency}{next_signal_price:,.2f}"
             )
-
         else:
-            signal_detail = (
-                "계획한 분할매수를 모두 사용한 상태입니다. "
-                f"평균매수가 대비 +{best_tp:.0%} 익절을 기다립니다."
-            )
-
+            detail = f"분할매수를 모두 사용했습니다. +{best_tp:.0%} 익절을 기다립니다."
     else:
-        first_buy_price = live_anchor * (1 - best_step)
+        first_signal_price = live_anchor * (1 - best_step)
 
-        if live_drawdown >= best_step:
-            if live_filter_ok:
+        if live_dd >= best_step:
+            if filter_ok:
                 signal = "1차 매수"
-                signal_amount = live_tranche_budget
-                signal_detail = (
-                    "오늘 처음 시작 기준으로 1차 매수 조건에 도달했고 "
-                    "필터도 통과했습니다. 과거에 여러 단계가 이미 충족됐더라도 "
-                    "오늘은 1차 금액만 매수합니다."
-                )
+                detail = "오늘 처음 시작 기준 1차 매수 조건과 필터를 통과했습니다."
             else:
-                signal_detail = (
-                    "가격은 1차 매수 구간이지만 필터 때문에 대기합니다: "
-                    + ", ".join(filter_reasons)
-                )
+                detail = "가격은 1차 구간이지만 필터 때문에 대기: " + ", ".join(filter_reasons)
         else:
-            signal_detail = (
-                f"오늘은 대기입니다. 1차 매수 기준 가격은 약 "
-                f"{currency}{first_buy_price:,.2f}입니다."
+            detail = (
+                f"오늘은 대기. 1차 신호가격은 약 "
+                f"{currency}{first_signal_price:,.2f}"
             )
 
-    s1, s2, s3 = st.columns(3)
-    s1.metric("오늘 신호", signal)
-    s2.metric("현재가", f"{currency}{price:,.2f}")
-    s3.metric("1회 매수금액", f"{currency}{live_tranche_budget:,.0f}")
+    a1, a2, a3 = st.columns(3)
+    a1.metric("오늘 신호", signal)
+    a2.metric("신호 ETF 가격", f"{currency}{signal_price:,.2f}")
+    a3.metric("실제 매수 ETF 가격", f"{currency}{trade_price:,.2f}")
 
-    if signal_amount > 0:
-        st.success(
-            f"✅ 오늘 할 일: **{signal} — 약 {currency}{signal_amount:,.0f} 매수**"
-        )
+    st.write(f"**신호 기준:** {best_mode['mode']}")
+    st.write(f"**1회 매수금액:** {currency}{tranche_budget:,.0f}")
+
+    if signal.endswith("매수"):
+        st.success(f"✅ 오늘 할 일: **{currency}{tranche_budget:,.0f} 매수**")
     elif signal == "익절":
-        st.success("✅ 오늘 할 일: **보유분 전량 익절**")
+        st.success("✅ 오늘 할 일: **실제 보유 ETF 전량 익절**")
     else:
         st.info("⏳ 오늘 할 일: **매수하지 않고 대기**")
 
-    st.write(signal_detail)
+    st.write(detail)
 
-    st.write(
-        f"**적용 전략:** {best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
-        f"{tranche_count}분할 / {filter_name(best_use_ma, best_rsi)}"
-    )
-
-    st.caption(
-        "장중 실시간 신호가 아니라 최근 일봉 종가 기준입니다. "
-        "실제 주문 전에는 현재 시장가격을 다시 확인하세요."
-    )
-
+    # ------------------------------------------------------------
+    # 전체 상위 전략
+    # ------------------------------------------------------------
     st.divider()
-    st.subheader("📊 상위 전략 비교")
+    st.subheader("📊 전체 상위 전략")
 
-    top_n = min(20, len(result))
-    display = result.head(top_n).copy()
-
-    display["최종자산"] = display["최종자산"].map(
-        lambda x: f"{currency}{x:,.0f}"
-    )
-    display["누적수익률"] = display["누적수익률"].map(
-        lambda x: f"{x:.1%}"
-    )
+    display = result.head(20).copy()
+    display["최종자산"] = display["최종자산"].map(lambda x: f"{currency}{x:,.0f}")
+    display["누적수익률"] = display["누적수익률"].map(lambda x: f"{x:.1%}")
     display["CAGR"] = display["CAGR"].map(lambda x: f"{x:.1%}")
     display["MDD"] = display["MDD"].map(lambda x: f"{x:.1%}")
+    display["최대보유일"] = display["최대보유일"].map(lambda x: f"{x:.0f}일")
     display["승률"] = display["승률"].map(
         lambda x: f"{x:.1%}" if pd.notna(x) else "-"
     )
-    display["평균보유일"] = display["평균보유일"].map(
-        lambda x: f"{x:.0f}일" if pd.notna(x) else "-"
-    )
-    display["매수간격"] = display["매수간격"].map(lambda x: f"{x:.0%}")
-    display["익절률"] = display["익절률"].map(lambda x: f"{x:.0%}")
 
-    display = display[
-        [
-            "전략",
-            "최종자산",
-            "누적수익률",
-            "CAGR",
-            "MDD",
-            "완료매매",
-            "승률",
-            "평균보유일",
-        ]
-    ]
-
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-    st.caption(
-        "순위는 최종자산을 가장 우선해서 정렬합니다. "
-        "설정을 바꿔도 자동 재계산하지 않으므로, 비교할 때만 실행 버튼을 누르면 됩니다."
+    st.dataframe(
+        display[
+            [
+                "운용방식",
+                "매수간격",
+                "익절률",
+                "필터",
+                "최종자산",
+                "CAGR",
+                "MDD",
+                "최대보유일",
+                "완료매매",
+                "승률",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
     )
 
     st.divider()
@@ -679,80 +768,21 @@ try:
 
     k1, k2 = st.columns(2)
     k1.metric("최종자산", f"{currency}{best['final_value']:,.0f}")
-    k2.metric(
-        "총 수익금",
-        f"{currency}{best['final_value'] - float(investment):,.0f}",
-    )
+    k2.metric("누적수익률", f"{best['total_return']:.1%}")
 
     k3, k4 = st.columns(2)
-    k3.metric("누적수익률", f"{best['total_return']:.1%}")
-    k4.metric("CAGR", f"{best['cagr']:.1%}")
+    k3.metric("CAGR", f"{best['cagr']:.1%}")
+    k4.metric("MDD", f"{best['mdd']:.1%}")
 
     k5, k6 = st.columns(2)
-    k5.metric("MDD", f"{best['mdd']:.1%}")
+    k5.metric("최대 보유기간", f"{best['max_hold']:.0f}일")
     k6.metric("완료 매매", f"{best['trade_count']}회")
-
-    k7, k8 = st.columns(2)
-    k7.metric(
-        "승률",
-        f"{best['win_rate']:.1%}" if pd.notna(best["win_rate"]) else "-",
-    )
-    k8.metric(
-        "평균 보유기간",
-        f"{best['avg_hold']:.0f}일" if pd.notna(best["avg_hold"]) else "-",
-    )
 
     st.line_chart(best["equity"][["Equity"]])
 
-    st.divider()
-    st.subheader("🧠 현재 필터 상태")
-
-    f1, f2 = st.columns(2)
-    f1.metric(
-        "200일선 필터",
-        "통과" if (not best_use_ma or trend_ok_now) else "차단",
-    )
-
-    if best_rsi is None:
-        f2.metric("RSI 필터", "미사용")
-    else:
-        f2.metric(
-            "RSI 필터",
-            "통과" if rsi_now <= best_rsi else "차단",
-            delta=f"현재 {rsi_now:.1f} / 기준 {best_rsi:.0f}",
-        )
-
-    if not best["trades"].empty:
-        st.divider()
-        st.subheader("🧾 최근 완료 매매")
-
-        trades_view = best["trades"].tail(10).copy()
-        trades_view["매도일"] = pd.to_datetime(
-            trades_view["매도일"]
-        ).dt.strftime("%Y-%m-%d")
-        trades_view["평균매수가"] = trades_view["평균매수가"].map(
-            lambda x: f"{currency}{x:,.2f}"
-        )
-        trades_view["매도가"] = trades_view["매도가"].map(
-            lambda x: f"{currency}{x:,.2f}"
-        )
-        trades_view["수익률"] = trades_view["수익률"].map(
-            lambda x: f"{x:.1%}"
-        )
-        trades_view["실현손익"] = trades_view["실현손익"].map(
-            lambda x: f"{currency}{x:,.0f}"
-        )
-
-        st.dataframe(
-            trades_view,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
     st.caption(
         "교육·백테스트용입니다. 세금, 수수료, 슬리피지, 환율, "
-        "장중 체결 차이와 레버리지 ETF의 구조적 특성은 별도로 반영하지 않습니다."
+        "추적오차와 레버리지 ETF의 일일 재조정 효과는 별도 반영하지 않습니다."
     )
 
 except Exception as e:
