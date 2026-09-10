@@ -996,6 +996,9 @@ try:
 
     live_rsi = float(latest["RSI14"])
     live_trend_ok = bool(latest["TREND_OK"])
+
+    next_stage = int(live_stage) + 1
+
     live_tranche_budgets = make_tranche_budgets(
         float(investment), tranche_count, best_weight_mode
     )
@@ -1022,7 +1025,6 @@ try:
     if best_rsi is not None and live_rsi > best_rsi:
         filter_reasons.append(f"RSI {live_rsi:.1f} > {best_rsi:.0f}")
 
-    next_stage = int(live_stage) + 1
     next_signal_price = (
         live_anchor * (1 - best_step * next_stage)
         if next_stage <= tranche_count
