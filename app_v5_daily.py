@@ -6,13 +6,13 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V9",
+    page_title="TQQQ / 코코레 QUANT V10",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / 코코레 QUANT V9")
-st.caption("일봉 전용 · TQQQ LOC 모드 + 단기회전 + 최대보유기간 청산 + 실제 매매기록")
+st.title("📈 TQQQ / 코코레 QUANT V10")
+st.caption("일봉 전용 · TQQQ LOC + 가중 분할매수 + 단기회전 + 실제 매매기록")
 
 market = st.radio(
     "시장",
@@ -103,6 +103,16 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         max_value=10,
         value=5,
         step=1,
+    )
+
+    weight_mode = st.selectbox(
+        "분할매수 비중",
+        ["균등비중", "약한 가중", "강한 가중"],
+        index=0,
+        help=(
+            "균등비중은 매회 같은 금액, 약한/강한 가중은 "
+            "하락 단계가 깊어질수록 더 큰 금액을 매수합니다."
+        ),
     )
 
     st.markdown("**필터 자동 비교**")
@@ -229,6 +239,18 @@ def entry_allowed(row, use_ma, rsi_max):
     return True
 
 
+def make_tranche_budgets(initial_cash, n_tranches, weight_mode):
+    if weight_mode == "약한 가중":
+        weights = np.linspace(1.0, 2.0, n_tranches)
+    elif weight_mode == "강한 가중":
+        weights = np.linspace(1.0, 3.0, n_tranches)
+    else:
+        weights = np.ones(n_tranches)
+
+    weights = weights / weights.sum()
+    return (float(initial_cash) * weights).tolist()
+
+
 def simulate(
     df,
     initial_cash,
@@ -237,6 +259,7 @@ def simulate(
     n_tranches,
     use_ma,
     rsi_max,
+    weight_mode="균등비중",
     max_hold_days=None,
     execution_mode="일반 종가모드",
     loc_buy_offset=0.0,
@@ -249,7 +272,9 @@ def simulate(
     trades = []
     equity_rows = []
     next_level = 1
-    tranche_budget = initial_cash / n_tranches
+    tranche_budgets = make_tranche_budgets(
+        initial_cash, n_tranches, weight_mode
+    )
 
     idx = df.index
     signal_arr = df["SIGNAL"].to_numpy(dtype=float)
@@ -337,7 +362,8 @@ def simulate(
 
         if allowed and not exited_today and buy_fill_ok:
             while next_level <= n_tranches and drawdown >= step_pct * next_level:
-                budget = min(tranche_budget, cash)
+                planned_budget = tranche_budgets[next_level - 1]
+                budget = min(planned_budget, cash)
                 if budget <= 0:
                     break
 
@@ -411,7 +437,9 @@ def simulate(
         "avg_entry": avg_entry,
         "unrealized_pct": unrealized_pct,
         "next_level": next_level,
-        "tranche_budget": tranche_budget,
+        "tranche_budget": tranche_budgets[min(next_level - 1, n_tranches - 1)],
+        "tranche_budgets": tranche_budgets,
+        "weight_mode": weight_mode,
     }
 
 
@@ -488,6 +516,7 @@ try:
         tuple(effective_take_profits),
         tuple(effective_max_holds),
         tranche_count,
+        weight_mode,
         use_ma_candidates,
         use_rsi_candidates,
         tuple(rsi_thresholds),
@@ -584,6 +613,7 @@ try:
                                     tranche_count,
                                     use_ma,
                                     rsi_max,
+                                    weight_mode,
                                     max_hold_days,
                                     us_execution_mode,
                                     float(loc_buy_offset),
@@ -600,7 +630,7 @@ try:
                                 strategy_name = (
                                     f"{mode['mode']} | "
                                     f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / "
-                                    f"최대 {hold_name} / {fname} / {exec_name}"
+                                    f"{weight_mode} / 최대 {hold_name} / {fname} / {exec_name}"
                                 )
 
                                 sims[strategy_name] = {
@@ -611,6 +641,7 @@ try:
                                     "tp": tp,
                                     "use_ma": use_ma,
                                     "rsi_max": rsi_max,
+                                    "weight_mode": weight_mode,
                                     "max_hold_days": max_hold_days,
                                     "execution_mode": us_execution_mode,
                                     "loc_buy_offset": float(loc_buy_offset),
@@ -623,6 +654,7 @@ try:
                                         "운용방식": mode["mode"],
                                         "매수간격": step_pct,
                                         "익절률": tp,
+                                        "매수비중": weight_mode,
                                         "필터": fname,
                                         "체결방식": exec_name,
                                         "보유제한": hold_name,
@@ -675,6 +707,7 @@ try:
     best_tp = float(winner_bundle["tp"])
     best_use_ma = bool(winner_bundle["use_ma"])
     best_rsi = winner_bundle["rsi_max"]
+    best_weight_mode = winner_bundle.get("weight_mode", "균등비중")
     best_max_hold = winner_bundle.get("max_hold_days")
     best_execution_mode = winner_bundle.get("execution_mode", "일반 종가모드")
     best_loc_buy_offset = winner_bundle.get("loc_buy_offset", 0.0)
@@ -692,7 +725,7 @@ try:
             st.info("🇺🇸 일반 종가 체결 가정")
     st.write(
         f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
-        f"{filter_name(best_use_ma, best_rsi)} / "
+        f"{best_weight_mode} / {filter_name(best_use_ma, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
     )
 
@@ -963,7 +996,12 @@ try:
 
     live_rsi = float(latest["RSI14"])
     live_trend_ok = bool(latest["TREND_OK"])
-    tranche_budget = float(investment) / tranche_count
+    live_tranche_budgets = make_tranche_budgets(
+        float(investment), tranche_count, best_weight_mode
+    )
+    tranche_budget = live_tranche_budgets[
+        min(max(next_stage - 1, 0), tranche_count - 1)
+    ]
 
     avg_buy_price = auto_avg_price if live_stage > 0 else None
 
@@ -1084,7 +1122,15 @@ try:
             "LOC 백테스트는 일봉 종가를 이용한 근사치입니다. 실제 LOC는 마감 경매에서 "
             "한도가격 조건을 만족할 때 체결되므로 실제 체결 여부와 가격은 달라질 수 있습니다."
         )
-    st.write(f"**1회 매수금액:** {currency}{tranche_budget:,.0f}")
+    allocation_text = " → ".join(
+        f"{currency}{x:,.0f}" for x in live_tranche_budgets
+    )
+    st.write(f"**매수 비중:** {best_weight_mode}")
+    st.caption(f"단계별 예정금액: {allocation_text}")
+    st.write(
+        f"**{min(next_stage, tranche_count)}차 예정 매수금액:** "
+        f"{currency}{tranche_budget:,.0f}"
+    )
 
     if signal.endswith("매수"):
         st.success(f"✅ 오늘 할 일: **{currency}{tranche_budget:,.0f} 매수**")
@@ -1123,6 +1169,7 @@ try:
                 "운용방식",
                 "매수간격",
                 "익절률",
+                "매수비중",
                 "필터",
                 "체결방식",
                 "최종자산",
