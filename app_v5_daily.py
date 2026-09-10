@@ -23,7 +23,7 @@ market = st.radio(
 if market.startswith("🇺🇸"):
     currency = "$"
     unit = "달러"
-    default_investment = 10000.0
+    default_investment = 4000.0
     min_investment = 1000.0
     step_investment = 1000.0
     default_tps = [0.10, 0.15, 0.20]
