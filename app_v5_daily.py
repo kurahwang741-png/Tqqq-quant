@@ -1066,9 +1066,23 @@ try:
                 f"**오늘 LOC 매수 한도:** {currency}{loc_buy_limit_today:,.2f} "
                 f"(전일 종가 대비 -{best_loc_buy_offset:.2%})"
             )
+
+            if "매수" in signal:
+                st.success(
+                    f"📌 **오늘 실제 주문:** TQQQ LOC 매수 "
+                    f"{currency}{loc_buy_limit_today:,.2f} / "
+                    f"주문금액 {currency}{tranche_budget:,.0f}"
+                )
+            elif signal in ["익절", "기간청산"]:
+                st.success(
+                    f"📌 **오늘 실제 주문:** TQQQ LOC 전량매도"
+                )
+            else:
+                st.info("📌 **오늘 실제 주문:** 없음 — 대기")
+
         st.caption(
-            "LOC 백테스트는 일봉 종가를 이용한 근사치입니다. 실제 브로커 체결 여부와 "
-            "마감 경매 가격 차이는 반영되지 않습니다."
+            "LOC 백테스트는 일봉 종가를 이용한 근사치입니다. 실제 LOC는 마감 경매에서 "
+            "한도가격 조건을 만족할 때 체결되므로 실제 체결 여부와 가격은 달라질 수 있습니다."
         )
     st.write(f"**1회 매수금액:** {currency}{tranche_budget:,.0f}")
 
