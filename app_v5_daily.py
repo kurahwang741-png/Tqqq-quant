@@ -87,6 +87,17 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         help="예: RSI 45 이하면 매수 허용",
     )
 
+run_backtest = st.button(
+    "🚀 백테스트 실행",
+    type="primary",
+    use_container_width=True,
+)
+
+if "backtest_result" not in st.session_state:
+    st.session_state.backtest_result = None
+    st.session_state.backtest_sims = None
+    st.session_state.backtest_params = None
+
 
 @st.cache_data(ttl=900)
 def get_data(asset_symbol: str, ref_symbol: str) -> pd.DataFrame:
@@ -368,50 +379,98 @@ try:
     st.divider()
     st.subheader("🏆 전략 + 필터 자동 비교")
 
-    results = []
-    sims = {}
-
-    for step_pct in buy_steps:
-        for tp in take_profits:
-            for use_ma, rsi_max in unique_candidates:
-                sim = simulate(
-                    data,
-                    float(investment),
-                    step_pct,
-                    tp,
-                    tranche_count,
-                    use_ma,
-                    rsi_max,
-                )
-
-                fname = filter_name(use_ma, rsi_max)
-                name = f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / {fname}"
-
-                sims[name] = sim
-
-                results.append(
-                    {
-                        "전략": name,
-                        "매수간격": step_pct,
-                        "익절률": tp,
-                        "필터": fname,
-                        "MA200": use_ma,
-                        "RSI상한": rsi_max,
-                        "최종자산": sim["final_value"],
-                        "누적수익률": sim["total_return"],
-                        "CAGR": sim["cagr"],
-                        "MDD": sim["mdd"],
-                        "완료매매": sim["trade_count"],
-                        "승률": sim["win_rate"],
-                        "평균보유일": sim["avg_hold"],
-                    }
-                )
-
-    result = (
-        pd.DataFrame(results)
-        .sort_values(["최종자산", "CAGR"], ascending=False)
-        .reset_index(drop=True)
+    current_params = (
+        tuple(buy_steps),
+        tuple(take_profits),
+        tranche_count,
+        anchor_mode,
+        use_ma_candidates,
+        use_rsi_candidates,
+        tuple(rsi_thresholds),
+        asset,
+        ref,
+        float(investment),
     )
+
+    if run_backtest:
+        results = []
+        sims = {}
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        total_jobs = max(
+            1,
+            len(buy_steps) * len(take_profits) * len(unique_candidates)
+        )
+        done_jobs = 0
+
+        with st.spinner("백테스트 계산 중..."):
+            for step_pct in buy_steps:
+                for tp in take_profits:
+                    for use_ma, rsi_max in unique_candidates:
+                        sim = simulate(
+                            data,
+                            float(investment),
+                            step_pct,
+                            tp,
+                            tranche_count,
+                            use_ma,
+                            rsi_max,
+                        )
+
+                        fname = filter_name(use_ma, rsi_max)
+                        name = f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / {fname}"
+
+                        sims[name] = sim
+                        results.append(
+                            {
+                                "전략": name,
+                                "매수간격": step_pct,
+                                "익절률": tp,
+                                "필터": fname,
+                                "MA200": use_ma,
+                                "RSI상한": rsi_max,
+                                "최종자산": sim["final_value"],
+                                "누적수익률": sim["total_return"],
+                                "CAGR": sim["cagr"],
+                                "MDD": sim["mdd"],
+                                "완료매매": sim["trade_count"],
+                                "승률": sim["win_rate"],
+                                "평균보유일": sim["avg_hold"],
+                            }
+                        )
+
+                        done_jobs += 1
+                        progress.progress(done_jobs / total_jobs)
+                        status.caption(
+                            f"계산 중... {done_jobs}/{total_jobs}"
+                        )
+
+        result = (
+            pd.DataFrame(results)
+            .sort_values(["최종자산", "CAGR"], ascending=False)
+            .reset_index(drop=True)
+        )
+
+        st.session_state.backtest_result = result
+        st.session_state.backtest_sims = sims
+        st.session_state.backtest_params = current_params
+
+        progress.empty()
+        status.empty()
+
+    result = st.session_state.backtest_result
+    sims = st.session_state.backtest_sims
+
+    if result is None or sims is None:
+        st.info("위의 **🚀 백테스트 실행** 버튼을 눌러 결과를 계산해 주세요.")
+        st.stop()
+
+    if st.session_state.backtest_params != current_params:
+        st.warning(
+            "설정을 변경했습니다. 새 조건으로 보려면 **🚀 백테스트 실행**을 다시 눌러 주세요."
+        )
 
     winner = result.iloc[0]
     winner_name = winner["전략"]
@@ -612,7 +671,7 @@ try:
 
     st.caption(
         "순위는 최종자산을 가장 우선해서 정렬합니다. "
-        "필터를 많이 붙였다고 항상 좋아지는 것은 아니므로 기본 전략도 함께 비교합니다."
+        "설정을 바꿔도 자동 재계산하지 않으므로, 비교할 때만 실행 버튼을 누르면 됩니다."
     )
 
     st.divider()
