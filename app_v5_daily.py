@@ -6,19 +6,21 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V22",
+    page_title="TQQQ / SOXL / 코코레 QUANT V24",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / 코코레 QUANT V13")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V24")
 st.caption("일봉 백테스트 · 오늘 현재가 프리/정규/애프터 최신 시세 + 가중비중 자동비교 + TQQQ LOC")
 
 market = st.radio(
     "시장",
-    ["🇺🇸 미국장 — TQQQ", "🇰🇷 한국장 — 코코레"],
+    ["🇺🇸 미국장 — TQQQ", "🇺🇸 미국장 — SOXL", "🇰🇷 한국장 — 코코레"],
     horizontal=True,
 )
+
+us_product = "SOXL" if "SOXL" in market else "TQQQ"
 
 if market.startswith("🇺🇸"):
     currency = "$"
@@ -226,8 +228,10 @@ def _trade_market_key(row):
     market_value = str(row.get("시장", "")).strip()
     symbol_value = str(row.get("종목", "")).strip()
 
-    if market_value in ("미국", "TQQQ") or symbol_value.upper() == "TQQQ":
-        return "TQQQ"
+    if symbol_value.upper() in ("TQQQ", "SOXL"):
+        return symbol_value.upper()
+    if market_value in ("TQQQ", "SOXL"):
+        return market_value
     if market_value in ("한국", "코코레") or symbol_value in ("233740.KS", "229200.KS"):
         return "코코레"
     return ""
@@ -251,7 +255,7 @@ def _is_market_cycle_locked(records, market_key):
 
     return bool(cycle_df["구분"].astype(str).str.contains("매수", na=False).any())
 
-active_market_key = "TQQQ" if market == "미국" else "코코레"
+active_market_key = us_product if market.startswith("🇺🇸") else "코코레"
 cycle_locked_for_ui = _is_market_cycle_locked(
     st.session_state.get("live_trades", []),
     active_market_key,
@@ -263,7 +267,7 @@ if cycle_locked_for_ui:
         "TQQQ와 코코레는 서로 독립적으로 운용됩니다."
     )
 else:
-    other_market_key = "코코레" if active_market_key == "TQQQ" else "TQQQ"
+    other_market_key = ("SOXL" if active_market_key == "TQQQ" else "TQQQ") if market.startswith("🇺🇸") else "TQQQ"
     if _is_market_cycle_locked(st.session_state.get("live_trades", []), other_market_key):
         st.caption(
             f"ℹ️ {other_market_key}는 현재 운용 중이지만, "
@@ -640,15 +644,15 @@ try:
     # 데이터 / 비교할 운용 방식
     # ------------------------------------------------------------
     if market.startswith("🇺🇸"):
-        symbols = ["TQQQ", "QQQ"]
+        symbols = [us_product, ("QQQ" if us_product == "TQQQ" else "SOXX")]
         close = download_close(symbols).dropna()
 
         modes = [
             {
-                "mode": "TQQQ 신호 → TQQQ 매수",
-                "signal_symbol": "TQQQ",
-                "trade_symbol": "TQQQ",
-                "ref_symbol": "QQQ",
+                 "mode": f"{us_product} 신호 → {us_product} 매수",
+                "signal_symbol": us_product,
+                "trade_symbol": us_product,
+                "ref_symbol": ("QQQ" if us_product == "TQQQ" else "SOXX"),
             }
         ]
     else:
@@ -748,7 +752,7 @@ try:
     c1, c2, c3 = st.columns(3)
 
     if market.startswith("🇺🇸"):
-        c1.metric("TQQQ", f"${current_signal_price:,.2f}")
+        c1.metric(us_product, f"${current_signal_price:,.2f}")
     else:
         c1.metric("코코레", f"₩{current_signal_price:,.0f}")
 
@@ -1342,8 +1346,8 @@ try:
             "229200.KS" if actual_trade_target == "코스닥150 본주" else "233740.KS"
         )
     else:
-        actual_trade_target = "TQQQ"
-        actual_trade_symbol = "TQQQ"
+        actual_trade_target = us_product
+        actual_trade_symbol = us_product
 
     st.caption(
         "코코레 신호를 보면서 실제 거래는 본주 또는 코코레 중 선택할 수 있습니다. "
@@ -1733,28 +1737,85 @@ try:
     elif auto_stage == 0:
         st.write(f"**새 사이클 적용 예정:** 현재 1위 · {live_best_weight_mode}")
     if market.startswith("🇺🇸") and live_best_execution_mode == "LOC 모드":
-        if loc_buy_limit_today is not None:
-            st.write(
-                f"**오늘 LOC 매수 한도:** {currency}{loc_buy_limit_today:,.2f} "
-                f"(전일 종가 대비 -{live_best_loc_buy_offset:.2%})"
-            )
+        # 매일 실제 주문에 바로 쓸 수 있도록 '가격'을 하나로 정리합니다.
+        # 매수는 전략의 낙폭 신호가격과 LOC 한도가격을 모두 만족해야 하므로 더 낮은 값을 사용합니다.
+        loc_effective_buy = None
+        if loc_buy_limit_today is not None and next_stage <= tranche_count:
+            raw_buy_trigger = next_signal_price if live_stage > 0 else first_signal_price
+            if raw_buy_trigger is not None:
+                loc_effective_buy = min(float(raw_buy_trigger), float(loc_buy_limit_today))
 
-            if "매수" in signal:
-                st.success(
-                    f"📌 **오늘 실제 주문:** TQQQ LOC 매수 "
-                    f"{currency}{loc_buy_limit_today:,.2f} / "
-                    f"주문금액 {currency}{tranche_budget:,.0f}"
+        # 매도는 보유 중일 때 평균단가 × 익절목표에 LOC 여유를 반영합니다.
+        loc_sell_limit_today = None
+        if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
+            base_sell_target = float(avg_buy_price) * (1 + live_best_tp)
+            loc_sell_limit_today = base_sell_target * (1 + live_best_loc_sell_offset)
+
+        st.markdown("### 📌 오늘의 LOC 주문가격")
+
+        c_buy, c_sell = st.columns(2)
+        with c_buy:
+            if loc_effective_buy is not None:
+                st.metric(
+                    f"{next_stage if live_stage > 0 else 1}차 LOC 매수가",
+                    f"{currency}{loc_effective_buy:,.2f} 이하",
                 )
-            elif signal in ["익절", "기간청산"]:
-                st.success(
-                    f"📌 **오늘 실제 주문:** TQQQ LOC 전량매도"
+                st.caption(
+                    f"주문금액 {currency}{tranche_budget:,.0f} · "
+                    f"전략 신호가와 LOC 한도 중 더 낮은 가격"
                 )
             else:
-                st.info("📌 **오늘 실제 주문:** 없음 — 대기")
+                st.metric("LOC 매수가", "-")
+                st.caption("추가 매수 차수가 없거나 가격을 계산할 수 없습니다.")
+
+        with c_sell:
+            if loc_sell_limit_today is not None:
+                st.metric(
+                    "LOC 전량매도가",
+                    f"{currency}{loc_sell_limit_today:,.2f} 이상",
+                )
+                st.caption(
+                    f"평균단가 {currency}{avg_buy_price:,.2f} × "
+                    f"익절 {live_best_tp:.0%}"
+                )
+            else:
+                st.metric("LOC 전량매도가", "-")
+                st.caption("현재 보유수량이 없어 매도가가 없습니다.")
+
+        if not filter_ok and next_stage <= tranche_count:
+            st.warning(
+                "오늘은 가격이 매수가에 도달하더라도 진입 필터가 통과되지 않아 "
+                "매수 주문을 내지 않는 날입니다: " + ", ".join(filter_reasons)
+            )
+        elif next_stage <= tranche_count and loc_effective_buy is not None:
+            st.success(
+                f"🟢 **오늘 매수 주문:** {us_product} LOC "
+                f"{currency}{loc_effective_buy:,.2f} 이하 / "
+                f"{currency}{tranche_budget:,.0f}"
+            )
+
+        if loc_sell_limit_today is not None:
+            if live_best_max_hold is not None and live_first_buy_date is not None:
+                holding_days_now = (
+                    pd.Timestamp(live_best_df.index[-1]) - live_first_buy_date
+                ).days
+            else:
+                holding_days_now = 0
+
+            if live_best_max_hold is not None and holding_days_now >= live_best_max_hold:
+                st.warning(
+                    f"🔴 **기간청산:** 최대 보유기간 {live_best_max_hold}일에 도달했습니다. "
+                    "가격 목표와 관계없이 전량매도 대상입니다."
+                )
+            else:
+                st.success(
+                    f"🔴 **오늘 매도 주문:** {us_product} LOC 전량매도 "
+                    f"{currency}{loc_sell_limit_today:,.2f} 이상"
+                )
 
         st.caption(
-            "LOC 백테스트는 일봉 종가를 이용한 근사치입니다. 실제 LOC는 마감 경매에서 "
-            "한도가격 조건을 만족할 때 체결되므로 실제 체결 여부와 가격은 달라질 수 있습니다."
+            "매수·매도 주문을 동시에 낼 수 있는지는 증권사 주문가능금액/수량 및 주문 방식에 따라 다릅니다. "
+            "LOC는 마감 경매에서 한도가격 조건을 만족해야 체결되며, 표시 가격에 반드시 체결되는 것은 아닙니다."
         )
     allocation_text = " → ".join(
         f"{currency}{x:,.0f}" for x in live_tranche_budgets
