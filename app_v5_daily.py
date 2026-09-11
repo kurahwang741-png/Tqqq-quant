@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V19",
+    page_title="TQQQ / 코코레 QUANT V20",
     page_icon="📈",
     layout="centered",
 )
@@ -968,50 +968,34 @@ try:
         "이 방식이 단순 전체기간 1위보다 과최적화 여부를 확인하는 데 유리합니다."
     )
 
-    st.subheader("🔄 진짜 워크포워드 검증")
+    st.subheader("🔄 최근 2개년 워크포워드 검증")
     st.caption(
-        "과거 3년·5년·10년 데이터만 보고 전략을 선택한 뒤, "
-        "바로 다음 1년에는 그 전략을 고정해서 적용합니다. 미래 데이터는 전략 선택에 사용하지 않습니다."
+        "전체 연도를 반복 계산하지 않고 최근 완료연도와 올해만 검증합니다. "
+        "각 실전연도 직전 3년·5년·10년 데이터만으로 전략을 선정한 뒤 해당 연도에 고정 적용합니다."
     )
 
-    run_walk_forward = st.button("🔬 워크포워드 실행", use_container_width=True)
+    run_walk_forward = st.button("🔬 최근 2개년 워크포워드 실행", use_container_width=True)
 
     if run_walk_forward:
         wf_windows = [3, 5, 10]
+        current_year = int(pd.DatetimeIndex(close.index).year.max())
+        test_years = [current_year - 1, current_year]
         wf_rows = []
         wf_year_rows = []
-
-        # 현재 선택 시장의 원본 가격 데이터에서 가능한 연도를 사용
-        all_years = sorted(set(pd.DatetimeIndex(close.index).year))
-        last_complete_or_current_year = max(all_years)
 
         wf_progress = st.progress(0.0)
         wf_status = st.empty()
 
-        # 현재 백테스트에서 생성된 전략 정의를 재사용하되,
-        # 각 학습기간에서는 그 기간 데이터로 다시 성과를 계산하여 1위를 고른다.
         strategy_defs = list(sims.items())
-        total_wf_jobs = max(
-            1,
-            sum(
-                max(0, len([y for y in all_years if y >= min(all_years) + w and y <= last_complete_or_current_year]))
-                for w in wf_windows
-            ),
-        )
+        total_wf_jobs = len(wf_windows) * len(test_years)
         wf_done = 0
 
         for train_years in wf_windows:
             capital = float(investment)
-            peak_capital = capital
             equity_points = [capital]
-            evaluated_years = 0
+            applied = 0
 
-            eligible_test_years = [
-                y for y in all_years
-                if (y - train_years) in all_years and y <= last_complete_or_current_year
-            ]
-
-            for test_year in eligible_test_years:
+            for test_year in test_years:
                 train_start = pd.Timestamp(f"{test_year - train_years}-01-01")
                 train_end = pd.Timestamp(f"{test_year - 1}-12-31")
                 test_start = pd.Timestamp(f"{test_year}-01-01")
@@ -1028,14 +1012,15 @@ try:
                     base["REF"] = close[mode["ref_symbol"]]
                     base = base.dropna()
 
-                    # 지표는 학습 시작 이전의 워밍업 데이터를 포함해 먼저 계산
                     base["ANCHOR"] = anchor_series(base["SIGNAL"], anchor_mode)
                     base["RSI14"] = calc_rsi(base["REF"], 14)
                     for p in [100, 150, 200]:
                         base[f"MA{p}"] = base["REF"].rolling(p).mean()
                         base[f"TREND_OK_{p}"] = base["REF"] > base[f"MA{p}"]
 
-                    train_df = base.loc[(base.index >= train_start) & (base.index <= train_end)].copy()
+                    train_df = base.loc[
+                        (base.index >= train_start) & (base.index <= train_end)
+                    ].copy()
 
                     ma_period = bundle.get("ma_period")
                     required_cols = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
@@ -1060,131 +1045,112 @@ try:
                         bundle["loc_buy_offset"],
                         bundle["loc_sell_offset"],
                     )
-
                     candidates.append(
                         (train_sim["final_value"], train_sim["cagr"], strategy_name, bundle, base)
                     )
 
-                if not candidates:
-                    wf_done += 1
-                    wf_progress.progress(min(wf_done / total_wf_jobs, 1.0))
-                    continue
+                if candidates:
+                    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                    _, _, chosen_name, chosen_bundle, chosen_base = candidates[0]
 
-                # 학습기간 최종자산 우선, CAGR 보조
-                candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                _, _, chosen_name, chosen_bundle, chosen_base = candidates[0]
+                    test_df = chosen_base.loc[
+                        (chosen_base.index >= test_start) & (chosen_base.index <= test_end)
+                    ].copy()
 
-                test_df = chosen_base.loc[
-                    (chosen_base.index >= test_start) & (chosen_base.index <= test_end)
-                ].copy()
+                    ma_period = chosen_bundle.get("ma_period")
+                    required_cols = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
+                    if ma_period is not None:
+                        required_cols.append(f"TREND_OK_{int(ma_period)}")
+                    test_df = test_df.dropna(subset=required_cols)
 
-                ma_period = chosen_bundle.get("ma_period")
-                required_cols = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
-                if ma_period is not None:
-                    required_cols.append(f"TREND_OK_{int(ma_period)}")
-                test_df = test_df.dropna(subset=required_cols)
+                    if len(test_df) >= 20:
+                        start_capital = capital
+                        test_sim = simulate(
+                            test_df,
+                            capital,
+                            chosen_bundle["step_pct"],
+                            chosen_bundle["tp"],
+                            tranche_count,
+                            ma_period,
+                            chosen_bundle["rsi_max"],
+                            chosen_bundle["weight_mode"],
+                            chosen_bundle["max_hold_days"],
+                            chosen_bundle["execution_mode"],
+                            chosen_bundle["loc_buy_offset"],
+                            chosen_bundle["loc_sell_offset"],
+                        )
+                        capital = float(test_sim["final_value"])
+                        year_return = capital / start_capital - 1 if start_capital else 0.0
+                        equity_points.append(capital)
+                        applied += 1
 
-                if len(test_df) < 20:
-                    wf_done += 1
-                    wf_progress.progress(min(wf_done / total_wf_jobs, 1.0))
-                    continue
-
-                test_sim = simulate(
-                    test_df,
-                    capital,
-                    chosen_bundle["step_pct"],
-                    chosen_bundle["tp"],
-                    tranche_count,
-                    ma_period,
-                    chosen_bundle["rsi_max"],
-                    chosen_bundle["weight_mode"],
-                    chosen_bundle["max_hold_days"],
-                    chosen_bundle["execution_mode"],
-                    chosen_bundle["loc_buy_offset"],
-                    chosen_bundle["loc_sell_offset"],
-                )
-
-                start_capital = capital
-                capital = float(test_sim["final_value"])
-                year_return = capital / start_capital - 1 if start_capital else 0.0
-                equity_points.append(capital)
-                peak_capital = max(peak_capital, capital)
-                evaluated_years += 1
-
-                wf_year_rows.append({
-                    "학습기간": f"{train_years}년",
-                    "실전연도": test_year,
-                    "선택전략": chosen_name,
-                    "연초자산": start_capital,
-                    "연말자산": capital,
-                    "연수익률": year_return,
-                })
+                        wf_year_rows.append({
+                            "학습기간": f"{train_years}년",
+                            "실전연도": f"{test_year}{' YTD' if test_year == current_year else ''}",
+                            "학습구간": f"{test_year-train_years}~{test_year-1}",
+                            "선택전략": chosen_name,
+                            "연초자산": start_capital,
+                            "연말/현재자산": capital,
+                            "수익률": year_return,
+                        })
 
                 wf_done += 1
-                wf_progress.progress(min(wf_done / total_wf_jobs, 1.0))
+                wf_progress.progress(wf_done / total_wf_jobs)
                 wf_status.caption(
-                    f"워크포워드 계산 중 · {train_years}년 학습 → {test_year}년 적용"
+                    f"계산 중 · {train_years}년 학습 → {test_year}{' YTD' if test_year == current_year else ''}"
                 )
 
-            if evaluated_years > 0:
+            if applied:
                 total_return = capital / float(investment) - 1
-                cagr = (capital / float(investment)) ** (1 / evaluated_years) - 1
-
+                years_equiv = max(applied - (0.5 if current_year in test_years else 0), 0.5)
+                cagr = (capital / float(investment)) ** (1 / years_equiv) - 1
                 eq = pd.Series(equity_points, dtype=float)
-                running_peak = eq.cummax()
-                mdd = float((eq / running_peak - 1).min())
+                mdd = float((eq / eq.cummax() - 1).min())
 
                 wf_rows.append({
                     "학습기간": f"{train_years}년",
-                    "적용연수": evaluated_years,
+                    "검증": f"{current_year-1} + {current_year} YTD",
                     "최종자산": capital,
                     "누적수익률": total_return,
-                    "CAGR": cagr,
+                    "참고 CAGR": cagr,
                     "연도단위 MDD": mdd,
                 })
 
         wf_progress.progress(1.0)
-        wf_status.caption("워크포워드 계산 완료")
+        wf_status.caption("최근 2개년 워크포워드 계산 완료")
 
         if wf_rows:
             wf_result = pd.DataFrame(wf_rows).sort_values(
-                ["최종자산", "CAGR"], ascending=False
+                ["최종자산", "참고 CAGR"], ascending=False
             ).reset_index(drop=True)
 
             wf_view = wf_result.copy()
             wf_view["최종자산"] = wf_view["최종자산"].map(lambda x: f"{currency}{x:,.0f}")
             wf_view["누적수익률"] = wf_view["누적수익률"].map(lambda x: f"{x:.1%}")
-            wf_view["CAGR"] = wf_view["CAGR"].map(lambda x: f"{x:.1%}")
+            wf_view["참고 CAGR"] = wf_view["참고 CAGR"].map(lambda x: f"{x:.1%}")
             wf_view["연도단위 MDD"] = wf_view["연도단위 MDD"].map(lambda x: f"{x:.1%}")
             st.dataframe(wf_view, use_container_width=True, hide_index=True)
 
             wf_best = wf_result.iloc[0]
             st.success(
-                f"🏆 워크포워드 1위: **{wf_best['학습기간']} 학습** · "
-                f"최종자산 {currency}{wf_best['최종자산']:,.0f} · "
-                f"CAGR {wf_best['CAGR']:.1%} · "
-                f"연도단위 MDD {wf_best['연도단위 MDD']:.1%}"
+                f"🏆 현재 추천 학습기간: **{wf_best['학습기간']}** · "
+                f"{current_year-1} + {current_year} YTD 누적수익률 "
+                f"{wf_best['누적수익률']:.1%}"
             )
 
             if wf_year_rows:
-                with st.expander("연도별로 어떤 전략을 선택했는지 보기"):
-                    wf_year_df = pd.DataFrame(wf_year_rows)
-                    wf_year_view = wf_year_df.copy()
-                    wf_year_view["연초자산"] = wf_year_view["연초자산"].map(
+                with st.expander("2025/2026 연도별 선택 전략 보기"):
+                    detail = pd.DataFrame(wf_year_rows)
+                    detail["연초자산"] = detail["연초자산"].map(
                         lambda x: f"{currency}{x:,.0f}"
                     )
-                    wf_year_view["연말자산"] = wf_year_view["연말자산"].map(
+                    detail["연말/현재자산"] = detail["연말/현재자산"].map(
                         lambda x: f"{currency}{x:,.0f}"
                     )
-                    wf_year_view["연수익률"] = wf_year_view["연수익률"].map(
-                        lambda x: f"{x:.1%}"
-                    )
-                    st.dataframe(wf_year_view, use_container_width=True, hide_index=True)
+                    detail["수익률"] = detail["수익률"].map(lambda x: f"{x:.1%}")
+                    st.dataframe(detail, use_container_width=True, hide_index=True)
         else:
-            st.warning(
-                "워크포워드에 사용할 데이터가 충분하지 않습니다. "
-                "백테스트 기간을 전체기간으로 선택한 뒤 다시 실행해 보세요."
-            )
+            st.warning("최근 2개년 워크포워드에 사용할 데이터가 충분하지 않습니다.")
 
     st.subheader("📈 이동평균선 방식 비교")
     ma_summary = (
