@@ -7,13 +7,13 @@ import time
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V25",
+    page_title="TQQQ / SOXL / 코코레 QUANT V26",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V25")
-st.caption("일봉 백테스트 · 오늘 현재가 프리/정규/애프터 최신 시세 + 가중비중 자동비교 + TQQQ LOC")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V26")
+st.caption("일봉 백테스트 · 최대 20분할 · 매수비중 % 표시 · 미국장 LOC")
 
 market = st.radio(
     "시장",
@@ -106,9 +106,10 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
     tranche_count = st.slider(
         "분할매수 횟수",
         min_value=2,
-        max_value=10,
+        max_value=20,
         value=5,
         step=1,
+        help="최대 20분할까지 비교합니다. 매수 간격×차수가 100% 이상이면 깊은 차수는 실제로 도달하기 어렵습니다.",
     )
 
     weight_modes = st.multiselect(
@@ -432,7 +433,11 @@ def entry_allowed(row, ma_period, rsi_max):
     return True
 
 
-def make_tranche_budgets(initial_cash, n_tranches, weight_mode):
+def make_tranche_weights(n_tranches, weight_mode):
+    """분할별 비중을 합계 100%인 소수로 반환합니다."""
+    if int(n_tranches) < 1:
+        raise ValueError("분할매수 횟수는 1 이상이어야 합니다.")
+
     if weight_mode == "약한 가중":
         weights = np.linspace(1.0, 2.0, n_tranches)
     elif weight_mode == "강한 가중":
@@ -440,7 +445,11 @@ def make_tranche_budgets(initial_cash, n_tranches, weight_mode):
     else:
         weights = np.ones(n_tranches)
 
-    weights = weights / weights.sum()
+    return weights / weights.sum()
+
+
+def make_tranche_budgets(initial_cash, n_tranches, weight_mode):
+    weights = make_tranche_weights(n_tranches, weight_mode)
     return (float(initial_cash) * weights).tolist()
 
 
@@ -557,13 +566,19 @@ def simulate(
                 loc_buy_limit = prev_trade_price * (1 - loc_buy_offset)
                 buy_fill_ok = trade_price <= loc_buy_limit
 
-        if allowed and not exited_today and buy_fill_ok:
-            while next_level <= n_tranches and drawdown >= step_pct * next_level:
-                planned_budget = tranche_budgets[next_level - 1]
-                budget = min(planned_budget, cash)
-                if budget <= 0:
-                    break
-
+        # 화면은 매일 '다음 한 차수'의 주문가만 제시하므로 백테스트도 하루에
+        # 최대 한 차수만 체결합니다. 급락일에 여러 차수가 같은 종가로 한꺼번에
+        # 체결되는 과대평가를 막고 실제 운용 화면과 기준을 맞춥니다.
+        if (
+            allowed
+            and not exited_today
+            and buy_fill_ok
+            and next_level <= n_tranches
+            and drawdown + 1e-12 >= step_pct * next_level
+        ):
+            planned_budget = tranche_budgets[next_level - 1]
+            budget = min(planned_budget, cash)
+            if budget > 0:
                 qty = budget / trade_price
                 shares += qty
                 total_cost += budget
@@ -1616,8 +1631,10 @@ try:
             key="record_price",
         )
         record_weight_mode = live_best_weight_mode if auto_stage > 0 else best_weight_mode
+        record_weights = make_tranche_weights(tranche_count, record_weight_mode)
         record_budgets = make_tranche_budgets(float(investment), tranche_count, record_weight_mode)
         record_next_stage = min(auto_stage + 1, tranche_count)
+        record_weight_pct = float(record_weights[record_next_stage - 1])
         default_amount = float(record_budgets[record_next_stage - 1])
         default_qty = (default_amount / record_price) if record_price > 0 else 0.0
 
@@ -1643,9 +1660,12 @@ try:
             )
 
         record_amount = float(record_price) * float(record_qty)
+        actual_investment_pct = record_amount / float(investment) if investment > 0 else 0.0
         st.caption(
             f"체결금액: {currency}{record_amount:,.2f} · "
-            f"이번 차수 권장예산: {currency}{default_amount:,.2f}"
+            f"초기 투자금의 {actual_investment_pct:.2%} · "
+            f"이번 차수 계획비중: {record_weight_pct:.2%} "
+            f"({currency}{default_amount:,.2f})"
         )
 
         b1, b2 = st.columns(2)
@@ -1664,6 +1684,8 @@ try:
                         "가격": float(record_price),
                         "수량": float(record_qty),
                         "금액": float(record_amount),
+                        "계획비중": record_weight_pct,
+                        "실제투입비중": actual_investment_pct,
                         "사이클전략": live_strategy_name if auto_stage > 0 and cycle_is_locked else winner_name,
                         "사이클매수비중": live_best_weight_mode if auto_stage > 0 and cycle_is_locked else best_weight_mode,
                     }
@@ -1685,6 +1707,8 @@ try:
                         "가격": float(record_price),
                         "수량": float(live_qty),
                         "금액": float(proceeds),
+                        "계획비중": None,
+                        "실제투입비중": None,
                         "사이클전략": live_strategy_name if auto_stage > 0 else winner_name,
                         "사이클매수비중": live_best_weight_mode if auto_stage > 0 else best_weight_mode,
                     }
@@ -1694,7 +1718,13 @@ try:
     trade_log = pd.DataFrame(st.session_state.live_trades)
 
     if not trade_log.empty:
-        st.dataframe(trade_log, use_container_width=True, hide_index=True)
+        trade_log_view = trade_log.copy()
+        for pct_col in ["계획비중", "실제투입비중"]:
+            if pct_col in trade_log_view.columns:
+                trade_log_view[pct_col] = trade_log_view[pct_col].map(
+                    lambda x: f"{float(x):.2%}" if pd.notna(x) and str(x).strip() else "-"
+                )
+        st.dataframe(trade_log_view, use_container_width=True, hide_index=True)
 
         csv_bytes = trade_log.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
@@ -1779,20 +1809,25 @@ try:
 
     signal = "대기"
     detail = ""
+    loc_sell_limit_today = None
 
     if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
         target_sell = avg_buy_price * (1 + live_best_tp)
+        effective_sell_target = target_sell
+        if market.startswith("🇺🇸") and live_best_execution_mode == "LOC 모드":
+            loc_sell_limit_today = target_sell * (1 + live_best_loc_sell_offset)
+            effective_sell_target = loc_sell_limit_today
 
         holding_days_now = (
             (pd.Timestamp(live_best_df.index[-1]) - live_first_buy_date).days
             if live_first_buy_date is not None else 0
         )
 
-        if trade_price >= target_sell:
+        if trade_price >= effective_sell_target:
             signal = "익절"
             detail = (
                 f"실제 매수 ETF 현재가가 익절 기준 "
-                f"{currency}{target_sell:,.2f} 이상입니다."
+                f"{currency}{effective_sell_target:,.2f} 이상입니다."
             )
         elif live_best_max_hold is not None and holding_days_now >= live_best_max_hold:
             signal = "기간청산"
@@ -1801,7 +1836,7 @@ try:
                 f"최대 보유기간 {live_best_max_hold}일에 도달했습니다. "
                 "단기회전 규칙에 따라 전량매도 신호입니다."
             )
-        elif next_stage <= tranche_count and live_dd >= live_best_step * next_stage:
+        elif next_stage <= tranche_count and live_dd + 1e-12 >= live_best_step * next_stage:
             if filter_ok and loc_buy_fill_ok:
                 signal = f"{next_stage}차 매수"
                 detail = "가격 조건과 필터를 모두 통과했습니다."
@@ -1822,7 +1857,7 @@ try:
     else:
         first_signal_price = live_anchor * (1 - live_best_step)
 
-        if live_dd >= live_best_step:
+        if live_dd + 1e-12 >= live_best_step:
             if filter_ok and loc_buy_fill_ok:
                 signal = "1차 매수"
                 detail = "오늘 처음 시작 기준 1차 매수 조건과 필터를 통과했습니다."
@@ -1869,8 +1904,7 @@ try:
                 loc_effective_buy = min(float(raw_buy_trigger), float(loc_buy_limit_today))
 
         # 매도는 보유 중일 때 평균단가 × 익절목표에 LOC 여유를 반영합니다.
-        loc_sell_limit_today = None
-        if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
+        if loc_sell_limit_today is None and live_stage > 0 and avg_buy_price and avg_buy_price > 0:
             base_sell_target = float(avg_buy_price) * (1 + live_best_tp)
             loc_sell_limit_today = base_sell_target * (1 + live_best_loc_sell_offset)
 
@@ -1940,14 +1974,27 @@ try:
             "매수·매도 주문을 동시에 낼 수 있는지는 증권사 주문가능금액/수량 및 주문 방식에 따라 다릅니다. "
             "LOC는 마감 경매에서 한도가격 조건을 만족해야 체결되며, 표시 가격에 반드시 체결되는 것은 아닙니다."
         )
-    allocation_text = " → ".join(
-        f"{currency}{x:,.0f}" for x in live_tranche_budgets
+    live_tranche_weights = make_tranche_weights(tranche_count, live_best_weight_mode)
+    allocation_view = pd.DataFrame(
+        {
+            "차수": [f"{i}차" for i in range(1, tranche_count + 1)],
+            "매수비중": [f"{w:.2%}" for w in live_tranche_weights],
+            "예정금액": [f"{currency}{x:,.0f}" for x in live_tranche_budgets],
+        }
+    )
+    current_weight_pct = float(
+        live_tranche_weights[min(max(next_stage - 1, 0), tranche_count - 1)]
     )
     st.write(f"**매수 비중:** {live_best_weight_mode}")
-    st.caption(f"단계별 예정금액: {allocation_text}")
+    st.dataframe(
+        allocation_view,
+        use_container_width=True,
+        hide_index=True,
+        height=min(38 * (tranche_count + 1), 500),
+    )
     st.write(
-        f"**{min(next_stage, tranche_count)}차 예정 매수금액:** "
-        f"{currency}{tranche_budget:,.0f}"
+        f"**{min(next_stage, tranche_count)}차 예정 비중:** {current_weight_pct:.2%} · "
+        f"예정 매수금액 {currency}{tranche_budget:,.0f}"
     )
 
     if signal.endswith("매수"):
