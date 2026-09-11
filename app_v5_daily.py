@@ -1488,8 +1488,18 @@ try:
             side = str(rec.get("구분", ""))
             px = float(rec.get("가격", 0) or 0)
             amount = float(rec.get("금액", 0) or 0)
+            raw_qty = rec.get("수량", None)
+            try:
+                qty = float(raw_qty) if pd.notna(raw_qty) and str(raw_qty).strip() else 0.0
+            except Exception:
+                qty = 0.0
 
-            if side == "매수" and px > 0 and amount > 0:
+            # 구버전 CSV에는 수량 열이 없으므로 금액/가격으로 자동 복원합니다.
+            if side == "매수" and px > 0 and (amount > 0 or qty > 0):
+                if qty <= 0 and amount > 0:
+                    qty = amount / px
+                if amount <= 0 and qty > 0:
+                    amount = qty * px
                 if live_buys == 0:
                     try:
                         live_first_buy_date = pd.Timestamp(rec.get("날짜"))
@@ -1501,7 +1511,7 @@ try:
                     raw_weight = rec.get("사이클매수비중", None)
                     if pd.notna(raw_weight) and str(raw_weight).strip():
                         cycle_weight_mode = str(raw_weight)
-                live_qty += amount / px
+                live_qty += qty
                 live_cost += amount
                 live_buys += 1
             elif side == "전량매도":
@@ -1550,13 +1560,15 @@ try:
     live_best_loc_buy_offset = live_bundle.get("loc_buy_offset", 0.0)
     live_best_loc_sell_offset = live_bundle.get("loc_sell_offset", 0.0)
 
-    log1, log2, log3 = st.columns(3)
+    log1, log2, log3, log4 = st.columns(4)
     log1.metric("자동 보유 차수", f"{auto_stage}차")
     log2.metric(
         "자동 평균단가",
         f"{currency}{auto_avg_price:,.2f}" if live_qty > 0 else "-",
     )
-    log3.metric("투입금액", f"{currency}{live_cost:,.0f}")
+    qty_text = f"{live_qty:,.0f}주" if market.startswith("🇰🇷") else f"{live_qty:,.4f}주"
+    log3.metric("보유 수량", qty_text if live_qty > 0 else "-")
+    log4.metric("투입금액", f"{currency}{live_cost:,.0f}")
 
     if auto_stage > 0 and cycle_is_locked:
         st.success(
@@ -1607,12 +1619,33 @@ try:
         record_budgets = make_tranche_budgets(float(investment), tranche_count, record_weight_mode)
         record_next_stage = min(auto_stage + 1, tranche_count)
         default_amount = float(record_budgets[record_next_stage - 1])
-        record_amount = st.number_input(
-            f"매수금액 ({unit})",
-            min_value=0.0,
-            value=default_amount,
-            step=100.0 if currency == "$" else 10000.0,
-            key="record_amount",
+        default_qty = (default_amount / record_price) if record_price > 0 else 0.0
+
+        if market.startswith("🇰🇷"):
+            record_qty = st.number_input(
+                "실제 체결 수량 (주)",
+                min_value=0,
+                value=max(1, int(default_qty)) if default_qty > 0 else 0,
+                step=1,
+                key="record_qty_kr",
+                help="실제로 체결된 주식 수를 입력하세요.",
+            )
+            record_qty = float(record_qty)
+        else:
+            record_qty = st.number_input(
+                "실제 체결 수량 (주)",
+                min_value=0.0,
+                value=round(default_qty, 4),
+                step=0.0001,
+                format="%.4f",
+                key="record_qty_us",
+                help="실제로 체결된 주식 수를 입력하세요. 소수점 매수도 입력할 수 있습니다.",
+            )
+
+        record_amount = float(record_price) * float(record_qty)
+        st.caption(
+            f"체결금액: {currency}{record_amount:,.2f} · "
+            f"이번 차수 권장예산: {currency}{default_amount:,.2f}"
         )
 
         b1, b2 = st.columns(2)
@@ -1620,8 +1653,8 @@ try:
         if b1.button("🟢 매수 기록", use_container_width=True):
             if auto_stage >= tranche_count:
                 st.warning("설정한 분할매수 횟수를 이미 모두 사용했습니다.")
-            elif record_price <= 0 or record_amount <= 0:
-                st.warning("체결가격과 매수금액을 입력해 주세요.")
+            elif record_price <= 0 or record_qty <= 0:
+                st.warning("체결가격과 매수 수량을 입력해 주세요.")
             else:
                 st.session_state.live_trades.append(
                     {
@@ -1629,6 +1662,7 @@ try:
                         "종목": actual_trade_target,
                         "구분": "매수",
                         "가격": float(record_price),
+                        "수량": float(record_qty),
                         "금액": float(record_amount),
                         "사이클전략": live_strategy_name if auto_stage > 0 and cycle_is_locked else winner_name,
                         "사이클매수비중": live_best_weight_mode if auto_stage > 0 and cycle_is_locked else best_weight_mode,
@@ -1649,6 +1683,7 @@ try:
                         "종목": actual_trade_target,
                         "구분": "전량매도",
                         "가격": float(record_price),
+                        "수량": float(live_qty),
                         "금액": float(proceeds),
                         "사이클전략": live_strategy_name if auto_stage > 0 else winner_name,
                         "사이클매수비중": live_best_weight_mode if auto_stage > 0 else best_weight_mode,
