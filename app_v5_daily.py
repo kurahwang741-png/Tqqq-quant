@@ -2,19 +2,24 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import date
+from datetime import date, datetime, timezone
 import time
+import json
+import hashlib
+import urllib.error
+import urllib.parse
+import urllib.request
 from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V30",
+    page_title="TQQQ / SOXL / 코코레 QUANT V31",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V30")
-st.caption("현금보유 자동비교 · 평균 투자금 사용률 · 다음 거래일 체결")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V31")
+st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 
@@ -47,6 +52,29 @@ investment = st.number_input(
     value=default_investment,
     step=step_investment,
 )
+
+with st.expander("🛡️ 실전 주문 안전장치", expanded=True):
+    emergency_stop = st.toggle(
+        "긴급 매수 중지",
+        value=False,
+        help="켜면 매수 신호와 주문 안내를 모두 안전대기로 바꿉니다. 매도 신호는 유지합니다.",
+    )
+    safe1, safe2 = st.columns(2)
+    max_daily_buy_pct = safe1.number_input(
+        "1일 최대 매수비중(%)", min_value=1.0, max_value=100.0, value=25.0, step=1.0
+    ) / 100
+    max_total_deployed_pct = safe2.number_input(
+        "총투입 한도(%)", min_value=10.0, max_value=100.0, value=90.0, step=5.0
+    ) / 100
+    safe3, safe4 = st.columns(2)
+    max_quote_age_minutes = int(safe3.number_input(
+        "최신시세 허용 지연(분)", min_value=1, max_value=10080, value=1440, step=10,
+        help="미국장 마감 후 다음 장 준비가 가능하도록 기본값은 24시간입니다. 장중에는 20분 등으로 줄일 수 있습니다.",
+    ))
+    max_price_gap_pct = safe4.number_input(
+        "일봉 대비 가격차 경고(%)", min_value=1.0, max_value=50.0, value=15.0, step=1.0
+    ) / 100
+    st.caption("안전장치는 백테스트 수익률이 아니라 실제 주문 안내와 매매기록 입력에 적용됩니다.")
 
 st.info(
     "백테스트와 전략 신호 계산은 일봉 기준입니다. "
@@ -280,7 +308,7 @@ def _is_market_cycle_locked(records, market_key):
     if df.empty:
         return False
 
-    sell_mask = df["구분"].astype(str).str.contains("매도", na=False)
+    sell_mask = df["구분"].astype(str).eq("전량매도")
     sell_rows = df.index[sell_mask].tolist()
     cycle_df = df.loc[sell_rows[-1] + 1:] if sell_rows else df
 
@@ -525,16 +553,98 @@ def make_tranche_budgets(initial_cash, n_tranches, allocation_weights=None):
     return (float(initial_cash) * weights).tolist()
 
 
-def autosave_live_trades(records):
-    """앱 재실행 시 복구할 수 있도록 매매기록을 즉시 저장합니다."""
+def _remote_store_config():
+    """선택형 Supabase 저장소 설정을 읽습니다. 설정이 없으면 로컬 저장만 사용합니다."""
     try:
-        pd.DataFrame(records).to_csv(AUTO_LOG_PATH, index=False, encoding="utf-8-sig")
-        return True
+        cfg = st.secrets.get("trade_store", {})
+        url = str(cfg.get("url", "")).rstrip("/")
+        key = str(cfg.get("key", ""))
+        user_key = str(cfg.get("user_key", ""))
+        if url and key and user_key:
+            return url, key, user_key
+    except Exception:
+        pass
+    return None
+
+
+def _remote_request(method, records=None):
+    cfg = _remote_store_config()
+    if cfg is None:
+        return None
+    url, key, user_key = cfg
+    encoded_key = urllib.parse.quote(user_key, safe="")
+    endpoint = f"{url}/rest/v1/quant_trade_logs"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if method == "GET":
+        request = urllib.request.Request(
+            f"{endpoint}?user_key=eq.{encoded_key}&select=records",
+            headers=headers,
+            method="GET",
+        )
+    else:
+        payload = json.dumps({
+            "user_key": user_key,
+            "records": records or [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False).encode("utf-8")
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        request = urllib.request.Request(
+            f"{endpoint}?on_conflict=user_key", data=payload, headers=headers, method="POST"
+        )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body) if body else True
+
+
+def save_remote_trades(records):
+    try:
+        return _remote_request("POST", records) is not None
     except Exception:
         return False
 
 
+def load_remote_trades():
+    try:
+        result = _remote_request("GET")
+        if isinstance(result, list) and result:
+            records = result[0].get("records", [])
+            return records if isinstance(records, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def trade_log_checksum(records):
+    raw = json.dumps(records or [], ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+
+def autosave_live_trades(records):
+    """앱 재실행 시 복구할 수 있도록 매매기록을 즉시 저장합니다."""
+    local_ok = False
+    try:
+        pd.DataFrame(records).to_csv(AUTO_LOG_PATH, index=False, encoding="utf-8-sig")
+        local_ok = True
+    except Exception:
+        pass
+    remote_ok = save_remote_trades(records) if _remote_store_config() else None
+    st.session_state["last_save_status"] = {
+        "local": local_ok,
+        "remote": remote_ok,
+        "checksum": trade_log_checksum(records),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+    return bool(local_ok or remote_ok)
+
+
 def load_autosaved_trades():
+    remote = load_remote_trades() if _remote_store_config() else []
+    if remote:
+        return remote
     if not AUTO_LOG_PATH.exists() or AUTO_LOG_PATH.stat().st_size == 0:
         return []
     try:
@@ -1703,6 +1813,25 @@ try:
     if "live_trades" not in st.session_state:
         st.session_state.live_trades = load_autosaved_trades()
 
+    if _remote_store_config():
+        st.success("☁️ 매매기록 영구저장 연결됨")
+    else:
+        st.warning(
+            "현재는 로컬+CSV 백업 모드입니다. Streamlit 재배포 후 자동복구가 필요하면 "
+            "secrets의 [trade_store]에 url, key, user_key를 설정하세요."
+        )
+
+    save_status = st.session_state.get("last_save_status")
+    if save_status:
+        remote_text = (
+            "영구저장 완료" if save_status.get("remote") is True
+            else "영구저장 미사용" if save_status.get("remote") is None
+            else "영구저장 실패"
+        )
+        st.caption(
+            f"최근 저장: {remote_text} · 기록 확인코드 {save_status.get('checksum', '-')}"
+        )
+
     uploaded_log = st.file_uploader(
         "기존 매매기록 CSV 불러오기",
         type=["csv"],
@@ -1734,6 +1863,7 @@ try:
     live_cost = 0.0
     live_buys = 0
     live_first_buy_date = None
+    live_partial_stage = None
     cycle_strategy_name = None
     cycle_allocation_raw = None
     cycle_deployment_ratio = None
@@ -1745,6 +1875,9 @@ try:
                 continue
 
             side = str(rec.get("구분", ""))
+            fill_status = str(rec.get("체결상태", "전량체결") or "전량체결")
+            if fill_status in ("미체결", "취소"):
+                continue
             px = float(rec.get("가격", 0) or 0)
             amount = float(rec.get("금액", 0) or 0)
             raw_qty = rec.get("수량", None)
@@ -1778,15 +1911,33 @@ try:
                             cycle_deployment_ratio = None
                 live_qty += qty
                 live_cost += amount
-                live_buys += 1
-            elif side == "전량매도":
-                live_qty = 0.0
-                live_cost = 0.0
-                live_buys = 0
-                live_first_buy_date = None
-                cycle_strategy_name = None
-                cycle_allocation_raw = None
-                cycle_deployment_ratio = None
+                raw_stage = rec.get("차수", None)
+                try:
+                    rec_stage = int(float(raw_stage)) if pd.notna(raw_stage) else live_buys + 1
+                except Exception:
+                    rec_stage = live_buys + 1
+                if fill_status == "부분체결":
+                    live_partial_stage = rec_stage
+                    live_buys = max(live_buys, rec_stage - 1)
+                else:
+                    live_buys = max(live_buys, rec_stage)
+                    if live_partial_stage == rec_stage:
+                        live_partial_stage = None
+            elif side in ("부분매도", "전량매도") and live_qty > 0:
+                sold_qty = min(max(qty, 0.0), live_qty)
+                if side == "전량매도" or sold_qty >= live_qty - 1e-8:
+                    live_qty = 0.0
+                    live_cost = 0.0
+                    live_buys = 0
+                    live_partial_stage = None
+                    live_first_buy_date = None
+                    cycle_strategy_name = None
+                    cycle_allocation_raw = None
+                    cycle_deployment_ratio = None
+                elif sold_qty > 0:
+                    remaining_ratio = (live_qty - sold_qty) / live_qty
+                    live_cost *= remaining_ratio
+                    live_qty -= sold_qty
 
     auto_avg_price = live_cost / live_qty if live_qty > 0 else 0.0
     auto_stage = min(live_buys, tranche_count)
@@ -1834,7 +1985,10 @@ try:
     live_best_loc_sell_offset = live_bundle.get("loc_sell_offset", 0.0)
 
     log1, log2, log3, log4 = st.columns(4)
-    log1.metric("자동 보유 차수", f"{auto_stage}차")
+    stage_label = f"{auto_stage}차"
+    if live_partial_stage is not None:
+        stage_label += f" · {live_partial_stage}차 부분체결"
+    log1.metric("자동 보유 차수", stage_label)
     log2.metric(
         "자동 평균단가",
         f"{currency}{auto_avg_price:,.2f}" if live_qty > 0 else "-",
@@ -1905,6 +2059,37 @@ try:
         default_amount = float(record_budgets[record_next_stage - 1])
         default_qty = (default_amount / record_price) if record_price > 0 else 0.0
 
+        order_status = st.selectbox(
+            "매수/매도 체결상태",
+            ["전량체결", "부분체결", "미체결", "취소"],
+            help="부분체결은 실제 체결된 수량만 입력하세요. 해당 차수는 전량체결 기록 전까지 완료되지 않습니다.",
+        )
+        order_id = st.text_input(
+            "주문번호/확인번호",
+            value=f"{record_date}-{actual_trade_symbol}-B{record_next_stage}",
+            help="증권사 주문번호가 있으면 바꿔 입력하세요. 동일 번호의 중복기록을 차단합니다.",
+        ).strip()
+
+        plan_row = live_best_df.iloc[-1]
+        planned_signal_price = float(plan_row["ANCHOR"]) * (
+            1 - live_best_step * record_next_stage
+        )
+        default_expected_price = selected_live_price
+        if market.startswith("🇺🇸") and live_best_loc_buy_ratio > 0:
+            series_for_plan = close[actual_trade_symbol].dropna()
+            if not series_for_plan.empty:
+                default_expected_price = min(
+                    planned_signal_price,
+                    float(series_for_plan.iloc[-1]) * (1 - live_best_loc_buy_offset),
+                )
+        expected_order_price = st.number_input(
+            f"앱 예상 주문가격 ({unit})",
+            min_value=0.0,
+            value=max(float(default_expected_price), 0.0),
+            step=1.0 if currency == "$" else 10.0,
+            help="실제 체결가와 비교해 체결오차를 자동 계산합니다.",
+        )
+
         if market.startswith("🇰🇷"):
             record_qty = st.number_input(
                 "실제 체결 수량 (주)",
@@ -1928,41 +2113,88 @@ try:
 
         record_amount = float(record_price) * float(record_qty)
         actual_investment_pct = record_amount / float(investment) if investment > 0 else 0.0
+        fill_error_pct = (
+            float(record_price) / float(expected_order_price) - 1
+            if expected_order_price > 0 and record_price > 0 else np.nan
+        )
         st.caption(
             f"체결금액: {currency}{record_amount:,.2f} · "
             f"초기 투자금의 {actual_investment_pct:.2%} · "
             f"이번 차수 계획비중: {record_weight_pct:.2%} "
             f"({currency}{default_amount:,.2f})"
         )
+        if np.isfinite(fill_error_pct):
+            st.caption(f"예상 주문가 대비 실제 체결오차: {fill_error_pct:+.3%}")
+
+        default_sell_qty = float(live_qty) if live_qty > 0 else 0.0
+        if market.startswith("🇰🇷"):
+            sell_qty = float(st.number_input(
+                "매도 체결 수량 (주)", min_value=0, value=int(default_sell_qty), step=1,
+                help="부분체결이면 실제 체결 수량만 입력하세요.",
+            ))
+        else:
+            sell_qty = float(st.number_input(
+                "매도 체결 수량 (주)", min_value=0.0, value=round(default_sell_qty, 4),
+                step=0.0001, format="%.4f", help="부분체결이면 실제 체결 수량만 입력하세요.",
+            ))
+        expected_sell_price = (
+            auto_avg_price * (1 + live_best_tp) if auto_avg_price > 0 else record_price
+        )
 
         b1, b2 = st.columns(2)
 
         if b1.button("🟢 매수 기록", use_container_width=True):
+            daily_filled_buy = 0.0
+            for existing in st.session_state.live_trades:
+                existing_status = str(existing.get("체결상태", "전량체결") or "전량체결")
+                if (
+                    str(existing.get("날짜", "")) == str(record_date)
+                    and str(existing.get("종목", actual_trade_target)) == actual_trade_target
+                    and str(existing.get("구분", "")) == "매수"
+                    and existing_status in ("전량체결", "부분체결")
+                ):
+                    daily_filled_buy += float(existing.get("금액", 0) or 0)
             duplicate_buy = any(
-                str(x.get("날짜", "")) == str(record_date)
-                and str(x.get("종목", actual_trade_target)) == actual_trade_target
-                and str(x.get("구분", "")) == "매수"
+                (
+                    order_id and str(x.get("주문ID", "")).strip() == order_id
+                ) or (
+                    not order_id
+                    and str(x.get("날짜", "")) == str(record_date)
+                    and str(x.get("종목", actual_trade_target)) == actual_trade_target
+                    and str(x.get("구분", "")) == "매수"
+                    and str(x.get("차수", "")) == str(record_next_stage)
+                )
                 for x in st.session_state.live_trades
             )
             if auto_stage >= tranche_count:
                 st.warning("설정한 분할매수 횟수를 이미 모두 사용했습니다.")
             elif duplicate_buy:
-                st.warning("같은 종목의 같은 날짜 매수기록이 이미 있어 중복 입력을 막았습니다.")
-            elif record_price <= 0 or record_qty <= 0:
+                st.warning("동일한 주문번호 또는 같은 날짜·차수의 기록이 있어 중복 입력을 막았습니다.")
+            elif order_status in ("전량체결", "부분체결") and (record_price <= 0 or record_qty <= 0):
                 st.warning("체결가격과 매수 수량을 입력해 주세요.")
-            elif live_cost + record_amount > float(investment) * 1.001:
-                st.warning("입력 후 총투입금액이 설정한 초기 투자금을 초과해 기록하지 않았습니다.")
+            elif order_status in ("전량체결", "부분체결") and daily_filled_buy + record_amount > float(investment) * max_daily_buy_pct + 1e-6:
+                st.warning(f"1일 최대 매수한도 {max_daily_buy_pct:.0%}를 초과해 기록하지 않았습니다.")
+            elif order_status in ("전량체결", "부분체결") and live_cost + record_amount > float(investment) * max_total_deployed_pct + 1e-6:
+                st.warning(f"총투입 한도 {max_total_deployed_pct:.0%}를 초과해 기록하지 않았습니다.")
             else:
+                effective_qty = float(record_qty) if order_status in ("전량체결", "부분체결") else 0.0
+                effective_amount = float(record_price) * effective_qty
                 st.session_state.live_trades.append(
                     {
                         "날짜": str(record_date),
                         "종목": actual_trade_target,
                         "구분": "매수",
+                        "체결상태": order_status,
+                        "주문ID": order_id,
+                        "차수": record_next_stage,
                         "가격": float(record_price),
-                        "수량": float(record_qty),
-                        "금액": float(record_amount),
+                        "수량": effective_qty,
+                        "금액": effective_amount,
+                        "예상가격": float(expected_order_price),
+                        "예상금액": float(default_amount),
+                        "체결오차": float(fill_error_pct) if np.isfinite(fill_error_pct) and effective_qty > 0 else None,
                         "계획비중": record_weight_pct,
-                        "실제투입비중": actual_investment_pct,
+                        "실제투입비중": effective_amount / float(investment) if investment > 0 else 0.0,
                         "사이클전략": live_strategy_name if auto_stage > 0 and cycle_is_locked else winner_name,
                         "사이클매수비중": serialize_allocation(
                             live_best_allocation_weights if auto_stage > 0 and cycle_is_locked else best_allocation_weights
@@ -1973,29 +2205,49 @@ try:
                 autosave_live_trades(st.session_state.live_trades)
                 st.rerun()
 
-        if b2.button("🔴 전량매도 기록", use_container_width=True):
+        if b2.button("🔴 매도 기록", use_container_width=True):
+            sell_order_id = order_id.replace(f"-B{record_next_stage}", "-SELL") if order_id else ""
             duplicate_sell = any(
-                str(x.get("날짜", "")) == str(record_date)
-                and str(x.get("종목", actual_trade_target)) == actual_trade_target
-                and str(x.get("구분", "")) == "전량매도"
+                (
+                    sell_order_id and str(x.get("주문ID", "")).strip() == sell_order_id
+                ) or (
+                    not sell_order_id
+                    and str(x.get("날짜", "")) == str(record_date)
+                    and str(x.get("종목", actual_trade_target)) == actual_trade_target
+                    and str(x.get("구분", "")) in ("부분매도", "전량매도")
+                )
                 for x in st.session_state.live_trades
             )
-            if live_qty <= 0:
+            if live_qty <= 0 and order_status in ("전량체결", "부분체결"):
                 st.warning("현재 기록상 보유 수량이 없습니다.")
             elif duplicate_sell:
-                st.warning("같은 종목의 같은 날짜 전량매도 기록이 이미 있습니다.")
-            elif record_price <= 0:
+                st.warning("동일한 매도 주문번호가 이미 있어 중복 입력을 막았습니다.")
+            elif order_status in ("전량체결", "부분체결") and (record_price <= 0 or sell_qty <= 0):
                 st.warning("매도 체결가격을 입력해 주세요.")
+            elif sell_qty > live_qty + 1e-8:
+                st.warning("현재 보유수량보다 많이 매도할 수 없습니다.")
             else:
-                proceeds = live_qty * float(record_price)
+                effective_sell_qty = sell_qty if order_status in ("전량체결", "부분체결") else 0.0
+                proceeds = effective_sell_qty * float(record_price)
+                is_full_exit = effective_sell_qty >= live_qty - 1e-8 and order_status == "전량체결"
+                sell_error = (
+                    float(record_price) / float(expected_sell_price) - 1
+                    if expected_sell_price > 0 and effective_sell_qty > 0 else None
+                )
                 st.session_state.live_trades.append(
                     {
                         "날짜": str(record_date),
                         "종목": actual_trade_target,
-                        "구분": "전량매도",
+                        "구분": "전량매도" if is_full_exit else "부분매도",
+                        "체결상태": order_status,
+                        "주문ID": sell_order_id,
+                        "차수": auto_stage,
                         "가격": float(record_price),
-                        "수량": float(live_qty),
+                        "수량": float(effective_sell_qty),
                         "금액": float(proceeds),
+                        "예상가격": float(expected_sell_price),
+                        "예상금액": float(live_qty * expected_sell_price),
+                        "체결오차": float(sell_error) if sell_error is not None else None,
                         "계획비중": None,
                         "실제투입비중": None,
                         "사이클전략": live_strategy_name if auto_stage > 0 else winner_name,
@@ -2018,6 +2270,25 @@ try:
                     lambda x: f"{float(x):.2%}" if pd.notna(x) and str(x).strip() else "-"
                 )
         st.dataframe(trade_log_view, use_container_width=True, hide_index=True)
+
+        if "체결상태" in trade_log.columns:
+            statuses = trade_log["체결상태"].fillna("전량체결").astype(str)
+            total_orders = len(trade_log)
+            filled_orders = int(statuses.isin(["전량체결", "부분체결"]).sum())
+            full_orders = int((statuses == "전량체결").sum())
+            fill_rate = filled_orders / total_orders if total_orders else 0.0
+            q1, q2, q3 = st.columns(3)
+            q1.metric("주문 기록", f"{total_orders}건")
+            q2.metric("체결률", f"{fill_rate:.1%}")
+            q3.metric("전량체결", f"{full_orders}건")
+
+        if "체결오차" in trade_log.columns:
+            errors = pd.to_numeric(trade_log["체결오차"], errors="coerce").dropna()
+            if not errors.empty:
+                e1, e2 = st.columns(2)
+                e1.metric("평균 체결오차", f"{errors.mean():+.3%}")
+                e2.metric("평균 절대오차", f"{errors.abs().mean():.3%}")
+                st.caption("양수는 앱 예상가격보다 높게 체결, 음수는 낮게 체결된 것입니다.")
 
         csv_bytes = trade_log.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
@@ -2062,7 +2333,27 @@ try:
         latest_daily_date = latest_daily_date.tz_localize(None)
     data_age_days = (pd.Timestamp.utcnow().tz_localize(None).normalize() - latest_daily_date.normalize()).days
     price_gap = abs(trade_price / daily_trade_price - 1) if daily_trade_price > 0 else float("inf")
-    data_safe = data_age_days <= 5 and np.isfinite(trade_price) and trade_price > 0 and price_gap <= 0.25
+    quote_age_minutes = float("inf")
+    if latest_price_time is not None:
+        try:
+            quote_ts = pd.Timestamp(latest_price_time)
+            if quote_ts.tzinfo is None:
+                quote_ts = quote_ts.tz_localize(
+                    "America/New_York" if market.startswith("🇺🇸") else "Asia/Seoul"
+                )
+            quote_age_minutes = max(
+                0.0,
+                (pd.Timestamp.now(tz="UTC") - quote_ts.tz_convert("UTC")).total_seconds() / 60,
+            )
+        except Exception:
+            quote_age_minutes = float("inf")
+    data_safe = (
+        data_age_days <= 5
+        and np.isfinite(trade_price)
+        and trade_price > 0
+        and price_gap <= max_price_gap_pct
+        and quote_age_minutes <= max_quote_age_minutes
+    )
     live_anchor = float(latest["ANCHOR"])
     live_dd = max(0.0, 1 - signal_price / live_anchor)
 
@@ -2184,10 +2475,22 @@ try:
 
     if not data_safe:
         signal = "안전대기"
+        age_text = "확인불가" if not np.isfinite(quote_age_minutes) else f"{quote_age_minutes:.0f}분"
         detail = (
             f"데이터 안전장치 작동: 최근 일봉 경과 {data_age_days}일, "
-            f"최신가와 일봉 차이 {price_gap:.1%}. 데이터 확인 전에는 주문하지 않습니다."
+            f"최신시세 경과 {age_text}, 최신가와 일봉 차이 {price_gap:.1%}. "
+            "데이터 확인 전에는 주문하지 않습니다."
         )
+
+    if signal.endswith("매수") and emergency_stop:
+        signal = "안전대기"
+        detail = "긴급 매수 중지가 켜져 있어 신규 매수 주문을 내지 않습니다."
+    elif signal.endswith("매수") and tranche_budget > float(investment) * max_daily_buy_pct + 1e-6:
+        signal = "안전대기"
+        detail = f"예정금액이 1일 최대 매수한도 {max_daily_buy_pct:.0%}를 초과해 주문을 보류합니다."
+    elif signal.endswith("매수") and live_cost + tranche_budget > float(investment) * max_total_deployed_pct + 1e-6:
+        signal = "안전대기"
+        detail = f"주문 후 총투입금액이 안전한도 {max_total_deployed_pct:.0%}를 초과해 주문을 보류합니다."
 
     a1, a2, a3 = st.columns(3)
     signal_display = (
