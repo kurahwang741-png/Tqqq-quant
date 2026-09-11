@@ -6,12 +6,12 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V26",
+    page_title="TQQQ / SOXL / 코코레 QUANT V27",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V26")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V27")
 st.caption("일봉 백테스트 · 오늘 현재가 프리/정규/애프터 최신 시세 + 가중비중 자동비교 + TQQQ LOC")
 
 market = st.radio(
@@ -1271,17 +1271,18 @@ try:
         f"CAGR {best_ma_row['CAGR']:.1%} · MDD {best_ma_row['MDD']:.1%}"
     )
 
-    st.subheader("⚖️ 비중 방식 비교")
+    st.subheader("⚖️ 자금배분 방식 비교")
     weight_summary = (
         result.sort_values(["최종자산", "CAGR"], ascending=False)
-        .groupby("매수비중", as_index=False)
+        .groupby("자금배분", as_index=False)
         .first()
         .sort_values(["최종자산", "CAGR"], ascending=False)
     )
 
     weight_view = weight_summary[
-        ["매수비중", "최종자산", "CAGR", "MDD", "최대보유일", "완료매매"]
+        ["자금배분", "최대투입", "최종자산", "CAGR", "MDD", "최대보유일", "완료매매"]
     ].copy()
+    weight_view["최대투입"] = weight_view["최대투입"].map(lambda x: f"{x:.0%}")
     weight_view["최종자산"] = weight_view["최종자산"].map(
         lambda x: f"{currency}{x:,.0f}"
     )
@@ -1292,7 +1293,7 @@ try:
 
     best_weight_row = weight_summary.iloc[0]
     st.success(
-        f"🏆 비중 방식 1위: **{best_weight_row['매수비중']}** · "
+        f"🏆 자금배분 1위: **{best_weight_row['자금배분']} / 최대투입 {best_weight_row['최대투입']:.0%}** · "
         f"최종자산 {currency}{best_weight_row['최종자산']:,.0f} · "
         f"CAGR {best_weight_row['CAGR']:.1%} · "
         f"MDD {best_weight_row['MDD']:.1%}"
@@ -1934,6 +1935,8 @@ try:
     display["최대보유일"] = display["최대보유일"].map(lambda x: f"{x:.0f}일")
     display["매수간격"] = display["매수간격"].map(lambda x: f"{x:.0%}")
     display["익절률"] = display["익절률"].map(lambda x: f"{x:.0%}")
+    if "최대투입" in display.columns:
+        display["최대투입"] = display["최대투입"].map(lambda x: f"{x:.0%}")
     display["승률"] = display["승률"].map(
         lambda x: f"{x:.1%}" if pd.notna(x) else "-"
     )
@@ -1944,7 +1947,9 @@ try:
                 "운용방식",
                 "매수간격",
                 "익절률",
-                "매수비중",
+                "자금배분",
+                "최대투입",
+                "단계비중",
                 "필터",
                 "체결방식",
                 "최종자산",
