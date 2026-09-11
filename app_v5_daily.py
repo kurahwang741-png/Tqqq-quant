@@ -6,12 +6,12 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V12",
+    page_title="TQQQ / 코코레 QUANT V13",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / 코코레 QUANT V12")
+st.title("📈 TQQQ / 코코레 QUANT V13")
 st.caption("일봉 백테스트 · 오늘 현재가 프리/정규/애프터 최신 시세 + 가중비중 자동비교 + TQQQ LOC")
 
 market = st.radio(
@@ -899,7 +899,7 @@ try:
     st.caption(
         "코코레 신호를 보면서 실제 거래는 본주 또는 코코레 중 선택할 수 있습니다. "
         "선택한 종목별로 보유 차수와 평균단가를 따로 계산합니다. "
-        "Streamlit Cloud 재부팅에 대비해 CSV 백업을 보관해 주세요."
+        "새 매수부터는 사이클 전략도 CSV에 함께 저장됩니다. Streamlit Cloud 재부팅에 대비해 CSV 백업을 보관해 주세요."
     )
 
     if "live_trades" not in st.session_state:
@@ -935,6 +935,8 @@ try:
     live_cost = 0.0
     live_buys = 0
     live_first_buy_date = None
+    cycle_strategy_name = None
+    cycle_weight_mode = None
 
     if not trade_log.empty:
         for _, rec in trade_log.iterrows():
@@ -952,6 +954,12 @@ try:
                         live_first_buy_date = pd.Timestamp(rec.get("날짜"))
                     except Exception:
                         live_first_buy_date = None
+                    raw_strategy = rec.get("사이클전략", None)
+                    if pd.notna(raw_strategy) and str(raw_strategy).strip():
+                        cycle_strategy_name = str(raw_strategy)
+                    raw_weight = rec.get("사이클매수비중", None)
+                    if pd.notna(raw_weight) and str(raw_weight).strip():
+                        cycle_weight_mode = str(raw_weight)
                 live_qty += amount / px
                 live_cost += amount
                 live_buys += 1
@@ -960,9 +968,46 @@ try:
                 live_cost = 0.0
                 live_buys = 0
                 live_first_buy_date = None
+                cycle_strategy_name = None
+                cycle_weight_mode = None
 
     auto_avg_price = live_cost / live_qty if live_qty > 0 else 0.0
     auto_stage = min(live_buys, tranche_count)
+
+    # 실제 보유 사이클이 시작되면 그때의 전략을 전량매도까지 고정합니다.
+    live_strategy_name = winner_name
+    live_bundle = winner_bundle
+    cycle_is_locked = False
+    legacy_cycle = False
+
+    if auto_stage > 0:
+        if cycle_strategy_name and cycle_strategy_name in sims:
+            live_strategy_name = cycle_strategy_name
+            live_bundle = sims[cycle_strategy_name]
+            cycle_is_locked = True
+        elif cycle_strategy_name:
+            # 현재 백테스트 조합에서 예전 전략을 찾지 못한 경우에도
+            # 매수비중은 CSV에 저장된 값을 우선 유지합니다.
+            live_strategy_name = cycle_strategy_name
+            live_bundle = winner_bundle
+            cycle_is_locked = True
+        else:
+            legacy_cycle = True
+
+    live_best = live_bundle["sim"]
+    live_best_mode = live_bundle["mode"]
+    live_best_df = live_bundle["df"]
+    live_best_step = float(live_bundle["step_pct"])
+    live_best_tp = float(live_bundle["tp"])
+    live_best_use_ma = bool(live_bundle["use_ma"])
+    live_best_rsi = live_bundle["rsi_max"]
+    live_best_weight_mode = live_bundle.get("weight_mode", "균등비중")
+    if cycle_weight_mode in ["균등비중", "약한 가중", "강한 가중"]:
+        live_best_weight_mode = cycle_weight_mode
+    live_best_max_hold = live_bundle.get("max_hold_days")
+    live_best_execution_mode = live_bundle.get("execution_mode", "일반 종가모드")
+    live_best_loc_buy_offset = live_bundle.get("loc_buy_offset", 0.0)
+    live_best_loc_sell_offset = live_bundle.get("loc_sell_offset", 0.0)
 
     log1, log2, log3 = st.columns(3)
     log1.metric("자동 보유 차수", f"{auto_stage}차")
@@ -971,6 +1016,35 @@ try:
         f"{currency}{auto_avg_price:,.2f}" if live_qty > 0 else "-",
     )
     log3.metric("투입금액", f"{currency}{live_cost:,.0f}")
+
+    if auto_stage > 0 and cycle_is_locked:
+        st.success(
+            f"🔒 현재 사이클 전략 고정: **{live_best_weight_mode}** · "
+            f"{live_best_step:.0%} 간격 / {live_best_tp:.0%} 익절 · "
+            "전량매도 전까지 오늘의 1위가 바뀌어도 이 전략을 유지합니다."
+        )
+    elif auto_stage > 0 and legacy_cycle:
+        st.warning(
+            "기존 백업 CSV에는 사이클 전략 정보가 없습니다. "
+            "아래 버튼을 누르면 현재 1위 전략을 이번 보유 사이클에 고정합니다."
+        )
+        if st.button("🔒 기존 보유 사이클을 현재 1위 전략으로 고정", use_container_width=True):
+            # 마지막 전량매도 이후, 선택 종목의 매수 기록에 전략 스냅샷을 채웁니다.
+            last_sell_idx = -1
+            for i, rec in enumerate(st.session_state.live_trades):
+                if str(rec.get("종목", actual_trade_target)) == actual_trade_target and str(rec.get("구분", "")) == "전량매도":
+                    last_sell_idx = i
+            for i in range(last_sell_idx + 1, len(st.session_state.live_trades)):
+                rec = st.session_state.live_trades[i]
+                if str(rec.get("종목", actual_trade_target)) == actual_trade_target and str(rec.get("구분", "")) == "매수":
+                    rec["사이클전략"] = winner_name
+                    rec["사이클매수비중"] = best_weight_mode
+            st.rerun()
+    elif auto_stage == 0:
+        st.caption(
+            f"다음 1차 매수 시 현재 1위 전략 **{best_weight_mode}**을 자동 저장하고, "
+            "그 사이클이 끝날 때까지 고정합니다."
+        )
 
     with st.expander("➕ 매수/매도 기록 입력", expanded=False):
         record_date = st.date_input("거래일", value=date.today())
@@ -988,7 +1062,10 @@ try:
             step=1.0 if currency == "$" else 10.0,
             key="record_price",
         )
-        default_amount = float(investment) / tranche_count
+        record_weight_mode = live_best_weight_mode if auto_stage > 0 else best_weight_mode
+        record_budgets = make_tranche_budgets(float(investment), tranche_count, record_weight_mode)
+        record_next_stage = min(auto_stage + 1, tranche_count)
+        default_amount = float(record_budgets[record_next_stage - 1])
         record_amount = st.number_input(
             f"매수금액 ({unit})",
             min_value=0.0,
@@ -1012,6 +1089,8 @@ try:
                         "구분": "매수",
                         "가격": float(record_price),
                         "금액": float(record_amount),
+                        "사이클전략": live_strategy_name if auto_stage > 0 and cycle_is_locked else winner_name,
+                        "사이클매수비중": live_best_weight_mode if auto_stage > 0 and cycle_is_locked else best_weight_mode,
                     }
                 )
                 st.rerun()
@@ -1030,6 +1109,8 @@ try:
                         "구분": "전량매도",
                         "가격": float(record_price),
                         "금액": float(proceeds),
+                        "사이클전략": live_strategy_name if auto_stage > 0 else winner_name,
+                        "사이클매수비중": live_best_weight_mode if auto_stage > 0 else best_weight_mode,
                     }
                 )
                 st.rerun()
@@ -1059,13 +1140,13 @@ try:
     st.divider()
     st.subheader("🚦 오늘의 매매 신호")
     st.caption(
-        "1위 전략 기준입니다. 위 실제 매매 기록에서 보유 차수와 평균단가를 자동으로 읽습니다. "
-        "오늘 처음 시작하면 과거 여러 차수가 이미 충족돼도 한 번에 1차수만 안내합니다."
+        "보유 중이면 1차 매수 때 저장된 사이클 전략을 전량매도까지 고정해서 사용합니다. "
+        "보유가 없을 때만 현재 백테스트 1위 전략으로 새 사이클을 시작합니다."
     )
 
     live_stage = auto_stage
 
-    latest = best_df.iloc[-1]
+    latest = live_best_df.iloc[-1]
     # 신호 ETF 가격은 1위 전략의 신호 기준을 사용하고,
     # 실제 매수/매도 판단 가격은 사용자가 선택한 실제 거래 종목을 사용합니다.
     signal_price = float(latest["SIGNAL"])
@@ -1085,7 +1166,7 @@ try:
     next_stage = int(live_stage) + 1
 
     live_tranche_budgets = make_tranche_budgets(
-        float(investment), tranche_count, best_weight_mode
+        float(investment), tranche_count, live_best_weight_mode
     )
     tranche_budget = live_tranche_budgets[
         min(max(next_stage - 1, 0), tranche_count - 1)
@@ -1093,25 +1174,25 @@ try:
 
     avg_buy_price = auto_avg_price if live_stage > 0 else None
 
-    filter_ok = entry_allowed(latest, best_use_ma, best_rsi)
+    filter_ok = entry_allowed(latest, live_best_use_ma, live_best_rsi)
 
     loc_buy_fill_ok = True
     loc_buy_limit_today = None
-    if market.startswith("🇺🇸") and best_execution_mode == "LOC 모드":
+    if market.startswith("🇺🇸") and live_best_execution_mode == "LOC 모드":
         trade_series = close[actual_trade_symbol].dropna()
         if len(trade_series) >= 2:
             prev_close = float(trade_series.iloc[-2])
-            loc_buy_limit_today = prev_close * (1 - best_loc_buy_offset)
+            loc_buy_limit_today = prev_close * (1 - live_best_loc_buy_offset)
             loc_buy_fill_ok = trade_price <= loc_buy_limit_today
 
     filter_reasons = []
-    if best_use_ma and not live_trend_ok:
+    if live_best_use_ma and not live_trend_ok:
         filter_reasons.append("200일선 아래")
-    if best_rsi is not None and live_rsi > best_rsi:
-        filter_reasons.append(f"RSI {live_rsi:.1f} > {best_rsi:.0f}")
+    if live_best_rsi is not None and live_rsi > live_best_rsi:
+        filter_reasons.append(f"RSI {live_rsi:.1f} > {live_best_rsi:.0f}")
 
     next_signal_price = (
-        live_anchor * (1 - best_step * next_stage)
+        live_anchor * (1 - live_best_step * next_stage)
         if next_stage <= tranche_count
         else None
     )
@@ -1120,10 +1201,10 @@ try:
     detail = ""
 
     if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
-        target_sell = avg_buy_price * (1 + best_tp)
+        target_sell = avg_buy_price * (1 + live_best_tp)
 
         holding_days_now = (
-            (pd.Timestamp(best_df.index[-1]) - live_first_buy_date).days
+            (pd.Timestamp(live_best_df.index[-1]) - live_first_buy_date).days
             if live_first_buy_date is not None else 0
         )
 
@@ -1133,14 +1214,14 @@ try:
                 f"실제 매수 ETF 현재가가 익절 기준 "
                 f"{currency}{target_sell:,.2f} 이상입니다."
             )
-        elif best_max_hold is not None and holding_days_now >= best_max_hold:
+        elif live_best_max_hold is not None and holding_days_now >= live_best_max_hold:
             signal = "기간청산"
             detail = (
                 f"첫 매수 후 {holding_days_now}일이 지나 "
-                f"최대 보유기간 {best_max_hold}일에 도달했습니다. "
+                f"최대 보유기간 {live_best_max_hold}일에 도달했습니다. "
                 "단기회전 규칙에 따라 전량매도 신호입니다."
             )
-        elif next_stage <= tranche_count and live_dd >= best_step * next_stage:
+        elif next_stage <= tranche_count and live_dd >= live_best_step * next_stage:
             if filter_ok and loc_buy_fill_ok:
                 signal = f"{next_stage}차 매수"
                 detail = "가격 조건과 필터를 모두 통과했습니다."
@@ -1157,11 +1238,11 @@ try:
                 f"{currency}{next_signal_price:,.2f}"
             )
         else:
-            detail = f"분할매수를 모두 사용했습니다. +{best_tp:.0%} 익절을 기다립니다."
+            detail = f"분할매수를 모두 사용했습니다. +{live_best_tp:.0%} 익절을 기다립니다."
     else:
-        first_signal_price = live_anchor * (1 - best_step)
+        first_signal_price = live_anchor * (1 - live_best_step)
 
-        if live_dd >= best_step:
+        if live_dd >= live_best_step:
             if filter_ok and loc_buy_fill_ok:
                 signal = "1차 매수"
                 detail = "오늘 처음 시작 기준 1차 매수 조건과 필터를 통과했습니다."
@@ -1187,13 +1268,17 @@ try:
         "실시간 거래소 직결 시세가 아니라 yfinance 지연/가용 시세입니다."
     )
 
-    st.write(f"**신호 기준:** {best_mode['mode']}")
+    st.write(f"**신호 기준:** {live_best_mode['mode']}")
     st.write(f"**실제 거래 종목:** {actual_trade_target}")
-    if market.startswith("🇺🇸") and best_execution_mode == "LOC 모드":
+    if auto_stage > 0 and cycle_is_locked:
+        st.write(f"**🔒 사이클 고정 전략:** {live_best_weight_mode} · {live_best_step:.0%} 간격 / {live_best_tp:.0%} 익절")
+    elif auto_stage == 0:
+        st.write(f"**새 사이클 적용 예정:** 현재 1위 · {live_best_weight_mode}")
+    if market.startswith("🇺🇸") and live_best_execution_mode == "LOC 모드":
         if loc_buy_limit_today is not None:
             st.write(
                 f"**오늘 LOC 매수 한도:** {currency}{loc_buy_limit_today:,.2f} "
-                f"(전일 종가 대비 -{best_loc_buy_offset:.2%})"
+                f"(전일 종가 대비 -{live_best_loc_buy_offset:.2%})"
             )
 
             if "매수" in signal:
@@ -1216,7 +1301,7 @@ try:
     allocation_text = " → ".join(
         f"{currency}{x:,.0f}" for x in live_tranche_budgets
     )
-    st.write(f"**매수 비중:** {best_weight_mode}")
+    st.write(f"**매수 비중:** {live_best_weight_mode}")
     st.caption(f"단계별 예정금액: {allocation_text}")
     st.write(
         f"**{min(next_stage, tranche_count)}차 예정 매수금액:** "
