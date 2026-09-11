@@ -125,8 +125,8 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
 
     rsi_thresholds = st.multiselect(
         "비교할 RSI 상한",
-        [35, 40, 45, 50, 55],
-        default=[40, 45, 50],
+        [30, 35, 40, 45, 50],
+        default=[30, 35, 40, 45, 50],
         disabled=not use_rsi_candidates,
         help="예: RSI 45 이하면 매수 허용",
     )
