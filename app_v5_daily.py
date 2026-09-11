@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V13",
+    page_title="TQQQ / 코코레 QUANT V14",
     page_icon="📈",
     layout="centered",
 )
@@ -220,7 +220,7 @@ def get_latest_market_price(symbol):
         if hist is not None and not hist.empty:
             close_s = hist["Close"].dropna()
             if not close_s.empty:
-                return float(close_s.iloc[-1]), "1분봉(프리/애프터 포함)"
+                return float(close_s.iloc[-1]), "1분봉(프리/애프터 포함)", close_s.index[-1]
     except Exception:
         pass
 
@@ -235,11 +235,25 @@ def get_latest_market_price(symbol):
         if hist is not None and not hist.empty:
             close_s = hist["Close"].dropna()
             if not close_s.empty:
-                return float(close_s.iloc[-1]), "5분봉(프리/애프터 포함)"
+                return float(close_s.iloc[-1]), "5분봉(프리/애프터 포함)", close_s.index[-1]
     except Exception:
         pass
 
-    return None, "최근 일봉"
+    return None, "최근 일봉", None
+
+
+def format_quote_time(ts):
+    if ts is None:
+        return None
+    try:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize("America/New_York")
+        ny = t.tz_convert("America/New_York")
+        kr = t.tz_convert("Asia/Seoul")
+        return f"미국 동부 {ny:%Y-%m-%d %H:%M} / 한국 {kr:%Y-%m-%d %H:%M}"
+    except Exception:
+        return str(ts)
 
 
 def calc_rsi(series, period=14):
@@ -1048,7 +1062,7 @@ try:
 
     with st.expander("➕ 매수/매도 기록 입력", expanded=False):
         record_date = st.date_input("거래일", value=date.today())
-        latest_record_price, _record_price_source = get_latest_market_price(actual_trade_symbol)
+        latest_record_price, _record_price_source, _record_price_time = get_latest_market_price(actual_trade_symbol)
         selected_live_price = (
             latest_record_price
             if latest_record_price is not None
@@ -1151,7 +1165,7 @@ try:
     # 실제 매수/매도 판단 가격은 사용자가 선택한 실제 거래 종목을 사용합니다.
     signal_price = float(latest["SIGNAL"])
     daily_trade_price = float(close[actual_trade_symbol].dropna().iloc[-1])
-    latest_trade_price, latest_price_source = get_latest_market_price(actual_trade_symbol)
+    latest_trade_price, latest_price_source, latest_price_time = get_latest_market_price(actual_trade_symbol)
     trade_price = (
         latest_trade_price
         if latest_trade_price is not None
@@ -1263,10 +1277,15 @@ try:
     a1.metric("오늘 신호", signal)
     a2.metric("신호 ETF 가격", f"{currency}{signal_price:,.2f}")
     a3.metric("실제 매수 ETF 최신가", f"{currency}{trade_price:,.2f}")
+    quote_time_text = format_quote_time(latest_price_time)
     st.caption(
         f"현재가 출처: {latest_price_source} · 최대 약 30초 캐시. "
         "실시간 거래소 직결 시세가 아니라 yfinance 지연/가용 시세입니다."
     )
+    if quote_time_text:
+        st.caption(f"🕒 시세 시각: {quote_time_text}")
+    else:
+        st.caption("🕒 시세 시각을 확인하지 못했습니다. 최근 일봉 가격일 수 있습니다.")
 
     st.write(f"**신호 기준:** {live_best_mode['mode']}")
     st.write(f"**실제 거래 종목:** {actual_trade_target}")
