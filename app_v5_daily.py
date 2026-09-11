@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V16",
+    page_title="TQQQ / 코코레 QUANT V17",
     page_icon="📈",
     layout="centered",
 )
@@ -756,18 +756,35 @@ try:
                     selected_end_date,
                 )
 
-                if len(df) < 260:
-                    raise ValueError(
-                        "선택한 백테스트 기간이 너무 짧습니다. "
-                        "200일 이동평균 계산을 위해 최소 약 1년 이상의 기간을 선택해 주세요."
-                    )
+                # 선택한 이평선 중 가장 긴 기간만큼의 사전 데이터가 필요합니다.
+                # 이평선 필터를 쓰지 않으면 짧은 연도 단독 백테스트도 허용합니다.
+                required_ma = max([int(x) for x in ma_periods], default=0)
+                min_rows = max(30, required_ma + 5)
+
+                if len(df) < min_rows:
+                    if required_ma > 0:
+                        raise ValueError(
+                            f"선택한 기간이 너무 짧습니다. "
+                            f"{required_ma}일 이동평균을 계산하려면 최소 약 {required_ma}거래일 이상의 데이터가 필요합니다."
+                        )
+                    else:
+                        raise ValueError("선택한 백테스트 기간이 너무 짧습니다.")
 
                 df["ANCHOR"] = anchor_series(df["SIGNAL"], anchor_mode)
                 df["RSI14"] = calc_rsi(df["REF"], 14)
-                for p in [100, 150, 200]:
+
+                # 선택한 이평선만 계산합니다.
+                for p in ma_periods:
+                    p = int(p)
                     df[f"MA{p}"] = df["REF"].rolling(p).mean()
                     df[f"TREND_OK_{p}"] = df["REF"] > df[f"MA{p}"]
-                df = df.dropna()
+
+                # RSI 계산에 필요한 초반 NaN만 제거합니다.
+                # 선택하지 않은 MA 때문에 2022년 초 데이터가 사라지지 않도록 합니다.
+                required_cols = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
+                for p in ma_periods:
+                    required_cols.append(f"TREND_OK_{int(p)}")
+                df = df.dropna(subset=required_cols)
 
                 for step_pct in effective_buy_steps:
                     for tp in effective_take_profits:
