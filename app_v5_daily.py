@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V21",
+    page_title="TQQQ / 코코레 QUANT V22",
     page_icon="📈",
     layout="centered",
 )
@@ -221,26 +221,57 @@ elif backtest_period_mode == "연도 범위":
 else:
     st.caption(f"선택 기간: {selected_start_date} ~ {selected_end_date}")
 
-# 실제 보유 사이클이 시작되면 전략을 전량매도까지 잠급니다.
-cycle_locked_for_ui = False
-if "live_trades" in st.session_state and st.session_state.live_trades:
-    _lock_df = pd.DataFrame(st.session_state.live_trades)
-    if "구분" in _lock_df.columns:
-        _sell_mask = _lock_df["구분"].astype(str).str.contains("매도", na=False)
-        _sell_rows = _lock_df.index[_sell_mask].tolist()
-        _cycle_df = _lock_df.loc[_sell_rows[-1] + 1:] if _sell_rows else _lock_df
-        cycle_locked_for_ui = bool(
-            _cycle_df["구분"].astype(str).str.contains("매수", na=False).any()
-        )
+# TQQQ와 코코레의 실제 운용 사이클은 서로 독립적으로 잠급니다.
+def _trade_market_key(row):
+    market_value = str(row.get("시장", "")).strip()
+    symbol_value = str(row.get("종목", "")).strip()
+
+    if market_value in ("미국", "TQQQ") or symbol_value.upper() == "TQQQ":
+        return "TQQQ"
+    if market_value in ("한국", "코코레") or symbol_value in ("233740.KS", "229200.KS"):
+        return "코코레"
+    return ""
+
+def _is_market_cycle_locked(records, market_key):
+    if not records:
+        return False
+
+    df = pd.DataFrame(records).copy()
+    if df.empty or "구분" not in df.columns:
+        return False
+
+    df["_시장키"] = df.apply(_trade_market_key, axis=1)
+    df = df[df["_시장키"] == market_key].copy()
+    if df.empty:
+        return False
+
+    sell_mask = df["구분"].astype(str).str.contains("매도", na=False)
+    sell_rows = df.index[sell_mask].tolist()
+    cycle_df = df.loc[sell_rows[-1] + 1:] if sell_rows else df
+
+    return bool(cycle_df["구분"].astype(str).str.contains("매수", na=False).any())
+
+active_market_key = "TQQQ" if market == "미국" else "코코레"
+cycle_locked_for_ui = _is_market_cycle_locked(
+    st.session_state.get("live_trades", []),
+    active_market_key,
+)
 
 if cycle_locked_for_ui:
     st.info(
-        "🔒 현재 사이클 운용 중 — 1차 매수 때 확정한 전략을 전량매도까지 유지합니다. "
-        "지금은 재백테스트할 필요가 없습니다."
+        f"🔒 {active_market_key} 현재 사이클 운용 중 — 전량매도까지 이 시장의 전략만 고정합니다. "
+        "TQQQ와 코코레는 서로 독립적으로 운용됩니다."
     )
+else:
+    other_market_key = "코코레" if active_market_key == "TQQQ" else "TQQQ"
+    if _is_market_cycle_locked(st.session_state.get("live_trades", []), other_market_key):
+        st.caption(
+            f"ℹ️ {other_market_key}는 현재 운용 중이지만, "
+            f"{active_market_key}는 별도로 최적화할 수 있습니다."
+        )
 
 run_backtest = st.button(
-    "🚀 다음 사이클 최적화" if not cycle_locked_for_ui else "🔒 전략 운용 중",
+    "🚀 다음 사이클 최적화" if not cycle_locked_for_ui else f"🔒 {active_market_key} 전략 운용 중",
     type="primary",
     use_container_width=True,
     disabled=cycle_locked_for_ui,
