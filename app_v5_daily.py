@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V20",
+    page_title="TQQQ / 코코레 QUANT V21",
     page_icon="📈",
     layout="centered",
 )
@@ -221,10 +221,29 @@ elif backtest_period_mode == "연도 범위":
 else:
     st.caption(f"선택 기간: {selected_start_date} ~ {selected_end_date}")
 
+# 실제 보유 사이클이 시작되면 전략을 전량매도까지 잠급니다.
+cycle_locked_for_ui = False
+if "live_trades" in st.session_state and st.session_state.live_trades:
+    _lock_df = pd.DataFrame(st.session_state.live_trades)
+    if "구분" in _lock_df.columns:
+        _sell_mask = _lock_df["구분"].astype(str).str.contains("매도", na=False)
+        _sell_rows = _lock_df.index[_sell_mask].tolist()
+        _cycle_df = _lock_df.loc[_sell_rows[-1] + 1:] if _sell_rows else _lock_df
+        cycle_locked_for_ui = bool(
+            _cycle_df["구분"].astype(str).str.contains("매수", na=False).any()
+        )
+
+if cycle_locked_for_ui:
+    st.info(
+        "🔒 현재 사이클 운용 중 — 1차 매수 때 확정한 전략을 전량매도까지 유지합니다. "
+        "지금은 재백테스트할 필요가 없습니다."
+    )
+
 run_backtest = st.button(
-    "🚀 백테스트 실행",
+    "🚀 다음 사이클 최적화" if not cycle_locked_for_ui else "🔒 전략 운용 중",
     type="primary",
     use_container_width=True,
+    disabled=cycle_locked_for_ui,
 )
 
 for key in ["backtest_result", "backtest_sims", "backtest_params"]:
