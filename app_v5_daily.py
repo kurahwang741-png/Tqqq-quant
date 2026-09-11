@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V14",
+    page_title="TQQQ / 코코레 QUANT V15",
     page_icon="📈",
     layout="centered",
 )
@@ -120,7 +120,13 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
     )
 
     st.markdown("**필터 자동 비교**")
-    use_ma_candidates = st.checkbox("200일선 필터 비교", value=True)
+    ma_periods = st.multiselect(
+        "비교할 이동평균선",
+        [100, 150, 200],
+        default=[100, 150, 200],
+        format_func=lambda x: f"{x}일선",
+        help="이평선 필터 없음도 자동으로 함께 비교합니다. 기준은 레버리지 ETF가 아니라 기초 ETF/본주입니다.",
+    )
     use_rsi_candidates = st.checkbox("RSI 필터 비교", value=True)
 
     rsi_thresholds = st.multiselect(
@@ -272,18 +278,20 @@ def anchor_series(series, mode):
     return series.cummax()
 
 
-def filter_name(use_ma, rsi_max):
+def filter_name(ma_period, rsi_max):
     parts = []
-    if use_ma:
-        parts.append("200일선")
+    if ma_period is not None:
+        parts.append(f"{int(ma_period)}일선")
     if rsi_max is not None:
         parts.append(f"RSI≤{int(rsi_max)}")
     return "기본" if not parts else " + ".join(parts)
 
 
-def entry_allowed(row, use_ma, rsi_max):
-    if use_ma and not bool(row["TREND_OK"]):
-        return False
+def entry_allowed(row, ma_period, rsi_max):
+    if ma_period is not None:
+        trend_col = f"TREND_OK_{int(ma_period)}"
+        if trend_col not in row.index or not bool(row[trend_col]):
+            return False
 
     if rsi_max is not None:
         rsi = row["RSI14"]
@@ -311,7 +319,7 @@ def simulate(
     step_pct,
     take_profit,
     n_tranches,
-    use_ma,
+    ma_period,
     rsi_max,
     weight_mode="균등비중",
     max_hold_days=None,
@@ -335,7 +343,11 @@ def simulate(
     trade_arr = df["TRADE"].to_numpy(dtype=float)
     prev_trade_arr = df["TRADE"].shift(1).to_numpy(dtype=float)
     anchor_arr = df["ANCHOR"].to_numpy(dtype=float)
-    trend_arr = df["TREND_OK"].to_numpy(dtype=bool)
+    trend_arr = (
+        df[f"TREND_OK_{int(ma_period)}"].to_numpy(dtype=bool)
+        if ma_period is not None
+        else None
+    )
     rsi_arr = df["RSI14"].to_numpy(dtype=float)
 
     for i in range(len(df)):
@@ -400,7 +412,7 @@ def simulate(
                 exited_today = True
 
         allowed = True
-        if use_ma and not trend_arr[i]:
+        if ma_period is not None and not trend_arr[i]:
             allowed = False
         if rsi_max is not None and (not np.isfinite(rsi_arr[i]) or rsi_arr[i] > rsi_max):
             allowed = False
@@ -538,17 +550,17 @@ try:
             },
         ]
 
-    # 필터 조합
-    filter_candidates = [(False, None)]
-
-    if use_ma_candidates:
-        filter_candidates.append((True, None))
-
+    # 필터 조합: 이평선 없음 + 100/150/200일선, RSI 없음 + 선택값
+    ma_candidates = [None] + [int(x) for x in ma_periods]
+    rsi_candidates = [None]
     if use_rsi_candidates:
-        for rsi_max in rsi_thresholds:
-            filter_candidates.append((False, float(rsi_max)))
-            if use_ma_candidates:
-                filter_candidates.append((True, float(rsi_max)))
+        rsi_candidates += [float(x) for x in rsi_thresholds]
+
+    filter_candidates = [
+        (ma_period, rsi_max)
+        for ma_period in ma_candidates
+        for rsi_max in rsi_candidates
+    ]
 
     # 중복 제거
     filter_candidates = list(dict.fromkeys(filter_candidates))
@@ -571,7 +583,7 @@ try:
         tuple(effective_max_holds),
         tranche_count,
         tuple(weight_modes),
-        use_ma_candidates,
+        tuple(ma_periods),
         use_rsi_candidates,
         tuple(rsi_thresholds),
         short_mode,
@@ -580,7 +592,7 @@ try:
         float(loc_sell_offset),
     )
 
-    # 현재 지표 표시용: 코코레 시장에서는 코코레 낙폭 + 본주 RSI/200일선
+    # 현재 지표 표시용: 레버리지 신호 + 기초 ETF/본주 RSI 및 추세
     current_signal_symbol = modes[0]["signal_symbol"]
     current_ref_symbol = modes[0]["ref_symbol"]
 
@@ -589,9 +601,10 @@ try:
     temp["REF"] = close[current_ref_symbol]
     temp["ANCHOR"] = anchor_series(temp["SIGNAL"], anchor_mode)
     temp["DD"] = temp["SIGNAL"] / temp["ANCHOR"] - 1
-    temp["MA200"] = temp["REF"].rolling(200).mean()
     temp["RSI14"] = calc_rsi(temp["REF"], 14)
-    temp["TREND_OK"] = temp["REF"] > temp["MA200"]
+    for p in [100, 150, 200]:
+        temp[f"MA{p}"] = temp["REF"].rolling(p).mean()
+        temp[f"TREND_OK_{p}"] = temp["REF"] > temp[f"MA{p}"]
     temp = temp.dropna()
 
     if temp.empty:
@@ -600,9 +613,8 @@ try:
     current_signal_price = float(temp["SIGNAL"].iloc[-1])
     current_dd = float(temp["DD"].iloc[-1])
     current_rsi = float(temp["RSI14"].iloc[-1])
-    current_trend_ok = bool(temp["TREND_OK"].iloc[-1])
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
 
     if market.startswith("🇺🇸"):
         c1.metric("TQQQ", f"${current_signal_price:,.2f}")
@@ -611,7 +623,10 @@ try:
 
     c2.metric("고점 대비", f"{current_dd:.1%}")
     c3.metric("RSI", f"{current_rsi:.1f}")
-    c4.metric("200일선", "위" if current_trend_ok else "아래")
+
+    m1, m2, m3 = st.columns(3)
+    for col, p in zip([m1, m2, m3], [100, 150, 200]):
+        col.metric(f"{p}일선", "위" if bool(temp[f"TREND_OK_{p}"].iloc[-1]) else "아래")
 
     if market.startswith("🇰🇷"):
         st.caption(
@@ -656,14 +671,15 @@ try:
                 df["REF"] = close[mode["ref_symbol"]]
 
                 df["ANCHOR"] = anchor_series(df["SIGNAL"], anchor_mode)
-                df["MA200"] = df["REF"].rolling(200).mean()
                 df["RSI14"] = calc_rsi(df["REF"], 14)
-                df["TREND_OK"] = df["REF"] > df["MA200"]
+                for p in [100, 150, 200]:
+                    df[f"MA{p}"] = df["REF"].rolling(p).mean()
+                    df[f"TREND_OK_{p}"] = df["REF"] > df[f"MA{p}"]
                 df = df.dropna()
 
                 for step_pct in effective_buy_steps:
                     for tp in effective_take_profits:
-                        for use_ma, rsi_max in filter_candidates:
+                        for ma_period, rsi_max in filter_candidates:
                             for max_hold_days in effective_max_holds:
                                 for weight_mode in weight_modes:
                                     sim = simulate(
@@ -672,7 +688,7 @@ try:
                                         step_pct,
                                         tp,
                                         tranche_count,
-                                        use_ma,
+                                        ma_period,
                                         rsi_max,
                                         weight_mode,
                                         max_hold_days,
@@ -681,7 +697,7 @@ try:
                                         float(loc_sell_offset),
                                     )
 
-                                    fname = filter_name(use_ma, rsi_max)
+                                    fname = filter_name(ma_period, rsi_max)
                                     hold_name = "제한없음" if max_hold_days is None else f"{max_hold_days}일"
                                     exec_name = (
                                         f"LOC(-{loc_buy_offset:.2%})"
@@ -700,7 +716,7 @@ try:
                                         "df": df,
                                         "step_pct": step_pct,
                                         "tp": tp,
-                                        "use_ma": use_ma,
+                                        "ma_period": ma_period,
                                         "rsi_max": rsi_max,
                                         "weight_mode": weight_mode,
                                         "max_hold_days": max_hold_days,
@@ -716,6 +732,7 @@ try:
                                             "매수간격": step_pct,
                                             "익절률": tp,
                                             "매수비중": weight_mode,
+                                            "이평선": "없음" if ma_period is None else f"{int(ma_period)}일",
                                             "필터": fname,
                                             "체결방식": exec_name,
                                             "보유제한": hold_name,
@@ -766,13 +783,21 @@ try:
     best_df = winner_bundle["df"]
     best_step = float(winner_bundle["step_pct"])
     best_tp = float(winner_bundle["tp"])
-    best_use_ma = bool(winner_bundle["use_ma"])
+    best_ma_period = winner_bundle.get("ma_period")
     best_rsi = winner_bundle["rsi_max"]
     best_weight_mode = winner_bundle.get("weight_mode", "균등비중")
     best_max_hold = winner_bundle.get("max_hold_days")
     best_execution_mode = winner_bundle.get("execution_mode", "일반 종가모드")
     best_loc_buy_offset = winner_bundle.get("loc_buy_offset", 0.0)
     best_loc_sell_offset = winner_bundle.get("loc_sell_offset", 0.0)
+
+    bt_start = pd.Timestamp(best_df.index.min())
+    bt_end = pd.Timestamp(best_df.index.max())
+    bt_years = max((bt_end - bt_start).days / 365.25, 0)
+    st.caption(
+        f"📅 실제 백테스트 사용기간: {bt_start:%Y-%m-%d} ~ {bt_end:%Y-%m-%d} "
+        f"(약 {bt_years:.1f}년)"
+    )
 
     st.success(f"🥇 최종자산 1위: **{winner['운용방식']}**")
 
@@ -786,8 +811,31 @@ try:
             st.info("🇺🇸 일반 종가 체결 가정")
     st.write(
         f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
-        f"{best_weight_mode} / {filter_name(best_use_ma, best_rsi)} / "
+        f"{best_weight_mode} / {filter_name(best_ma_period, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
+    )
+
+    st.subheader("📈 이동평균선 방식 비교")
+    ma_summary = (
+        result.sort_values(["최종자산", "CAGR"], ascending=False)
+        .groupby("이평선", as_index=False)
+        .first()
+        .sort_values(["최종자산", "CAGR"], ascending=False)
+    )
+    ma_view = ma_summary[
+        ["이평선", "최종자산", "CAGR", "MDD", "최대보유일", "완료매매"]
+    ].copy()
+    ma_view["최종자산"] = ma_view["최종자산"].map(lambda x: f"{currency}{x:,.0f}")
+    ma_view["CAGR"] = ma_view["CAGR"].map(lambda x: f"{x:.1%}")
+    ma_view["MDD"] = ma_view["MDD"].map(lambda x: f"{x:.1%}")
+    ma_view["최대보유일"] = ma_view["최대보유일"].map(lambda x: f"{x:.0f}일")
+    st.dataframe(ma_view, use_container_width=True, hide_index=True)
+
+    best_ma_row = ma_summary.iloc[0]
+    st.success(
+        f"🏆 이평선 방식 1위: **{best_ma_row['이평선']}** · "
+        f"최종자산 {currency}{best_ma_row['최종자산']:,.0f} · "
+        f"CAGR {best_ma_row['CAGR']:.1%} · MDD {best_ma_row['MDD']:.1%}"
     )
 
     st.subheader("⚖️ 비중 방식 비교")
@@ -1013,7 +1061,7 @@ try:
     live_best_df = live_bundle["df"]
     live_best_step = float(live_bundle["step_pct"])
     live_best_tp = float(live_bundle["tp"])
-    live_best_use_ma = bool(live_bundle["use_ma"])
+    live_best_ma_period = live_bundle.get("ma_period")
     live_best_rsi = live_bundle["rsi_max"]
     live_best_weight_mode = live_bundle.get("weight_mode", "균등비중")
     if cycle_weight_mode in ["균등비중", "약한 가중", "강한 가중"]:
@@ -1175,7 +1223,11 @@ try:
     live_dd = max(0.0, 1 - signal_price / live_anchor)
 
     live_rsi = float(latest["RSI14"])
-    live_trend_ok = bool(latest["TREND_OK"])
+    live_trend_ok = (
+        bool(latest[f"TREND_OK_{int(live_best_ma_period)}"])
+        if live_best_ma_period is not None
+        else True
+    )
 
     next_stage = int(live_stage) + 1
 
@@ -1188,7 +1240,7 @@ try:
 
     avg_buy_price = auto_avg_price if live_stage > 0 else None
 
-    filter_ok = entry_allowed(latest, live_best_use_ma, live_best_rsi)
+    filter_ok = entry_allowed(latest, live_best_ma_period, live_best_rsi)
 
     loc_buy_fill_ok = True
     loc_buy_limit_today = None
@@ -1200,8 +1252,8 @@ try:
             loc_buy_fill_ok = trade_price <= loc_buy_limit_today
 
     filter_reasons = []
-    if live_best_use_ma and not live_trend_ok:
-        filter_reasons.append("200일선 아래")
+    if live_best_ma_period is not None and not live_trend_ok:
+        filter_reasons.append(f"{int(live_best_ma_period)}일선 아래")
     if live_best_rsi is not None and live_rsi > live_best_rsi:
         filter_reasons.append(f"RSI {live_rsi:.1f} > {live_best_rsi:.0f}")
 
