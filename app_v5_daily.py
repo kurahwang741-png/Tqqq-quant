@@ -6,12 +6,12 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V24",
+    page_title="TQQQ / SOXL / 코코레 QUANT V26",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V24")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V26")
 st.caption("일봉 백테스트 · 오늘 현재가 프리/정규/애프터 최신 시세 + 가중비중 자동비교 + TQQQ LOC")
 
 market = st.radio(
@@ -102,22 +102,30 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         format_func=lambda x: f"{x:.0%}",
     )
 
-    tranche_count = st.slider(
-        "분할매수 횟수",
-        min_value=2,
-        max_value=10,
-        value=5,
-        step=1,
+    tranche_count = 10
+    st.caption(
+        "📌 최대 진입단계는 10단계로 고정하고, 분할횟수 자체보다 "
+        "각 단계의 자금배분 비율과 총자금 투입상한을 자동 최적화합니다."
     )
 
     weight_modes = st.multiselect(
-        "분할매수 비중 자동 비교",
-        ["균등비중", "약한 가중", "강한 가중"],
-        default=["균등비중", "약한 가중", "강한 가중"],
+        "단계별 자금배분 패턴 자동 비교",
+        ["균등", "완만한 후반가중", "강한 후반가중", "초반집중", "바벨형"],
+        default=["균등", "완만한 후반가중", "강한 후반가중", "초반집중", "바벨형"],
         help=(
-            "선택한 비중 방식을 한 번의 백테스트에서 모두 비교합니다. "
-            "균등비중은 매회 같은 금액, 약한/강한 가중은 "
-            "하락 단계가 깊어질수록 더 큰 금액을 매수합니다."
+            "같은 10단계라도 1차~10차에 배정하는 비율을 다르게 비교합니다. "
+            "후반가중은 큰 하락에서 더 많은 현금을 사용하고, 초반집중은 초기 하락에 더 적극적입니다."
+        ),
+    )
+
+    deploy_pct_candidates = st.multiselect(
+        "총자금 최대 투입비율",
+        [0.60, 0.70, 0.80, 0.90, 1.00],
+        default=[0.70, 0.80, 0.90, 1.00],
+        format_func=lambda x: f"{x:.0%}",
+        help=(
+            "10단계가 모두 체결되어도 총자금의 몇 %까지만 사용할지 비교합니다. "
+            "예: 80% 선택 전략이면 나머지 20%는 현금으로 남깁니다."
         ),
     )
 
@@ -431,16 +439,25 @@ def entry_allowed(row, ma_period, rsi_max):
     return True
 
 
-def make_tranche_budgets(initial_cash, n_tranches, weight_mode):
-    if weight_mode == "약한 가중":
-        weights = np.linspace(1.0, 2.0, n_tranches)
-    elif weight_mode == "강한 가중":
-        weights = np.linspace(1.0, 3.0, n_tranches)
+def make_tranche_budgets(initial_cash, n_tranches, weight_mode, deploy_pct=1.0):
+    """10개 진입단계에 총자금의 deploy_pct만 배분합니다."""
+    n = int(n_tranches)
+
+    if weight_mode in ("완만한 후반가중", "약한 가중"):
+        weights = np.linspace(1.0, 2.0, n)
+    elif weight_mode in ("강한 후반가중", "강한 가중"):
+        weights = np.linspace(1.0, 4.0, n)
+    elif weight_mode == "초반집중":
+        weights = np.linspace(2.5, 1.0, n)
+    elif weight_mode == "바벨형":
+        x = np.linspace(-1.0, 1.0, n)
+        weights = 1.0 + 1.5 * (x ** 2)
     else:
-        weights = np.ones(n_tranches)
+        weights = np.ones(n)
 
     weights = weights / weights.sum()
-    return (float(initial_cash) * weights).tolist()
+    deploy_cash = float(initial_cash) * float(deploy_pct)
+    return (deploy_cash * weights).tolist()
 
 
 def simulate(
@@ -451,7 +468,8 @@ def simulate(
     n_tranches,
     ma_period,
     rsi_max,
-    weight_mode="균등비중",
+    weight_mode="균등",
+    deploy_pct=1.0,
     max_hold_days=None,
     execution_mode="일반 종가모드",
     loc_buy_offset=0.0,
@@ -465,7 +483,7 @@ def simulate(
     equity_rows = []
     next_level = 1
     tranche_budgets = make_tranche_budgets(
-        initial_cash, n_tranches, weight_mode
+        initial_cash, n_tranches, weight_mode, deploy_pct
     )
 
     idx = df.index
@@ -636,6 +654,7 @@ def simulate(
         "tranche_budget": tranche_budgets[min(next_level - 1, n_tranches - 1)],
         "tranche_budgets": tranche_budgets,
         "weight_mode": weight_mode,
+        "deploy_pct": float(deploy_pct),
     }
 
 
@@ -713,6 +732,7 @@ try:
         tuple(effective_max_holds),
         tranche_count,
         tuple(weight_modes),
+        tuple(deploy_pct_candidates),
         tuple(ma_periods),
         backtest_period_mode,
         selected_start_year,
@@ -774,8 +794,9 @@ try:
         or not effective_take_profits
         or not effective_max_holds
         or not weight_modes
+        or not deploy_pct_candidates
     ):
-        st.warning("매수 간격, 익절률, 최대 보유기간, 분할매수 비중을 각각 하나 이상 선택해 주세요.")
+        st.warning("매수 간격, 익절률, 최대 보유기간, 자금배분 패턴, 총자금 투입비율을 각각 하나 이상 선택해 주세요.")
         st.stop()
 
     st.divider()
@@ -792,6 +813,7 @@ try:
             * len(filter_candidates)
             * len(effective_max_holds)
             * len(weight_modes)
+            * len(deploy_pct_candidates)
         )
         done_jobs = 0
 
@@ -850,73 +872,89 @@ try:
                         for ma_period, rsi_max in filter_candidates:
                             for max_hold_days in effective_max_holds:
                                 for weight_mode in weight_modes:
-                                    sim = simulate(
-                                        df,
-                                        float(investment),
-                                        step_pct,
-                                        tp,
-                                        tranche_count,
-                                        ma_period,
-                                        rsi_max,
-                                        weight_mode,
-                                        max_hold_days,
-                                        us_execution_mode,
-                                        float(loc_buy_offset),
-                                        float(loc_sell_offset),
-                                    )
+                                    for deploy_pct in deploy_pct_candidates:
+                                        sim = simulate(
+                                            df,
+                                            float(investment),
+                                            step_pct,
+                                            tp,
+                                            tranche_count,
+                                            ma_period,
+                                            rsi_max,
+                                            weight_mode,
+                                            float(deploy_pct),
+                                            max_hold_days,
+                                            us_execution_mode,
+                                            float(loc_buy_offset),
+                                            float(loc_sell_offset),
+                                        )
 
-                                    fname = filter_name(ma_period, rsi_max)
-                                    hold_name = "제한없음" if max_hold_days is None else f"{max_hold_days}일"
-                                    exec_name = (
-                                        f"LOC(-{loc_buy_offset:.2%})"
-                                        if market.startswith("🇺🇸") and us_execution_mode == "LOC 모드"
-                                        else "종가"
-                                    )
-                                    strategy_name = (
-                                        f"{mode['mode']} | "
-                                        f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / "
-                                        f"{weight_mode} / 최대 {hold_name} / {fname} / {exec_name}"
-                                    )
+                                        fname = filter_name(ma_period, rsi_max)
+                                        hold_name = "제한없음" if max_hold_days is None else f"{max_hold_days}일"
+                                        exec_name = (
+                                            f"LOC(-{loc_buy_offset:.2%})"
+                                            if market.startswith("🇺🇸") and us_execution_mode == "LOC 모드"
+                                            else "종가"
+                                        )
+                                        strategy_name = (
+                                            f"{mode['mode']} | "
+                                            f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / "
+                                            f"{weight_mode} / 최대투입 {float(deploy_pct):.0%} / "
+                                            f"최대 {hold_name} / {fname} / {exec_name}"
+                                        )
 
-                                    sims[strategy_name] = {
-                                        "sim": sim,
-                                        "mode": mode,
-                                        "df": df,
-                                        "step_pct": step_pct,
-                                        "tp": tp,
-                                        "ma_period": ma_period,
-                                        "rsi_max": rsi_max,
-                                        "weight_mode": weight_mode,
-                                        "max_hold_days": max_hold_days,
-                                        "execution_mode": us_execution_mode,
-                                        "loc_buy_offset": float(loc_buy_offset),
-                                        "loc_sell_offset": float(loc_sell_offset),
-                                    }
-
-                                    results.append(
-                                        {
-                                            "전략": strategy_name,
-                                            "운용방식": mode["mode"],
-                                            "매수간격": step_pct,
-                                            "익절률": tp,
-                                            "매수비중": weight_mode,
-                                            "이평선": "없음" if ma_period is None else f"{int(ma_period)}일",
-                                            "필터": fname,
-                                            "체결방식": exec_name,
-                                            "보유제한": hold_name,
-                                            "최종자산": sim["final_value"],
-                                            "누적수익률": sim["total_return"],
-                                            "CAGR": sim["cagr"],
-                                            "MDD": sim["mdd"],
-                                            "최대보유일": sim["max_hold"],
-                                            "기간청산": sim["forced_exit_count"],
-                                            "완료매매": sim["trade_count"],
-                                            "승률": sim["win_rate"],
+                                        sims[strategy_name] = {
+                                            "sim": sim,
+                                            "mode": mode,
+                                            "df": df,
+                                            "step_pct": step_pct,
+                                            "tp": tp,
+                                            "ma_period": ma_period,
+                                            "rsi_max": rsi_max,
+                                            "weight_mode": weight_mode,
+                                            "deploy_pct": float(deploy_pct),
+                                            "max_hold_days": max_hold_days,
+                                            "execution_mode": us_execution_mode,
+                                            "loc_buy_offset": float(loc_buy_offset),
+                                            "loc_sell_offset": float(loc_sell_offset),
                                         }
-                                    )
 
-                                    done_jobs += 1
-                                    progress.progress(done_jobs / max(total_jobs, 1))
+                                        stage_pcts = [
+                                            x / float(investment)
+                                            for x in make_tranche_budgets(
+                                                float(investment),
+                                                tranche_count,
+                                                weight_mode,
+                                                float(deploy_pct),
+                                            )
+                                        ]
+
+                                        results.append(
+                                            {
+                                                "전략": strategy_name,
+                                                "운용방식": mode["mode"],
+                                                "매수간격": step_pct,
+                                                "익절률": tp,
+                                                "자금배분": weight_mode,
+                                                "최대투입": float(deploy_pct),
+                                                "단계비중": " / ".join(f"{x:.1%}" for x in stage_pcts),
+                                                "이평선": "없음" if ma_period is None else f"{int(ma_period)}일",
+                                                "필터": fname,
+                                                "체결방식": exec_name,
+                                                "보유제한": hold_name,
+                                                "최종자산": sim["final_value"],
+                                                "누적수익률": sim["total_return"],
+                                                "CAGR": sim["cagr"],
+                                                "MDD": sim["mdd"],
+                                                "최대보유일": sim["max_hold"],
+                                                "기간청산": sim["forced_exit_count"],
+                                                "완료매매": sim["trade_count"],
+                                                "승률": sim["win_rate"],
+                                            }
+                                        )
+
+                                        done_jobs += 1
+                                        progress.progress(done_jobs / max(total_jobs, 1))
                                     status.caption(f"계산 중... {done_jobs}/{total_jobs}")
 
         result = (
@@ -953,7 +991,8 @@ try:
     best_tp = float(winner_bundle["tp"])
     best_ma_period = winner_bundle.get("ma_period")
     best_rsi = winner_bundle["rsi_max"]
-    best_weight_mode = winner_bundle.get("weight_mode", "균등비중")
+    best_weight_mode = winner_bundle.get("weight_mode", "균등")
+    best_deploy_pct = float(winner_bundle.get("deploy_pct", 1.0))
     best_max_hold = winner_bundle.get("max_hold_days")
     best_execution_mode = winner_bundle.get("execution_mode", "일반 종가모드")
     best_loc_buy_offset = winner_bundle.get("loc_buy_offset", 0.0)
@@ -979,7 +1018,8 @@ try:
             st.info("🇺🇸 일반 종가 체결 가정")
     st.write(
         f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
-        f"{best_weight_mode} / {filter_name(best_ma_period, best_rsi)} / "
+        f"{best_weight_mode} / 최대투입 {best_deploy_pct:.0%} / "
+        f"{filter_name(best_ma_period, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
     )
 
@@ -1094,6 +1134,7 @@ try:
                         ma_period,
                         bundle["rsi_max"],
                         bundle["weight_mode"],
+                        float(bundle.get("deploy_pct", 1.0)),
                         bundle["max_hold_days"],
                         bundle["execution_mode"],
                         bundle["loc_buy_offset"],
@@ -1128,6 +1169,7 @@ try:
                             ma_period,
                             chosen_bundle["rsi_max"],
                             chosen_bundle["weight_mode"],
+                            float(chosen_bundle.get("deploy_pct", 1.0)),
                             chosen_bundle["max_hold_days"],
                             chosen_bundle["execution_mode"],
                             chosen_bundle["loc_buy_offset"],
@@ -1390,6 +1432,7 @@ try:
     live_first_buy_date = None
     cycle_strategy_name = None
     cycle_weight_mode = None
+    cycle_deploy_pct = None
 
     if not trade_log.empty:
         for _, rec in trade_log.iterrows():
@@ -1413,6 +1456,13 @@ try:
                     raw_weight = rec.get("사이클매수비중", None)
                     if pd.notna(raw_weight) and str(raw_weight).strip():
                         cycle_weight_mode = str(raw_weight)
+
+                    raw_deploy = rec.get("사이클최대투입", None)
+                    if pd.notna(raw_deploy) and str(raw_deploy).strip():
+                        try:
+                            cycle_deploy_pct = float(raw_deploy)
+                        except Exception:
+                            cycle_deploy_pct = None
                 live_qty += amount / px
                 live_cost += amount
                 live_buys += 1
@@ -1423,6 +1473,7 @@ try:
                 live_first_buy_date = None
                 cycle_strategy_name = None
                 cycle_weight_mode = None
+                cycle_deploy_pct = None
 
     auto_avg_price = live_cost / live_qty if live_qty > 0 else 0.0
     auto_stage = min(live_buys, tranche_count)
@@ -1454,9 +1505,16 @@ try:
     live_best_tp = float(live_bundle["tp"])
     live_best_ma_period = live_bundle.get("ma_period")
     live_best_rsi = live_bundle["rsi_max"]
-    live_best_weight_mode = live_bundle.get("weight_mode", "균등비중")
-    if cycle_weight_mode in ["균등비중", "약한 가중", "강한 가중"]:
+    live_best_weight_mode = live_bundle.get("weight_mode", "균등")
+    valid_weight_modes = ["균등", "완만한 후반가중", "강한 후반가중", "초반집중", "바벨형",
+                          "균등비중", "약한 가중", "강한 가중"]
+    if cycle_weight_mode in valid_weight_modes:
         live_best_weight_mode = cycle_weight_mode
+
+    live_best_deploy_pct = float(live_bundle.get("deploy_pct", best_deploy_pct))
+    if cycle_deploy_pct is not None and 0 < float(cycle_deploy_pct) <= 1:
+        live_best_deploy_pct = float(cycle_deploy_pct)
+
     live_best_max_hold = live_bundle.get("max_hold_days")
     live_best_execution_mode = live_bundle.get("execution_mode", "일반 종가모드")
     live_best_loc_buy_offset = live_bundle.get("loc_buy_offset", 0.0)
@@ -1472,7 +1530,7 @@ try:
 
     if auto_stage > 0 and cycle_is_locked:
         st.success(
-            f"🔒 현재 사이클 전략 고정: **{live_best_weight_mode}** · "
+            f"🔒 현재 사이클 전략 고정: **{live_best_weight_mode} / 최대투입 {live_best_deploy_pct:.0%}** · "
             f"{live_best_step:.0%} 간격 / {live_best_tp:.0%} 익절 · "
             "전량매도 전까지 오늘의 1위가 바뀌어도 이 전략을 유지합니다."
         )
@@ -1492,10 +1550,11 @@ try:
                 if str(rec.get("종목", actual_trade_target)) == actual_trade_target and str(rec.get("구분", "")) == "매수":
                     rec["사이클전략"] = winner_name
                     rec["사이클매수비중"] = best_weight_mode
+                    rec["사이클최대투입"] = best_deploy_pct
             st.rerun()
     elif auto_stage == 0:
         st.caption(
-            f"다음 1차 매수 시 현재 1위 전략 **{best_weight_mode}**을 자동 저장하고, "
+            f"다음 1차 매수 시 현재 1위 전략 **{best_weight_mode} / 최대투입 {best_deploy_pct:.0%}**을 자동 저장하고, "
             "그 사이클이 끝날 때까지 고정합니다."
         )
 
@@ -1516,7 +1575,10 @@ try:
             key="record_price",
         )
         record_weight_mode = live_best_weight_mode if auto_stage > 0 else best_weight_mode
-        record_budgets = make_tranche_budgets(float(investment), tranche_count, record_weight_mode)
+        record_deploy_pct = live_best_deploy_pct if auto_stage > 0 else best_deploy_pct
+        record_budgets = make_tranche_budgets(
+            float(investment), tranche_count, record_weight_mode, record_deploy_pct
+        )
         record_next_stage = min(auto_stage + 1, tranche_count)
         default_amount = float(record_budgets[record_next_stage - 1])
         record_amount = st.number_input(
@@ -1544,6 +1606,7 @@ try:
                         "금액": float(record_amount),
                         "사이클전략": live_strategy_name if auto_stage > 0 and cycle_is_locked else winner_name,
                         "사이클매수비중": live_best_weight_mode if auto_stage > 0 and cycle_is_locked else best_weight_mode,
+                        "사이클최대투입": live_best_deploy_pct if auto_stage > 0 and cycle_is_locked else best_deploy_pct,
                     }
                 )
                 st.rerun()
@@ -1564,6 +1627,7 @@ try:
                         "금액": float(proceeds),
                         "사이클전략": live_strategy_name if auto_stage > 0 else winner_name,
                         "사이클매수비중": live_best_weight_mode if auto_stage > 0 else best_weight_mode,
+                        "사이클최대투입": live_best_deploy_pct if auto_stage > 0 else best_deploy_pct,
                     }
                 )
                 st.rerun()
@@ -1623,11 +1687,20 @@ try:
     next_stage = int(live_stage) + 1
 
     live_tranche_budgets = make_tranche_budgets(
-        float(investment), tranche_count, live_best_weight_mode
+        float(investment), tranche_count, live_best_weight_mode, live_best_deploy_pct
     )
     tranche_budget = live_tranche_budgets[
         min(max(next_stage - 1, 0), tranche_count - 1)
     ]
+    tranche_pct = (
+        float(tranche_budget) / float(investment) * 100.0
+        if float(investment) > 0 else 0.0
+    )
+    planned_cum_pct = (
+        sum(live_tranche_budgets[:min(next_stage, tranche_count)])
+        / float(investment) * 100.0
+        if float(investment) > 0 else 0.0
+    )
 
     avg_buy_price = auto_avg_price if live_stage > 0 else None
 
@@ -1733,9 +1806,9 @@ try:
     st.write(f"**신호 기준:** {live_best_mode['mode']}")
     st.write(f"**실제 거래 종목:** {actual_trade_target}")
     if auto_stage > 0 and cycle_is_locked:
-        st.write(f"**🔒 사이클 고정 전략:** {live_best_weight_mode} · {live_best_step:.0%} 간격 / {live_best_tp:.0%} 익절")
+        st.write(f"**🔒 사이클 고정 전략:** {live_best_weight_mode} / 최대투입 {live_best_deploy_pct:.0%} · {live_best_step:.0%} 간격 / {live_best_tp:.0%} 익절")
     elif auto_stage == 0:
-        st.write(f"**새 사이클 적용 예정:** 현재 1위 · {live_best_weight_mode}")
+        st.write(f"**새 사이클 적용 예정:** 현재 1위 · {live_best_weight_mode} / 최대투입 {live_best_deploy_pct:.0%}")
     if market.startswith("🇺🇸") and live_best_execution_mode == "LOC 모드":
         # 매일 실제 주문에 바로 쓸 수 있도록 '가격'을 하나로 정리합니다.
         # 매수는 전략의 낙폭 신호가격과 LOC 한도가격을 모두 만족해야 하므로 더 낮은 값을 사용합니다.
@@ -1761,6 +1834,7 @@ try:
                     f"{currency}{loc_effective_buy:,.2f} 이하",
                 )
                 st.caption(
+                    f"이번 매수비중 **{tranche_pct:.1f}%** · "
                     f"주문금액 {currency}{tranche_budget:,.0f} · "
                     f"전략 신호가와 LOC 한도 중 더 낮은 가격"
                 )
@@ -1791,7 +1865,7 @@ try:
             st.success(
                 f"🟢 **오늘 매수 주문:** {us_product} LOC "
                 f"{currency}{loc_effective_buy:,.2f} 이하 / "
-                f"{currency}{tranche_budget:,.0f}"
+                f"총자금의 **{tranche_pct:.1f}%** ({currency}{tranche_budget:,.0f})"
             )
 
         if loc_sell_limit_today is not None:
@@ -1818,13 +1892,19 @@ try:
             "LOC는 마감 경매에서 한도가격 조건을 만족해야 체결되며, 표시 가격에 반드시 체결되는 것은 아닙니다."
         )
     allocation_text = " → ".join(
-        f"{currency}{x:,.0f}" for x in live_tranche_budgets
+        f"{(float(x) / float(investment) * 100.0):.1f}%"
+        for x in live_tranche_budgets
     )
-    st.write(f"**매수 비중:** {live_best_weight_mode}")
-    st.caption(f"단계별 예정금액: {allocation_text}")
     st.write(
-        f"**{min(next_stage, tranche_count)}차 예정 매수금액:** "
-        f"{currency}{tranche_budget:,.0f}"
+        f"**자금배분:** {live_best_weight_mode} · "
+        f"**총자금 최대투입:** {live_best_deploy_pct:.0%}"
+    )
+    st.caption(f"1차→10차 단계별 예정비중: {allocation_text}")
+    st.write(
+        f"**{min(next_stage, tranche_count)}차 예정:** "
+        f"총자금의 **{tranche_pct:.1f}%** "
+        f"({currency}{tranche_budget:,.0f}) · "
+        f"이 단계까지 계획 누적 {planned_cum_pct:.1f}%"
     )
 
     if signal.endswith("매수"):
