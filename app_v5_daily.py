@@ -8,13 +8,13 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V29",
+    page_title="TQQQ / SOXL / 코코레 QUANT V30",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V29")
-st.caption("다음 거래일 체결 · 거래비용 · 전체 워크포워드 · 실전 안전장치")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V30")
+st.caption("현금보유 자동비교 · 평균 투자금 사용률 · 다음 거래일 체결")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 
@@ -122,6 +122,11 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
     st.info(
         "각 차수에 전체 투자금의 몇 %를 투입할지 앱이 자동으로 비교합니다. "
         "선택된 차수별 비중의 합계는 100%를 넘지 않습니다."
+    )
+    deployment_ratios = [0.70, 0.80, 0.90, 1.00]
+    st.caption(
+        "총자금의 70%·80%·90%·100%만 운용하는 경우도 자동 비교하고, "
+        "나머지는 현금으로 유지합니다."
     )
 
     st.markdown("**백테스트 기간**")
@@ -555,6 +560,7 @@ def simulate(
     fee_pct=0.0,
     slippage_pct=0.0,
     fx_cost_pct=0.0,
+    deployment_ratio=1.0,
 ):
     cash = float(initial_cash)
     shares = 0.0
@@ -566,7 +572,7 @@ def simulate(
     pending_buy = None
     pending_exit = None
     tranche_budgets = make_tranche_budgets(
-        initial_cash, n_tranches, allocation_weights
+        initial_cash * deployment_ratio, n_tranches, allocation_weights
     )
 
     idx = df.index
@@ -678,8 +684,10 @@ def simulate(
             pending_buy = {"level": next_level, "signal_date": dt}
 
         equity = cash + shares * trade_price * (1 - slippage_pct) * (1 - fee_pct - fx_cost_pct)
+        invested_value = shares * trade_price * (1 - slippage_pct) * (1 - fee_pct - fx_cost_pct)
+        exposure = invested_value / equity if equity > 0 else 0.0
         equity_rows.append(
-            (dt, equity, cash, shares, signal_price, trade_price, drawdown)
+            (dt, equity, cash, shares, signal_price, trade_price, drawdown, exposure)
         )
 
     if not equity_rows:
@@ -689,7 +697,7 @@ def simulate(
         equity_rows,
         columns=[
             "Date", "Equity", "Cash", "Shares",
-            "SignalPrice", "TradePrice", "Drawdown",
+            "SignalPrice", "TradePrice", "Drawdown", "Exposure",
         ],
     ).set_index("Date")
 
@@ -722,6 +730,8 @@ def simulate(
         ongoing_hold = (pd.Timestamp(df.index[-1]) - pd.Timestamp(entries[0][0])).days
 
     max_hold = max(closed_max_hold, ongoing_hold)
+    avg_exposure = float(eq["Exposure"].mean())
+    max_exposure = float(eq["Exposure"].max())
 
     return {
         "final_value": final_value,
@@ -732,6 +742,9 @@ def simulate(
         "win_rate": win_rate,
         "avg_hold": avg_hold,
         "max_hold": max_hold,
+        "avg_exposure": avg_exposure,
+        "max_exposure": max_exposure,
+        "deployment_ratio": float(deployment_ratio),
         "forced_exit_count": forced_exit_count,
         "equity": eq,
         "trades": trades_df,
@@ -824,6 +837,7 @@ try:
         tuple(effective_max_holds),
         tranche_count,
         tuple(allocation_candidates),
+        tuple(deployment_ratios),
         tuple(ma_periods),
         backtest_period_mode,
         selected_start_year,
@@ -958,7 +972,8 @@ try:
                         for hi, _ in enumerate(effective_max_holds):
                             for wi, _ in enumerate(allocation_candidates):
                                 for xi, _ in enumerate(loc_buy_ratios):
-                                    all_jobs.append((mi, si, ti, fi, hi, wi, xi))
+                                    for di, _ in enumerate(deployment_ratios):
+                                        all_jobs.append((mi, si, ti, fi, hi, wi, xi, di))
 
         total_grid = len(all_jobs)
         progress = st.progress(0)
@@ -970,7 +985,7 @@ try:
         live_best = {"eligible": False, "score": -float("inf"), "value": -float("inf"), "name": "-"}
 
         def run_one(job):
-            mi, si, ti, fi, hi, wi, xi = job
+            mi, si, ti, fi, hi, wi, xi, di = job
             mode, df = prepared[mi]
             step_pct = effective_buy_steps[si]
             tp = effective_take_profits[ti]
@@ -978,6 +993,7 @@ try:
             max_hold_days = effective_max_holds[hi]
             allocation_weights = allocation_candidates[wi]
             loc_buy_ratio = float(loc_buy_ratios[xi])
+            deployment_ratio = float(deployment_ratios[di])
 
             sim = simulate(
                 df,
@@ -996,6 +1012,7 @@ try:
                 float(fee_pct),
                 float(slippage_pct),
                 float(fx_cost_pct),
+                deployment_ratio,
             )
 
             eligible = (
@@ -1006,6 +1023,7 @@ try:
                 float(sim["cagr"])
                 - 0.50 * abs(float(sim["mdd"]))
                 - 0.02 * min(float(sim["max_hold"]) / 365.0, 5.0)
+                - 0.05 * (1 - float(sim["avg_exposure"]))
             )
 
             fname = filter_name(ma_period, rsi_max)
@@ -1022,7 +1040,7 @@ try:
                 exec_name = "종가"
             strategy_name = (
                 f"{mode['mode']} | {step_pct:.0%} 간격 / {tp:.0%} 익절 / "
-                f"자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
+                f"운용 {deployment_ratio:.0%} / 자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
             )
 
             sims[strategy_name] = {
@@ -1034,6 +1052,7 @@ try:
                 "ma_period": ma_period,
                 "rsi_max": rsi_max,
                 "allocation_weights": list(allocation_weights),
+                "deployment_ratio": deployment_ratio,
                 "max_hold_days": max_hold_days,
                 "execution_mode": us_execution_mode,
                 "loc_buy_ratio": loc_buy_ratio,
@@ -1045,7 +1064,8 @@ try:
                 "운용방식": mode["mode"],
                 "매수간격": step_pct,
                 "익절률": tp,
-                "차수별 매수%": allocation_text(allocation_weights),
+                "총자금 운용률": deployment_ratio,
+                "차수별 매수%": allocation_text(np.asarray(allocation_weights) * deployment_ratio),
                 "이평선": "없음" if ma_period is None else f"{int(ma_period)}일",
                 "필터": fname,
                 "체결방식": exec_name,
@@ -1060,6 +1080,8 @@ try:
                 "기간청산": sim["forced_exit_count"],
                 "완료매매": sim["trade_count"],
                 "승률": sim["win_rate"],
+                "평균 투자금 사용률": sim["avg_exposure"],
+                "최대 투자금 사용률": sim["max_exposure"],
                 "실전기준통과": eligible,
                 "실전점수": risk_score,
             }
@@ -1111,7 +1133,7 @@ try:
                 # 2차: 1차 상위 전략들의 각 파라미터 인접값(±1칸)을 후보로 확장
                 top_jobs = [j for _, j in sorted(scored, key=lambda x: x[0], reverse=True)[:20]]
                 refine = []
-                for mi, si, ti, fi, hi, wi, xi in top_jobs:
+                for mi, si, ti, fi, hi, wi, xi, di in top_jobs:
                     neighborhoods = [
                         range(max(0, si - 1), min(len(effective_buy_steps), si + 2)),
                         range(max(0, ti - 1), min(len(effective_take_profits), ti + 2)),
@@ -1119,6 +1141,7 @@ try:
                         range(max(0, hi - 1), min(len(effective_max_holds), hi + 2)),
                         range(max(0, wi - 1), min(len(allocation_candidates), wi + 2)),
                         range(max(0, xi - 1), min(len(loc_buy_ratios), xi + 2)),
+                        range(max(0, di - 1), min(len(deployment_ratios), di + 2)),
                     ]
                     for nsi in neighborhoods[0]:
                         for nti in neighborhoods[1]:
@@ -1126,9 +1149,10 @@ try:
                                 for nhi in neighborhoods[3]:
                                     for nwi in neighborhoods[4]:
                                         for nxi in neighborhoods[5]:
-                                            candidate = (mi, nsi, nti, nfi, nhi, nwi, nxi)
-                                            if candidate not in tested:
-                                                refine.append(candidate)
+                                            for ndi in neighborhoods[6]:
+                                                candidate = (mi, nsi, nti, nfi, nhi, nwi, nxi, ndi)
+                                                if candidate not in tested:
+                                                    refine.append(candidate)
 
                 # 중복 제거 후 후보가 많으면 전체 후보에서 균등 샘플링
                 refine = list(dict.fromkeys(refine))
@@ -1195,6 +1219,7 @@ try:
     best_allocation_weights = normalize_allocation_weights(
         tranche_count, winner_bundle.get("allocation_weights")
     )
+    best_deployment_ratio = float(winner_bundle.get("deployment_ratio", 1.0))
     best_max_hold = winner_bundle.get("max_hold_days")
     best_execution_mode = winner_bundle.get("execution_mode", "일반 종가모드")
     best_loc_buy_ratio = float(winner_bundle.get("loc_buy_ratio", 0.0))
@@ -1230,7 +1255,8 @@ try:
         )
     st.write(
         f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
-        f"차수별 매수비중 자동 최적화 / {filter_name(best_ma_period, best_rsi)} / "
+        f"총자금 {best_deployment_ratio:.0%} 운용 / 차수별 매수비중 자동 최적화 / "
+        f"{filter_name(best_ma_period, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
     )
 
@@ -1355,6 +1381,7 @@ try:
                         float(fee_pct),
                         float(slippage_pct),
                         float(fx_cost_pct),
+                        bundle.get("deployment_ratio", 1.0),
                     )
                     train_eligible = (
                         train_sim["trade_count"] >= int(min_completed_trades)
@@ -1363,6 +1390,7 @@ try:
                     train_score = (
                         train_sim["cagr"] - 0.50 * abs(train_sim["mdd"])
                         - 0.02 * min(train_sim["max_hold"] / 365.0, 5.0)
+                        - 0.05 * (1 - train_sim["avg_exposure"])
                     )
                     candidates.append(
                         (train_eligible, train_score, train_sim["final_value"], strategy_name, bundle, base)
@@ -1401,6 +1429,7 @@ try:
                             float(fee_pct),
                             float(slippage_pct),
                             float(fx_cost_pct),
+                            chosen_bundle.get("deployment_ratio", 1.0),
                         )
                         capital = float(test_sim["final_value"])
                         year_return = capital / start_capital - 1 if start_capital else 0.0
@@ -1462,7 +1491,7 @@ try:
             )
 
             if wf_year_rows:
-                with st.expander("2025/2026 연도별 선택 전략 보기"):
+                with st.expander("전체 연도별 선택 전략 보기"):
                     detail = pd.DataFrame(wf_year_rows)
                     detail["연초자산"] = detail["연초자산"].map(
                         lambda x: f"{currency}{x:,.0f}"
@@ -1496,6 +1525,28 @@ try:
         f"🏆 이평선 방식 1위: **{best_ma_row['이평선']}** · "
         f"최종자산 {currency}{best_ma_row['최종자산']:,.0f} · "
         f"CAGR {best_ma_row['CAGR']:.1%} · MDD {best_ma_row['MDD']:.1%}"
+    )
+
+    st.subheader("💵 총자금 운용률 비교")
+    deployment_summary = (
+        result.groupby("총자금 운용률", as_index=False).first()
+        .sort_values(["실전기준통과", "실전점수", "최종자산"], ascending=False)
+    )
+    deployment_view = deployment_summary[
+        ["총자금 운용률", "평균 투자금 사용률", "최종자산", "CAGR", "MDD", "실전점수"]
+    ].copy()
+    deployment_view["총자금 운용률"] = deployment_view["총자금 운용률"].map(lambda x: f"{x:.0%}")
+    deployment_view["평균 투자금 사용률"] = deployment_view["평균 투자금 사용률"].map(lambda x: f"{x:.1%}")
+    deployment_view["최종자산"] = deployment_view["최종자산"].map(lambda x: f"{currency}{x:,.0f}")
+    deployment_view["CAGR"] = deployment_view["CAGR"].map(lambda x: f"{x:.1%}")
+    deployment_view["MDD"] = deployment_view["MDD"].map(lambda x: f"{x:.1%}")
+    deployment_view["실전점수"] = deployment_view["실전점수"].map(lambda x: f"{x:.2%}")
+    st.dataframe(deployment_view, use_container_width=True, hide_index=True)
+    best_deployment_row = deployment_summary.iloc[0]
+    st.success(
+        f"🏆 운용률 1위: **총자금의 {best_deployment_row['총자금 운용률']:.0%} 운용** · "
+        f"평균 실제 투자 {best_deployment_row['평균 투자금 사용률']:.1%} · "
+        f"CAGR {best_deployment_row['CAGR']:.1%} · MDD {best_deployment_row['MDD']:.1%}"
     )
 
     st.subheader("💯 총자산 대비 매수 % 자동 최적화")
@@ -1685,6 +1736,7 @@ try:
     live_first_buy_date = None
     cycle_strategy_name = None
     cycle_allocation_raw = None
+    cycle_deployment_ratio = None
 
     if not trade_log.empty:
         for _, rec in trade_log.iterrows():
@@ -1718,6 +1770,12 @@ try:
                     raw_weight = rec.get("사이클매수비중", None)
                     if pd.notna(raw_weight) and str(raw_weight).strip():
                         cycle_allocation_raw = str(raw_weight)
+                    raw_deployment = rec.get("사이클운용비율", None)
+                    if pd.notna(raw_deployment) and str(raw_deployment).strip():
+                        try:
+                            cycle_deployment_ratio = float(raw_deployment)
+                        except Exception:
+                            cycle_deployment_ratio = None
                 live_qty += qty
                 live_cost += amount
                 live_buys += 1
@@ -1728,6 +1786,7 @@ try:
                 live_first_buy_date = None
                 cycle_strategy_name = None
                 cycle_allocation_raw = None
+                cycle_deployment_ratio = None
 
     auto_avg_price = live_cost / live_qty if live_qty > 0 else 0.0
     auto_stage = min(live_buys, tranche_count)
@@ -1762,9 +1821,12 @@ try:
     live_best_allocation_weights = normalize_allocation_weights(
         tranche_count, live_bundle.get("allocation_weights")
     )
+    live_best_deployment_ratio = float(live_bundle.get("deployment_ratio", 1.0))
     saved_cycle_allocation = parse_saved_allocation(cycle_allocation_raw, tranche_count)
     if saved_cycle_allocation is not None:
         live_best_allocation_weights = saved_cycle_allocation
+    if cycle_deployment_ratio is not None and 0 < cycle_deployment_ratio <= 1:
+        live_best_deployment_ratio = cycle_deployment_ratio
     live_best_max_hold = live_bundle.get("max_hold_days")
     live_best_execution_mode = live_bundle.get("execution_mode", "일반 종가모드")
     live_best_loc_buy_ratio = float(live_bundle.get("loc_buy_ratio", 0.0))
@@ -1803,6 +1865,7 @@ try:
                 if str(rec.get("종목", actual_trade_target)) == actual_trade_target and str(rec.get("구분", "")) == "매수":
                     rec["사이클전략"] = winner_name
                     rec["사이클매수비중"] = serialize_allocation(best_allocation_weights)
+                    rec["사이클운용비율"] = best_deployment_ratio
             autosave_live_trades(st.session_state.live_trades)
             st.rerun()
     elif auto_stage == 0:
@@ -1831,10 +1894,14 @@ try:
             live_best_allocation_weights if auto_stage > 0 else best_allocation_weights
         )
         record_budgets = make_tranche_budgets(
-            float(investment), tranche_count, record_weights
+            float(investment) * (
+                live_best_deployment_ratio if auto_stage > 0 else best_deployment_ratio
+            ), tranche_count, record_weights
         )
         record_next_stage = min(auto_stage + 1, tranche_count)
-        record_weight_pct = float(record_weights[record_next_stage - 1])
+        record_weight_pct = float(record_weights[record_next_stage - 1]) * (
+            live_best_deployment_ratio if auto_stage > 0 else best_deployment_ratio
+        )
         default_amount = float(record_budgets[record_next_stage - 1])
         default_qty = (default_amount / record_price) if record_price > 0 else 0.0
 
@@ -1900,6 +1967,7 @@ try:
                         "사이클매수비중": serialize_allocation(
                             live_best_allocation_weights if auto_stage > 0 and cycle_is_locked else best_allocation_weights
                         ),
+                        "사이클운용비율": live_best_deployment_ratio if auto_stage > 0 and cycle_is_locked else best_deployment_ratio,
                     }
                 )
                 autosave_live_trades(st.session_state.live_trades)
@@ -1934,6 +2002,7 @@ try:
                         "사이클매수비중": serialize_allocation(
                             live_best_allocation_weights if auto_stage > 0 else best_allocation_weights
                         ),
+                        "사이클운용비율": live_best_deployment_ratio if auto_stage > 0 else best_deployment_ratio,
                     }
                 )
                 autosave_live_trades(st.session_state.live_trades)
@@ -2007,7 +2076,8 @@ try:
     next_stage = int(live_stage) + 1
 
     live_tranche_budgets = make_tranche_budgets(
-        float(investment), tranche_count, live_best_allocation_weights
+        float(investment) * live_best_deployment_ratio,
+        tranche_count, live_best_allocation_weights
     )
     live_tranche_weights = normalize_allocation_weights(
         tranche_count, live_best_allocation_weights
@@ -2017,7 +2087,7 @@ try:
     ]
     current_weight_pct = float(
         live_tranche_weights[min(max(next_stage - 1, 0), tranche_count - 1)]
-    )
+    ) * live_best_deployment_ratio
 
     avg_buy_price = auto_avg_price if live_stage > 0 else None
 
@@ -2240,7 +2310,9 @@ try:
     allocation_view = pd.DataFrame(
         {
             "차수": [f"{i}차" for i in range(1, tranche_count + 1)],
-            "매수비중": [f"{w:.2%}" for w in live_tranche_weights],
+            "총자금 대비 매수비중": [
+                f"{w * live_best_deployment_ratio:.2%}" for w in live_tranche_weights
+            ],
             "예정금액": [f"{currency}{x:,.0f}" for x in live_tranche_budgets],
             "종가금액": [f"{currency}{x * (1-live_best_loc_buy_ratio):,.0f}" for x in live_tranche_budgets],
             "LOC금액": [f"{currency}{x * live_best_loc_buy_ratio:,.0f}" for x in live_tranche_budgets],
@@ -2248,8 +2320,9 @@ try:
     )
     st.write("**전체 투자금 기준 분할매수 계획**")
     st.caption(
-        f"자동 최적화된 총자산 대비 매수 % · 종가 {1-live_best_loc_buy_ratio:.0%} + "
-        f"LOC {live_best_loc_buy_ratio:.0%} · 아래 비중의 합계는 100%입니다."
+        f"총자금 {live_best_deployment_ratio:.0%} 운용 · 종가 {1-live_best_loc_buy_ratio:.0%} + "
+        f"LOC {live_best_loc_buy_ratio:.0%} · 아래 비중 합계는 총자금의 "
+        f"{live_best_deployment_ratio:.0%}입니다."
     )
     st.dataframe(
         allocation_view,
@@ -2296,6 +2369,8 @@ try:
     )
     display["실전점수"] = display["실전점수"].map(lambda x: f"{x:.2%}")
     display["실전기준통과"] = display["실전기준통과"].map(lambda x: "통과" if x else "미달")
+    display["총자금 운용률"] = display["총자금 운용률"].map(lambda x: f"{x:.0%}")
+    display["평균 투자금 사용률"] = display["평균 투자금 사용률"].map(lambda x: f"{x:.1%}")
 
     st.dataframe(
         display[
@@ -2306,6 +2381,8 @@ try:
                 "차수별 매수%",
                 "필터",
                 "체결방식",
+                "총자금 운용률",
+                "평균 투자금 사용률",
                 "실전기준통과",
                 "실전점수",
                 "최종자산",
@@ -2335,6 +2412,10 @@ try:
     k5, k6 = st.columns(2)
     k5.metric("최대 보유기간", f"{best['max_hold']:.0f}일")
     k6.metric("완료 매매", f"{best['trade_count']}회")
+
+    k7, k8 = st.columns(2)
+    k7.metric("평균 투자금 사용률", f"{best['avg_exposure']:.1%}")
+    k8.metric("최대 투자금 사용률", f"{best['max_exposure']:.1%}")
 
     st.line_chart(best["equity"][["Equity"]])
 
