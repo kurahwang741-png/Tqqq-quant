@@ -1778,9 +1778,13 @@ try:
     live_tranche_budgets = make_tranche_budgets(
         float(investment), tranche_count, live_best_weight_mode
     )
+    live_tranche_weights = make_tranche_weights(tranche_count, live_best_weight_mode)
     tranche_budget = live_tranche_budgets[
         min(max(next_stage - 1, 0), tranche_count - 1)
     ]
+    current_weight_pct = float(
+        live_tranche_weights[min(max(next_stage - 1, 0), tranche_count - 1)]
+    )
 
     avg_buy_price = auto_avg_price if live_stage > 0 else None
 
@@ -1875,7 +1879,12 @@ try:
             )
 
     a1, a2, a3 = st.columns(3)
-    a1.metric("오늘 신호", signal)
+    signal_display = (
+        f"{signal} · 총자금 {current_weight_pct:.2%}"
+        if signal.endswith("매수")
+        else (f"{signal} · 보유수량 100%" if signal in ["익절", "기간청산"] else signal)
+    )
+    a1.metric("오늘 신호", signal_display)
     a2.metric("신호 ETF 가격", f"{currency}{signal_price:,.2f}")
     a3.metric("실제 매수 ETF 최신가", f"{currency}{trade_price:,.2f}")
     quote_time_text = format_quote_time(latest_price_time)
@@ -1918,7 +1927,8 @@ try:
                     f"{currency}{loc_effective_buy:,.2f} 이하",
                 )
                 st.caption(
-                    f"주문금액 {currency}{tranche_budget:,.0f} · "
+                    f"전체 투자금의 {current_weight_pct:.2%} 매수 "
+                    f"({currency}{tranche_budget:,.0f}) · "
                     f"전략 신호가와 LOC 한도 중 더 낮은 가격"
                 )
             else:
@@ -1932,6 +1942,7 @@ try:
                     f"{currency}{loc_sell_limit_today:,.2f} 이상",
                 )
                 st.caption(
+                    f"보유수량의 100% 매도 · "
                     f"평균단가 {currency}{avg_buy_price:,.2f} × "
                     f"익절 {live_best_tp:.0%}"
                 )
@@ -1948,7 +1959,8 @@ try:
             st.success(
                 f"🟢 **오늘 매수 주문:** {us_product} LOC "
                 f"{currency}{loc_effective_buy:,.2f} 이하 / "
-                f"{currency}{tranche_budget:,.0f}"
+                f"전체 투자금의 **{current_weight_pct:.2%}** "
+                f"({currency}{tranche_budget:,.0f})"
             )
 
         if loc_sell_limit_today is not None:
@@ -1967,14 +1979,14 @@ try:
             else:
                 st.success(
                     f"🔴 **오늘 매도 주문:** {us_product} LOC 전량매도 "
-                    f"{currency}{loc_sell_limit_today:,.2f} 이상"
+                    f"{currency}{loc_sell_limit_today:,.2f} 이상 / "
+                    "보유수량의 **100% 매도**"
                 )
 
         st.caption(
             "매수·매도 주문을 동시에 낼 수 있는지는 증권사 주문가능금액/수량 및 주문 방식에 따라 다릅니다. "
             "LOC는 마감 경매에서 한도가격 조건을 만족해야 체결되며, 표시 가격에 반드시 체결되는 것은 아닙니다."
         )
-    live_tranche_weights = make_tranche_weights(tranche_count, live_best_weight_mode)
     allocation_view = pd.DataFrame(
         {
             "차수": [f"{i}차" for i in range(1, tranche_count + 1)],
@@ -1982,10 +1994,8 @@ try:
             "예정금액": [f"{currency}{x:,.0f}" for x in live_tranche_budgets],
         }
     )
-    current_weight_pct = float(
-        live_tranche_weights[min(max(next_stage - 1, 0), tranche_count - 1)]
-    )
-    st.write(f"**매수 비중:** {live_best_weight_mode}")
+    st.write("**전체 투자금 기준 분할매수 계획**")
+    st.caption(f"계산 방식: {live_best_weight_mode} · 아래 비중의 합계는 100%입니다.")
     st.dataframe(
         allocation_view,
         use_container_width=True,
@@ -1998,13 +2008,12 @@ try:
     )
 
     if signal.endswith("매수"):
-        st.success(f"✅ 오늘 할 일: **{currency}{tranche_budget:,.0f} 매수**")
-    elif signal in ["익절", "기간청산"]:
         st.success(
-            "✅ 오늘 할 일: **실제 보유 ETF 전량매도**"
-            if signal == "기간청산"
-            else "✅ 오늘 할 일: **실제 보유 ETF 전량 익절**"
+            f"✅ 오늘 할 일: **전체 투자금의 {current_weight_pct:.2%} 매수** "
+            f"({currency}{tranche_budget:,.0f})"
         )
+    elif signal in ["익절", "기간청산"]:
+        st.success("✅ 오늘 할 일: **현재 보유수량의 100% 매도**")
     else:
         st.info("⏳ 오늘 할 일: **매수하지 않고 대기**")
 
