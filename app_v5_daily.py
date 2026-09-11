@@ -6,13 +6,13 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V10",
+    page_title="TQQQ / 코코레 QUANT V11",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / 코코레 QUANT V10")
-st.caption("일봉 전용 · TQQQ LOC + 가중 분할매수 + 단기회전 + 실제 매매기록")
+st.title("📈 TQQQ / 코코레 QUANT V11")
+st.caption("일봉 전용 · 가중비중 자동비교 + TQQQ LOC + 단기회전 + 실제 매매기록")
 
 market = st.radio(
     "시장",
@@ -105,11 +105,12 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         step=1,
     )
 
-    weight_mode = st.selectbox(
-        "분할매수 비중",
+    weight_modes = st.multiselect(
+        "분할매수 비중 자동 비교",
         ["균등비중", "약한 가중", "강한 가중"],
-        index=0,
+        default=["균등비중", "약한 가중", "강한 가중"],
         help=(
+            "선택한 비중 방식을 한 번의 백테스트에서 모두 비교합니다. "
             "균등비중은 매회 같은 금액, 약한/강한 가중은 "
             "하락 단계가 깊어질수록 더 큰 금액을 매수합니다."
         ),
@@ -516,7 +517,7 @@ try:
         tuple(effective_take_profits),
         tuple(effective_max_holds),
         tranche_count,
-        weight_mode,
+        tuple(weight_modes),
         use_ma_candidates,
         use_rsi_candidates,
         tuple(rsi_thresholds),
@@ -565,8 +566,13 @@ try:
             "③ 본주 신호로 본주 매수를 같은 조건에서 비교합니다."
         )
 
-    if not effective_buy_steps or not effective_take_profits or not effective_max_holds:
-        st.warning("매수 간격, 익절률, 최대 보유기간을 각각 하나 이상 선택해 주세요.")
+    if (
+        not effective_buy_steps
+        or not effective_take_profits
+        or not effective_max_holds
+        or not weight_modes
+    ):
+        st.warning("매수 간격, 익절률, 최대 보유기간, 분할매수 비중을 각각 하나 이상 선택해 주세요.")
         st.stop()
 
     st.divider()
@@ -582,6 +588,7 @@ try:
             * len(effective_take_profits)
             * len(filter_candidates)
             * len(effective_max_holds)
+            * len(weight_modes)
         )
         done_jobs = 0
 
@@ -605,73 +612,74 @@ try:
                     for tp in effective_take_profits:
                         for use_ma, rsi_max in filter_candidates:
                             for max_hold_days in effective_max_holds:
-                                sim = simulate(
-                                    df,
-                                    float(investment),
-                                    step_pct,
-                                    tp,
-                                    tranche_count,
-                                    use_ma,
-                                    rsi_max,
-                                    weight_mode,
-                                    max_hold_days,
-                                    us_execution_mode,
-                                    float(loc_buy_offset),
-                                    float(loc_sell_offset),
-                                )
+                                for weight_mode in weight_modes:
+                                    sim = simulate(
+                                        df,
+                                        float(investment),
+                                        step_pct,
+                                        tp,
+                                        tranche_count,
+                                        use_ma,
+                                        rsi_max,
+                                        weight_mode,
+                                        max_hold_days,
+                                        us_execution_mode,
+                                        float(loc_buy_offset),
+                                        float(loc_sell_offset),
+                                    )
 
-                                fname = filter_name(use_ma, rsi_max)
-                                hold_name = "제한없음" if max_hold_days is None else f"{max_hold_days}일"
-                                exec_name = (
-                                    f"LOC(-{loc_buy_offset:.2%})"
-                                    if market.startswith("🇺🇸") and us_execution_mode == "LOC 모드"
-                                    else "종가"
-                                )
-                                strategy_name = (
-                                    f"{mode['mode']} | "
-                                    f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / "
-                                    f"{weight_mode} / 최대 {hold_name} / {fname} / {exec_name}"
-                                )
+                                    fname = filter_name(use_ma, rsi_max)
+                                    hold_name = "제한없음" if max_hold_days is None else f"{max_hold_days}일"
+                                    exec_name = (
+                                        f"LOC(-{loc_buy_offset:.2%})"
+                                        if market.startswith("🇺🇸") and us_execution_mode == "LOC 모드"
+                                        else "종가"
+                                    )
+                                    strategy_name = (
+                                        f"{mode['mode']} | "
+                                        f"{step_pct:.0%} 간격 / {tp:.0%} 익절 / "
+                                        f"{weight_mode} / 최대 {hold_name} / {fname} / {exec_name}"
+                                    )
 
-                                sims[strategy_name] = {
-                                    "sim": sim,
-                                    "mode": mode,
-                                    "df": df,
-                                    "step_pct": step_pct,
-                                    "tp": tp,
-                                    "use_ma": use_ma,
-                                    "rsi_max": rsi_max,
-                                    "weight_mode": weight_mode,
-                                    "max_hold_days": max_hold_days,
-                                    "execution_mode": us_execution_mode,
-                                    "loc_buy_offset": float(loc_buy_offset),
-                                    "loc_sell_offset": float(loc_sell_offset),
-                                }
-
-                                results.append(
-                                    {
-                                        "전략": strategy_name,
-                                        "운용방식": mode["mode"],
-                                        "매수간격": step_pct,
-                                        "익절률": tp,
-                                        "매수비중": weight_mode,
-                                        "필터": fname,
-                                        "체결방식": exec_name,
-                                        "보유제한": hold_name,
-                                        "최종자산": sim["final_value"],
-                                        "누적수익률": sim["total_return"],
-                                        "CAGR": sim["cagr"],
-                                        "MDD": sim["mdd"],
-                                        "최대보유일": sim["max_hold"],
-                                        "기간청산": sim["forced_exit_count"],
-                                        "완료매매": sim["trade_count"],
-                                        "승률": sim["win_rate"],
+                                    sims[strategy_name] = {
+                                        "sim": sim,
+                                        "mode": mode,
+                                        "df": df,
+                                        "step_pct": step_pct,
+                                        "tp": tp,
+                                        "use_ma": use_ma,
+                                        "rsi_max": rsi_max,
+                                        "weight_mode": weight_mode,
+                                        "max_hold_days": max_hold_days,
+                                        "execution_mode": us_execution_mode,
+                                        "loc_buy_offset": float(loc_buy_offset),
+                                        "loc_sell_offset": float(loc_sell_offset),
                                     }
-                                )
 
-                                done_jobs += 1
-                                progress.progress(done_jobs / max(total_jobs, 1))
-                                status.caption(f"계산 중... {done_jobs}/{total_jobs}")
+                                    results.append(
+                                        {
+                                            "전략": strategy_name,
+                                            "운용방식": mode["mode"],
+                                            "매수간격": step_pct,
+                                            "익절률": tp,
+                                            "매수비중": weight_mode,
+                                            "필터": fname,
+                                            "체결방식": exec_name,
+                                            "보유제한": hold_name,
+                                            "최종자산": sim["final_value"],
+                                            "누적수익률": sim["total_return"],
+                                            "CAGR": sim["cagr"],
+                                            "MDD": sim["mdd"],
+                                            "최대보유일": sim["max_hold"],
+                                            "기간청산": sim["forced_exit_count"],
+                                            "완료매매": sim["trade_count"],
+                                            "승률": sim["win_rate"],
+                                        }
+                                    )
+
+                                    done_jobs += 1
+                                    progress.progress(done_jobs / max(total_jobs, 1))
+                                    status.caption(f"계산 중... {done_jobs}/{total_jobs}")
 
         result = (
             pd.DataFrame(results)
@@ -727,6 +735,33 @@ try:
         f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
         f"{best_weight_mode} / {filter_name(best_use_ma, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
+    )
+
+    st.subheader("⚖️ 비중 방식 비교")
+    weight_summary = (
+        result.sort_values(["최종자산", "CAGR"], ascending=False)
+        .groupby("매수비중", as_index=False)
+        .first()
+        .sort_values(["최종자산", "CAGR"], ascending=False)
+    )
+
+    weight_view = weight_summary[
+        ["매수비중", "최종자산", "CAGR", "MDD", "최대보유일", "완료매매"]
+    ].copy()
+    weight_view["최종자산"] = weight_view["최종자산"].map(
+        lambda x: f"{currency}{x:,.0f}"
+    )
+    weight_view["CAGR"] = weight_view["CAGR"].map(lambda x: f"{x:.1%}")
+    weight_view["MDD"] = weight_view["MDD"].map(lambda x: f"{x:.1%}")
+    weight_view["최대보유일"] = weight_view["최대보유일"].map(lambda x: f"{x:.0f}일")
+    st.dataframe(weight_view, use_container_width=True, hide_index=True)
+
+    best_weight_row = weight_summary.iloc[0]
+    st.success(
+        f"🏆 비중 방식 1위: **{best_weight_row['매수비중']}** · "
+        f"최종자산 {currency}{best_weight_row['최종자산']:,.0f} · "
+        f"CAGR {best_weight_row['CAGR']:.1%} · "
+        f"MDD {best_weight_row['MDD']:.1%}"
     )
 
     st.subheader("🎯 목적별 추천")
