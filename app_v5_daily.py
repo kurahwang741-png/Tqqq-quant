@@ -6,7 +6,7 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V15",
+    page_title="TQQQ / 코코레 QUANT V16",
     page_icon="📈",
     layout="centered",
 )
@@ -119,6 +119,46 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         ),
     )
 
+    st.markdown("**백테스트 기간**")
+    backtest_period_mode = st.radio(
+        "기간 선택",
+        ["전체기간", "연도 범위", "직접 날짜 선택"],
+        horizontal=True,
+        help="전체기간 또는 원하는 특정 기간만 선택해서 백테스트할 수 있습니다.",
+    )
+
+    selected_start_year = None
+    selected_end_year = None
+    selected_start_date = None
+    selected_end_date = None
+
+    if backtest_period_mode == "연도 범위":
+        y1, y2 = st.columns(2)
+        selected_start_year = int(y1.number_input(
+            "시작연도",
+            min_value=2010,
+            max_value=date.today().year,
+            value=max(2016, date.today().year - 10),
+            step=1,
+        ))
+        selected_end_year = int(y2.number_input(
+            "종료연도",
+            min_value=2010,
+            max_value=date.today().year,
+            value=date.today().year,
+            step=1,
+        ))
+    elif backtest_period_mode == "직접 날짜 선택":
+        d1, d2 = st.columns(2)
+        selected_start_date = d1.date_input(
+            "시작일",
+            value=date(max(2016, date.today().year - 10), 1, 1),
+        )
+        selected_end_date = d2.date_input(
+            "종료일",
+            value=date.today(),
+        )
+
     st.markdown("**필터 자동 비교**")
     ma_periods = st.multiselect(
         "비교할 이동평균선",
@@ -168,6 +208,13 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         disabled=not short_mode,
         help="해당 기간 안에 익절하지 못하면 그날 종가에 전량 청산하는 조건입니다.",
     )
+
+if backtest_period_mode == "전체기간":
+    st.caption("선택 기간: 전체 데이터")
+elif backtest_period_mode == "연도 범위":
+    st.caption(f"선택 기간: {selected_start_year}년 ~ {selected_end_year}년")
+else:
+    st.caption(f"선택 기간: {selected_start_date} ~ {selected_end_date}")
 
 run_backtest = st.button(
     "🚀 백테스트 실행",
@@ -260,6 +307,30 @@ def format_quote_time(ts):
         return f"미국 동부 {ny:%Y-%m-%d %H:%M} / 한국 {kr:%Y-%m-%d %H:%M}"
     except Exception:
         return str(ts)
+
+
+def apply_backtest_period(df, mode, start_year=None, end_year=None, start_date=None, end_date=None):
+    out = df.copy()
+
+    if mode == "연도 범위":
+        if start_year is None or end_year is None:
+            return out
+        if int(start_year) > int(end_year):
+            raise ValueError("시작연도는 종료연도보다 늦을 수 없습니다.")
+        start_ts = pd.Timestamp(f"{int(start_year)}-01-01")
+        end_ts = pd.Timestamp(f"{int(end_year)}-12-31")
+        out = out.loc[(out.index >= start_ts) & (out.index <= end_ts)]
+
+    elif mode == "직접 날짜 선택":
+        if start_date is None or end_date is None:
+            return out
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        if start_ts > end_ts:
+            raise ValueError("시작일은 종료일보다 늦을 수 없습니다.")
+        out = out.loc[(out.index >= start_ts) & (out.index <= end_ts)]
+
+    return out
 
 
 def calc_rsi(series, period=14):
@@ -584,6 +655,11 @@ try:
         tranche_count,
         tuple(weight_modes),
         tuple(ma_periods),
+        backtest_period_mode,
+        selected_start_year,
+        selected_end_year,
+        selected_start_date,
+        selected_end_date,
         use_rsi_candidates,
         tuple(rsi_thresholds),
         short_mode,
@@ -669,6 +745,22 @@ try:
                 df["SIGNAL"] = close[mode["signal_symbol"]]
                 df["TRADE"] = close[mode["trade_symbol"]]
                 df["REF"] = close[mode["ref_symbol"]]
+                df = df.dropna()
+
+                df = apply_backtest_period(
+                    df,
+                    backtest_period_mode,
+                    selected_start_year,
+                    selected_end_year,
+                    selected_start_date,
+                    selected_end_date,
+                )
+
+                if len(df) < 260:
+                    raise ValueError(
+                        "선택한 백테스트 기간이 너무 짧습니다. "
+                        "200일 이동평균 계산을 위해 최소 약 1년 이상의 기간을 선택해 주세요."
+                    )
 
                 df["ANCHOR"] = anchor_series(df["SIGNAL"], anchor_mode)
                 df["RSI14"] = calc_rsi(df["REF"], 14)
@@ -796,7 +888,7 @@ try:
     bt_years = max((bt_end - bt_start).days / 365.25, 0)
     st.caption(
         f"📅 실제 백테스트 사용기간: {bt_start:%Y-%m-%d} ~ {bt_end:%Y-%m-%d} "
-        f"(약 {bt_years:.1f}년)"
+        f"(약 {bt_years:.1f}년) · 선택모드: {backtest_period_mode}"
     )
 
     st.success(f"🥇 최종자산 1위: **{winner['운용방식']}**")
