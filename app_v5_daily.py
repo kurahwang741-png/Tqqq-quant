@@ -5,15 +5,18 @@ import numpy as np
 from datetime import date
 import time
 from io import StringIO
+from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V28",
+    page_title="TQQQ / SOXL / 코코레 QUANT V29",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V28")
-st.caption("일봉 백테스트 · 총자산 대비 매수 % + 종가·LOC 비중 자동 최적화")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V29")
+st.caption("다음 거래일 체결 · 거래비용 · 전체 워크포워드 · 실전 안전장치")
+
+AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 
 market = st.radio(
     "시장",
@@ -215,6 +218,29 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         disabled=not short_mode,
         help="해당 기간 안에 익절하지 못하면 그날 종가에 전량 청산하는 조건입니다.",
     )
+
+    st.markdown("**💸 실전 거래비용**")
+    cost1, cost2, cost3 = st.columns(3)
+    fee_pct = cost1.number_input(
+        "편도 수수료(%)", min_value=0.0, max_value=2.0, value=0.05, step=0.01
+    ) / 100
+    slippage_pct = cost2.number_input(
+        "편도 슬리피지(%)", min_value=0.0, max_value=2.0, value=0.05, step=0.01
+    ) / 100
+    fx_cost_pct = cost3.number_input(
+        "편도 환전비용(%)", min_value=0.0, max_value=2.0,
+        value=0.10 if market.startswith("🇺🇸") else 0.0, step=0.01,
+        disabled=not market.startswith("🇺🇸"),
+    ) / 100
+
+    st.markdown("**🛡️ 실전 전략 선정 기준**")
+    risk1, risk2 = st.columns(2)
+    min_completed_trades = int(risk1.number_input(
+        "최소 완료매매 횟수", min_value=1, max_value=100, value=5, step=1
+    ))
+    max_allowed_mdd = risk2.number_input(
+        "허용 최대 MDD(%)", min_value=10.0, max_value=95.0, value=60.0, step=5.0
+    ) / 100
 
 if backtest_period_mode == "전체기간":
     st.caption("선택 기간: 전체 데이터 · 워크포워드 검증은 전체기간에서 실행하는 것을 권장합니다.")
@@ -494,6 +520,24 @@ def make_tranche_budgets(initial_cash, n_tranches, allocation_weights=None):
     return (float(initial_cash) * weights).tolist()
 
 
+def autosave_live_trades(records):
+    """앱 재실행 시 복구할 수 있도록 매매기록을 즉시 저장합니다."""
+    try:
+        pd.DataFrame(records).to_csv(AUTO_LOG_PATH, index=False, encoding="utf-8-sig")
+        return True
+    except Exception:
+        return False
+
+
+def load_autosaved_trades():
+    if not AUTO_LOG_PATH.exists() or AUTO_LOG_PATH.stat().st_size == 0:
+        return []
+    try:
+        return pd.read_csv(AUTO_LOG_PATH).to_dict("records")
+    except Exception:
+        return []
+
+
 def simulate(
     df,
     initial_cash,
@@ -508,6 +552,9 @@ def simulate(
     loc_buy_offset=0.0,
     loc_sell_offset=0.0,
     loc_buy_ratio=0.0,
+    fee_pct=0.0,
+    slippage_pct=0.0,
+    fx_cost_pct=0.0,
 ):
     cash = float(initial_cash)
     shares = 0.0
@@ -516,6 +563,8 @@ def simulate(
     trades = []
     equity_rows = []
     next_level = 1
+    pending_buy = None
+    pending_exit = None
     tranche_budgets = make_tranche_budgets(
         initial_cash, n_tranches, allocation_weights
     )
@@ -550,48 +599,56 @@ def simulate(
         drawdown = max(0.0, 1 - signal_price / anchor)
         exited_today = False
 
-        if shares > 0:
-            avg_price = total_cost / shares
-            pnl_pct = trade_price / avg_price - 1
-            first_buy_date = entries[0][0] if entries else dt
-            holding_days = (dt - pd.Timestamp(first_buy_date)).days
-
-            exit_reason = None
-
-            target_sell_price = avg_price * (1 + take_profit)
-            sell_fill_ok = True
-            if execution_mode == "LOC 모드":
-                loc_sell_limit = target_sell_price * (1 + loc_sell_offset)
-                sell_fill_ok = trade_price >= loc_sell_limit
-
-            if pnl_pct >= take_profit and sell_fill_ok:
-                exit_reason = "익절"
-            elif max_hold_days is not None and holding_days >= max_hold_days:
-                exit_reason = "기간청산"
-
-            if exit_reason is not None:
-                proceeds = shares * trade_price
+        # 전일 종가로 확정된 신호만 오늘 종가에 체결합니다.
+        if pending_exit is not None and shares > 0:
+            sell_fill_ok = (
+                pending_exit["reason"] == "기간청산"
+                or execution_mode != "LOC 모드"
+                or trade_price >= pending_exit["limit"]
+            )
+            if sell_fill_ok:
+                avg_price = total_cost / shares
+                holding_days = (dt - pd.Timestamp(entries[0][0])).days if entries else 0
+                effective_sell_price = trade_price * (1 - slippage_pct)
+                gross = shares * effective_sell_price
+                proceeds = gross * (1 - fee_pct - fx_cost_pct)
                 realized = proceeds - total_cost
+                pnl_pct = proceeds / total_cost - 1 if total_cost > 0 else 0.0
                 cash += proceeds
-
-                trades.append(
-                    {
-                        "매도일": dt,
-                        "평균매수가": avg_price,
-                        "매도가": trade_price,
-                        "수익률": pnl_pct,
-                        "실현손익": realized,
-                        "보유일수": holding_days,
-                        "매수횟수": len(entries),
-                        "청산사유": exit_reason,
-                    }
-                )
-
-                shares = 0.0
-                total_cost = 0.0
-                entries = []
-                next_level = 1
+                trades.append({
+                    "신호일": pending_exit["signal_date"], "매도일": dt,
+                    "평균매수가": avg_price, "매도가": effective_sell_price,
+                    "수익률": pnl_pct, "실현손익": realized,
+                    "보유일수": holding_days, "매수횟수": len(entries),
+                    "청산사유": pending_exit["reason"],
+                })
+                shares, total_cost, entries, next_level = 0.0, 0.0, [], 1
+                pending_exit = None
+                pending_buy = None
                 exited_today = True
+
+        if pending_buy is not None and not exited_today and pending_exit is None:
+            level = int(pending_buy["level"])
+            if level == next_level and level <= n_tranches:
+                planned_budget = tranche_budgets[level - 1]
+                close_budget = planned_budget * (1 - loc_buy_ratio)
+                loc_fill = False
+                prev_trade_price = prev_trade_arr[i]
+                if loc_buy_ratio > 0 and np.isfinite(prev_trade_price) and prev_trade_price > 0:
+                    loc_limit = prev_trade_price * (1 - loc_buy_offset)
+                    loc_fill = trade_price <= loc_limit
+                loc_budget = planned_budget * loc_buy_ratio if loc_fill else 0.0
+                budget = min(close_budget + loc_budget, cash)
+                if budget > 0:
+                    effective_buy_price = trade_price * (1 + slippage_pct)
+                    unit_cash_cost = effective_buy_price * (1 + fee_pct + fx_cost_pct)
+                    qty = budget / unit_cash_cost
+                    shares += qty
+                    total_cost += budget
+                    cash -= budget
+                    entries.append((dt, effective_buy_price, budget, level))
+                    next_level += 1
+            pending_buy = None
 
         allowed = True
         if ma_period is not None and not trend_arr[i]:
@@ -599,35 +656,28 @@ def simulate(
         if rsi_max is not None and (not np.isfinite(rsi_arr[i]) or rsi_arr[i] > rsi_max):
             allowed = False
 
-        loc_buy_fill_ok = False
-        if loc_buy_ratio > 0:
-            prev_trade_price = prev_trade_arr[i]
-            if np.isfinite(prev_trade_price) and prev_trade_price > 0:
-                loc_buy_limit = prev_trade_price * (1 - loc_buy_offset)
-                loc_buy_fill_ok = trade_price <= loc_buy_limit
+        # 오늘 종가로 신호를 확정하고 다음 거래일 주문으로 넘깁니다.
+        if shares > 0 and pending_exit is None and not exited_today:
+            avg_price = total_cost / shares
+            first_buy_date = entries[0][0] if entries else dt
+            holding_days = (dt - pd.Timestamp(first_buy_date)).days
+            target_sell_price = avg_price * (1 + take_profit)
+            if trade_price >= target_sell_price:
+                pending_exit = {
+                    "reason": "익절", "signal_date": dt,
+                    "limit": target_sell_price * (1 + loc_sell_offset),
+                }
+            elif max_hold_days is not None and holding_days >= max_hold_days:
+                pending_exit = {"reason": "기간청산", "signal_date": dt, "limit": 0.0}
 
-        # 화면은 매일 '다음 한 차수'의 주문가만 제시하므로 백테스트도 하루에
-        # 최대 한 차수만 체결합니다. 급락일에 여러 차수가 같은 종가로 한꺼번에
-        # 체결되는 과대평가를 막고 실제 운용 화면과 기준을 맞춥니다.
         if (
-            allowed
-            and not exited_today
+            pending_exit is None and allowed and not exited_today
             and next_level <= n_tranches
             and drawdown + 1e-12 >= step_pct * next_level
         ):
-            planned_budget = tranche_budgets[next_level - 1]
-            close_budget = planned_budget * (1 - loc_buy_ratio)
-            loc_budget = planned_budget * loc_buy_ratio if loc_buy_fill_ok else 0.0
-            budget = min(close_budget + loc_budget, cash)
-            if budget > 0:
-                qty = budget / trade_price
-                shares += qty
-                total_cost += budget
-                cash -= budget
-                entries.append((dt, trade_price, budget, next_level))
-                next_level += 1
+            pending_buy = {"level": next_level, "signal_date": dt}
 
-        equity = cash + shares * trade_price
+        equity = cash + shares * trade_price * (1 - slippage_pct) * (1 - fee_pct - fx_cost_pct)
         equity_rows.append(
             (dt, equity, cash, shares, signal_price, trade_price, drawdown)
         )
@@ -787,6 +837,11 @@ try:
         tuple(loc_buy_ratios),
         float(loc_buy_offset),
         float(loc_sell_offset),
+        float(fee_pct),
+        float(slippage_pct),
+        float(fx_cost_pct),
+        int(min_completed_trades),
+        float(max_allowed_mdd),
     )
 
     # 현재 지표 표시용: 레버리지 신호 + 기초 ETF/본주 RSI 및 추세
@@ -912,7 +967,7 @@ try:
         started_at = time.time()
         tested = set()
         scored = []
-        live_best = {"value": -float("inf"), "name": "-"}
+        live_best = {"eligible": False, "score": -float("inf"), "value": -float("inf"), "name": "-"}
 
         def run_one(job):
             mi, si, ti, fi, hi, wi, xi = job
@@ -938,6 +993,19 @@ try:
                 float(loc_buy_offset),
                 float(loc_sell_offset),
                 loc_buy_ratio,
+                float(fee_pct),
+                float(slippage_pct),
+                float(fx_cost_pct),
+            )
+
+            eligible = (
+                sim["trade_count"] >= int(min_completed_trades)
+                and abs(sim["mdd"]) <= float(max_allowed_mdd)
+            )
+            risk_score = (
+                float(sim["cagr"])
+                - 0.50 * abs(float(sim["mdd"]))
+                - 0.02 * min(float(sim["max_hold"]) / 365.0, 5.0)
             )
 
             fname = filter_name(ma_period, rsi_max)
@@ -954,7 +1022,7 @@ try:
                 exec_name = "종가"
             strategy_name = (
                 f"{mode['mode']} | {step_pct:.0%} 간격 / {tp:.0%} 익절 / "
-                f"차수별 자동비중 / 최대 {hold_name} / {fname} / {exec_name}"
+                f"자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
             )
 
             sims[strategy_name] = {
@@ -992,11 +1060,20 @@ try:
                 "기간청산": sim["forced_exit_count"],
                 "완료매매": sim["trade_count"],
                 "승률": sim["win_rate"],
+                "실전기준통과": eligible,
+                "실전점수": risk_score,
             }
             results.append(row)
-            scored.append((float(sim["final_value"]), job))
+            scored.append(((1 if eligible else 0, risk_score, float(sim["final_value"])), job))
             tested.add(job)
-            if float(sim["final_value"]) > live_best["value"]:
+            live_rank = (1 if eligible else 0, risk_score, float(sim["final_value"]))
+            current_rank = (
+                1 if live_best["eligible"] else 0,
+                live_best["score"], live_best["value"]
+            )
+            if live_rank > current_rank:
+                live_best["eligible"] = eligible
+                live_best["score"] = risk_score
                 live_best["value"] = float(sim["final_value"])
                 live_best["name"] = strategy_name
 
@@ -1077,7 +1154,7 @@ try:
 
         result = (
             pd.DataFrame(results)
-            .sort_values(["최종자산", "CAGR"], ascending=False)
+            .sort_values(["실전기준통과", "실전점수", "최종자산"], ascending=False)
             .reset_index(drop=True)
         )
 
@@ -1132,7 +1209,14 @@ try:
         f"(약 {bt_years:.1f}년) · 선택모드: {backtest_period_mode}"
     )
 
-    st.success(f"🥇 최종자산 1위: **{winner['운용방식']}**")
+    st.success(
+        f"🥇 실전점수 1위: **{winner['운용방식']}** · "
+        f"완료매매 {int(winner['완료매매'])}회 · MDD {winner['MDD']:.1%}"
+    )
+    st.caption(
+        f"선정 기준: 완료매매 {min_completed_trades}회 이상, MDD {max_allowed_mdd:.0%} 이내를 우선하고 "
+        "CAGR에서 MDD와 장기 보유 페널티를 차감한 실전점수로 순위를 정합니다."
+    )
 
     if market.startswith("🇺🇸"):
         sell_desc = (
@@ -1189,18 +1273,20 @@ try:
         "이 방식이 단순 전체기간 1위보다 과최적화 여부를 확인하는 데 유리합니다."
     )
 
-    st.subheader("🔄 최근 2개년 워크포워드 검증")
+    st.subheader("🔄 전체 연도 워크포워드 검증")
     st.caption(
-        "전체 연도를 반복 계산하지 않고 최근 완료연도와 올해만 검증합니다. "
-        "각 실전연도 직전 3년·5년·10년 데이터만으로 전략을 선정한 뒤 해당 연도에 고정 적용합니다."
+        "데이터가 허용하는 모든 실전연도에 대해 직전 3년·5년·10년 자료만으로 "
+        "전략을 선정하고 다음 1년 성과를 연결합니다. 계산 시간이 길 수 있습니다."
     )
 
-    run_walk_forward = st.button("🔬 최근 2개년 워크포워드 실행", use_container_width=True)
+    run_walk_forward = st.button("🔬 전체 연도 워크포워드 실행", use_container_width=True)
 
     if run_walk_forward:
         wf_windows = [3, 5, 10]
-        current_year = int(pd.DatetimeIndex(close.index).year.max())
-        test_years = [current_year - 1, current_year]
+        all_years = sorted(pd.DatetimeIndex(close.index).year.unique())
+        current_year = int(max(all_years))
+        first_year = int(min(all_years))
+        test_years = [int(y) for y in all_years if int(y) >= first_year + 3]
         wf_rows = []
         wf_year_rows = []
 
@@ -1249,7 +1335,7 @@ try:
                         required_cols.append(f"TREND_OK_{int(ma_period)}")
                     train_df = train_df.dropna(subset=required_cols)
 
-                    if len(train_df) < 100:
+                    if len(train_df) < max(100, int(train_years) * 200):
                         continue
 
                     train_sim = simulate(
@@ -1266,14 +1352,25 @@ try:
                         bundle["loc_buy_offset"],
                         bundle["loc_sell_offset"],
                         bundle.get("loc_buy_ratio", 0.0),
+                        float(fee_pct),
+                        float(slippage_pct),
+                        float(fx_cost_pct),
+                    )
+                    train_eligible = (
+                        train_sim["trade_count"] >= int(min_completed_trades)
+                        and abs(train_sim["mdd"]) <= float(max_allowed_mdd)
+                    )
+                    train_score = (
+                        train_sim["cagr"] - 0.50 * abs(train_sim["mdd"])
+                        - 0.02 * min(train_sim["max_hold"] / 365.0, 5.0)
                     )
                     candidates.append(
-                        (train_sim["final_value"], train_sim["cagr"], strategy_name, bundle, base)
+                        (train_eligible, train_score, train_sim["final_value"], strategy_name, bundle, base)
                     )
 
                 if candidates:
-                    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                    _, _, chosen_name, chosen_bundle, chosen_base = candidates[0]
+                    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+                    _, _, _, chosen_name, chosen_bundle, chosen_base = candidates[0]
 
                     test_df = chosen_base.loc[
                         (chosen_base.index >= test_start) & (chosen_base.index <= test_end)
@@ -1301,6 +1398,9 @@ try:
                             chosen_bundle["loc_buy_offset"],
                             chosen_bundle["loc_sell_offset"],
                             chosen_bundle.get("loc_buy_ratio", 0.0),
+                            float(fee_pct),
+                            float(slippage_pct),
+                            float(fx_cost_pct),
                         )
                         capital = float(test_sim["final_value"])
                         year_return = capital / start_capital - 1 if start_capital else 0.0
@@ -1340,7 +1440,7 @@ try:
                 })
 
         wf_progress.progress(1.0)
-        wf_status.caption("최근 2개년 워크포워드 계산 완료")
+        wf_status.caption("전체 연도 워크포워드 계산 완료")
 
         if wf_rows:
             wf_result = pd.DataFrame(wf_rows).sort_values(
@@ -1373,7 +1473,7 @@ try:
                     detail["수익률"] = detail["수익률"].map(lambda x: f"{x:.1%}")
                     st.dataframe(detail, use_container_width=True, hide_index=True)
         else:
-            st.warning("최근 2개년 워크포워드에 사용할 데이터가 충분하지 않습니다.")
+            st.warning("전체 연도 워크포워드에 사용할 데이터가 충분하지 않습니다.")
 
     st.subheader("📈 이동평균선 방식 비교")
     ma_summary = (
@@ -1545,11 +1645,12 @@ try:
     st.caption(
         "코코레 신호를 보면서 실제 거래는 본주 또는 코코레 중 선택할 수 있습니다. "
         "선택한 종목별로 보유 차수와 평균단가를 따로 계산합니다. "
-        "새 매수부터는 사이클 전략도 CSV에 함께 저장됩니다. Streamlit Cloud 재부팅에 대비해 CSV 백업을 보관해 주세요."
+        "새 매수부터는 사이클 전략도 함께 저장됩니다. 입력 즉시 자동저장되지만, "
+        "Streamlit Cloud 재배포 시 파일이 초기화될 수 있으므로 CSV 백업도 보관해 주세요."
     )
 
     if "live_trades" not in st.session_state:
-        st.session_state.live_trades = []
+        st.session_state.live_trades = load_autosaved_trades()
 
     uploaded_log = st.file_uploader(
         "기존 매매기록 CSV 불러오기",
@@ -1567,6 +1668,7 @@ try:
                     if "종목" not in restored.columns:
                         restored["종목"] = actual_trade_target
                     st.session_state.live_trades = restored.to_dict("records")
+                    autosave_live_trades(st.session_state.live_trades)
                     st.session_state.loaded_trade_log = upload_key
                     st.success("매매기록을 불러왔습니다.")
                 else:
@@ -1701,6 +1803,7 @@ try:
                 if str(rec.get("종목", actual_trade_target)) == actual_trade_target and str(rec.get("구분", "")) == "매수":
                     rec["사이클전략"] = winner_name
                     rec["사이클매수비중"] = serialize_allocation(best_allocation_weights)
+            autosave_live_trades(st.session_state.live_trades)
             st.rerun()
     elif auto_stage == 0:
         st.caption(
@@ -1768,10 +1871,20 @@ try:
         b1, b2 = st.columns(2)
 
         if b1.button("🟢 매수 기록", use_container_width=True):
+            duplicate_buy = any(
+                str(x.get("날짜", "")) == str(record_date)
+                and str(x.get("종목", actual_trade_target)) == actual_trade_target
+                and str(x.get("구분", "")) == "매수"
+                for x in st.session_state.live_trades
+            )
             if auto_stage >= tranche_count:
                 st.warning("설정한 분할매수 횟수를 이미 모두 사용했습니다.")
+            elif duplicate_buy:
+                st.warning("같은 종목의 같은 날짜 매수기록이 이미 있어 중복 입력을 막았습니다.")
             elif record_price <= 0 or record_qty <= 0:
                 st.warning("체결가격과 매수 수량을 입력해 주세요.")
+            elif live_cost + record_amount > float(investment) * 1.001:
+                st.warning("입력 후 총투입금액이 설정한 초기 투자금을 초과해 기록하지 않았습니다.")
             else:
                 st.session_state.live_trades.append(
                     {
@@ -1789,11 +1902,20 @@ try:
                         ),
                     }
                 )
+                autosave_live_trades(st.session_state.live_trades)
                 st.rerun()
 
         if b2.button("🔴 전량매도 기록", use_container_width=True):
+            duplicate_sell = any(
+                str(x.get("날짜", "")) == str(record_date)
+                and str(x.get("종목", actual_trade_target)) == actual_trade_target
+                and str(x.get("구분", "")) == "전량매도"
+                for x in st.session_state.live_trades
+            )
             if live_qty <= 0:
                 st.warning("현재 기록상 보유 수량이 없습니다.")
+            elif duplicate_sell:
+                st.warning("같은 종목의 같은 날짜 전량매도 기록이 이미 있습니다.")
             elif record_price <= 0:
                 st.warning("매도 체결가격을 입력해 주세요.")
             else:
@@ -1814,6 +1936,7 @@ try:
                         ),
                     }
                 )
+                autosave_live_trades(st.session_state.live_trades)
                 st.rerun()
 
     trade_log = pd.DataFrame(st.session_state.live_trades)
@@ -1839,13 +1962,14 @@ try:
         if st.button("🗑️ 매매기록 전체 초기화", use_container_width=True):
             st.session_state.live_trades = []
             st.session_state.pop("loaded_trade_log", None)
+            autosave_live_trades([])
             st.rerun()
 
     # ------------------------------------------------------------
     # 오늘의 실제 매매 신호
     # ------------------------------------------------------------
     st.divider()
-    st.subheader("🚦 오늘의 매매 신호")
+    st.subheader("🚦 다음 거래일 매매 신호")
     st.caption(
         "보유 중이면 1차 매수 때 저장된 사이클 전략을 전량매도까지 고정해서 사용합니다. "
         "보유가 없을 때만 현재 백테스트 1위 전략으로 새 사이클을 시작합니다."
@@ -1864,6 +1988,12 @@ try:
         if latest_trade_price is not None
         else daily_trade_price
     )
+    latest_daily_date = pd.Timestamp(close.index.max())
+    if latest_daily_date.tzinfo is not None:
+        latest_daily_date = latest_daily_date.tz_localize(None)
+    data_age_days = (pd.Timestamp.utcnow().tz_localize(None).normalize() - latest_daily_date.normalize()).days
+    price_gap = abs(trade_price / daily_trade_price - 1) if daily_trade_price > 0 else float("inf")
+    data_safe = data_age_days <= 5 and np.isfinite(trade_price) and trade_price > 0 and price_gap <= 0.25
     live_anchor = float(latest["ANCHOR"])
     live_dd = max(0.0, 1 - signal_price / live_anchor)
 
@@ -1897,10 +2027,11 @@ try:
     loc_buy_limit_today = None
     if market.startswith("🇺🇸") and live_best_loc_buy_ratio > 0:
         trade_series = close[actual_trade_symbol].dropna()
-        if len(trade_series) >= 2:
-            prev_close = float(trade_series.iloc[-2])
+        if len(trade_series) >= 1:
+            prev_close = float(trade_series.iloc[-1])
             loc_buy_limit_today = prev_close * (1 - live_best_loc_buy_offset)
-            loc_buy_fill_ok = trade_price <= loc_buy_limit_today
+            # 다음 거래일 체결 여부는 아직 알 수 없으므로 주문 신호만 냅니다.
+            loc_buy_fill_ok = True
 
     filter_reasons = []
     if live_best_ma_period is not None and not live_trend_ok:
@@ -1948,7 +2079,7 @@ try:
                 signal = f"{next_stage}차 매수"
                 detail = (
                     "가격 조건과 필터를 통과했습니다. "
-                    + ("LOC도 체결 조건입니다." if loc_buy_fill_ok else "종가분만 매수하고 LOC분은 미체결 대기입니다.")
+                    + "LOC분은 다음 거래일 마감가격이 한도 조건을 만족할 때만 체결됩니다."
                 )
             elif not filter_ok:
                 detail = "가격 조건은 충족했지만 필터 때문에 대기: " + ", ".join(filter_reasons)
@@ -1969,7 +2100,7 @@ try:
                 signal = "1차 매수"
                 detail = (
                     "오늘 처음 시작 기준 1차 매수 조건과 필터를 통과했습니다. "
-                    + ("LOC도 체결 조건입니다." if loc_buy_fill_ok else "종가분만 매수하고 LOC분은 미체결 대기입니다.")
+                    + "LOC분은 다음 거래일 마감가격이 한도 조건을 만족할 때만 체결됩니다."
                 )
             elif not filter_ok:
                 detail = "가격은 1차 구간이지만 필터 때문에 대기: " + ", ".join(filter_reasons)
@@ -1981,13 +2112,20 @@ try:
                 f"{currency}{first_signal_price:,.2f}"
             )
 
+    if not data_safe:
+        signal = "안전대기"
+        detail = (
+            f"데이터 안전장치 작동: 최근 일봉 경과 {data_age_days}일, "
+            f"최신가와 일봉 차이 {price_gap:.1%}. 데이터 확인 전에는 주문하지 않습니다."
+        )
+
     a1, a2, a3 = st.columns(3)
     signal_display = (
         f"{signal} · 총자금 {current_weight_pct:.2%}"
         if signal.endswith("매수")
         else (f"{signal} · 보유수량 100%" if signal in ["익절", "기간청산"] else signal)
     )
-    a1.metric("오늘 신호", signal_display)
+    a1.metric("다음 거래일 신호", signal_display)
     a2.metric("신호 ETF 가격", f"{currency}{signal_price:,.2f}")
     a3.metric("실제 매수 ETF 최신가", f"{currency}{trade_price:,.2f}")
     quote_time_text = format_quote_time(latest_price_time)
@@ -2011,9 +2149,7 @@ try:
         # 매수는 전략의 낙폭 신호가격과 LOC 한도가격을 모두 만족해야 하므로 더 낮은 값을 사용합니다.
         loc_effective_buy = None
         if loc_buy_limit_today is not None and next_stage <= tranche_count:
-            raw_buy_trigger = next_signal_price if live_stage > 0 else first_signal_price
-            if raw_buy_trigger is not None:
-                loc_effective_buy = min(float(raw_buy_trigger), float(loc_buy_limit_today))
+            loc_effective_buy = float(loc_buy_limit_today)
 
         # 매도는 보유 중일 때 평균단가 × 익절목표에 LOC 여유를 반영합니다.
         if loc_sell_limit_today is None and live_stage > 0 and avg_buy_price and avg_buy_price > 0:
@@ -2025,7 +2161,7 @@ try:
         close_order_amount = tranche_budget * (1 - live_best_loc_buy_ratio)
         loc_order_amount = tranche_budget * live_best_loc_buy_ratio
 
-        st.markdown("### 📌 오늘의 종가 + LOC 주문금액")
+        st.markdown("### 📌 다음 거래일 종가 + LOC 주문금액")
 
         c_buy, c_sell = st.columns(2)
         with c_buy:
@@ -2072,7 +2208,7 @@ try:
             )
         elif next_stage <= tranche_count and signal.endswith("매수"):
             st.success(
-                f"🟢 **오늘 매수 주문:** 종가 {currency}{close_order_amount:,.0f} "
+                f"🟢 **다음 거래일 매수 주문:** 종가 {currency}{close_order_amount:,.0f} "
                 f"({close_order_pct:.2%}) + LOC {currency}{loc_order_amount:,.0f} "
                 f"({loc_order_pct:.2%})"
             )
@@ -2092,7 +2228,7 @@ try:
                 )
             else:
                 st.success(
-                    f"🔴 **오늘 매도 주문:** {us_product} LOC 전량매도 "
+                    f"🔴 **다음 거래일 매도 주문:** {us_product} LOC 전량매도 "
                     f"{currency}{loc_sell_limit_today:,.2f} 이상 / "
                     "보유수량의 **100% 매도**"
                 )
@@ -2130,14 +2266,14 @@ try:
         expected_close_amount = tranche_budget * (1 - live_best_loc_buy_ratio)
         expected_loc_amount = tranche_budget * live_best_loc_buy_ratio
         st.success(
-            f"✅ 오늘 할 일: **종가 {currency}{expected_close_amount:,.0f} + "
+            f"✅ 다음 거래일 할 일: **종가 {currency}{expected_close_amount:,.0f} + "
             f"LOC {currency}{expected_loc_amount:,.0f} 주문** "
             f"(합계 최대 {current_weight_pct:.2%})"
         )
     elif signal in ["익절", "기간청산"]:
-        st.success("✅ 오늘 할 일: **현재 보유수량의 100% 매도**")
+        st.success("✅ 다음 거래일 할 일: **현재 보유수량의 100% 매도**")
     else:
-        st.info("⏳ 오늘 할 일: **매수하지 않고 대기**")
+        st.info("⏳ 다음 거래일 할 일: **매수하지 않고 대기**")
 
     st.write(detail)
 
@@ -2158,6 +2294,8 @@ try:
     display["승률"] = display["승률"].map(
         lambda x: f"{x:.1%}" if pd.notna(x) else "-"
     )
+    display["실전점수"] = display["실전점수"].map(lambda x: f"{x:.2%}")
+    display["실전기준통과"] = display["실전기준통과"].map(lambda x: "통과" if x else "미달")
 
     st.dataframe(
         display[
@@ -2168,6 +2306,8 @@ try:
                 "차수별 매수%",
                 "필터",
                 "체결방식",
+                "실전기준통과",
+                "실전점수",
                 "최종자산",
                 "CAGR",
                 "MDD",
@@ -2199,8 +2339,8 @@ try:
     st.line_chart(best["equity"][["Equity"]])
 
     st.caption(
-        "교육·백테스트용입니다. 세금, 수수료, 슬리피지, 환율, "
-        "추적오차와 레버리지 ETF의 일일 재조정 효과는 별도 반영하지 않습니다."
+        f"교육·백테스트용입니다. 편도 수수료 {fee_pct:.2%}, 슬리피지 {slippage_pct:.2%}, "
+        f"환전비용 {fx_cost_pct:.2%}를 반영했습니다. 세금·추적오차와 실제 체결 차이는 별도로 발생할 수 있습니다."
     )
 
 except Exception as e:
