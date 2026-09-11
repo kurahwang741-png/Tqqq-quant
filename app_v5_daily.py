@@ -6,13 +6,13 @@ from datetime import date
 from io import StringIO
 
 st.set_page_config(
-    page_title="TQQQ / 코코레 QUANT V11",
+    page_title="TQQQ / 코코레 QUANT V12",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / 코코레 QUANT V11")
-st.caption("일봉 전용 · 가중비중 자동비교 + TQQQ LOC + 단기회전 + 실제 매매기록")
+st.title("📈 TQQQ / 코코레 QUANT V12")
+st.caption("일봉 백테스트 · 오늘 현재가 프리/정규/애프터 최신 시세 + 가중비중 자동비교 + TQQQ LOC")
 
 market = st.radio(
     "시장",
@@ -42,7 +42,10 @@ investment = st.number_input(
     step=step_investment,
 )
 
-st.info("모든 계산은 일봉 종가 기준입니다. 장중 체결가격과는 차이가 날 수 있습니다.")
+st.info(
+    "백테스트와 전략 신호 계산은 일봉 기준입니다. "
+    "오늘 화면의 실제 거래 종목 현재가만 프리마켓/정규장/애프터마켓 최신 시세를 별도로 사용합니다."
+)
 
 with st.expander("⚙️ 백테스트 설정", expanded=False):
     if market.startswith("🇺🇸"):
@@ -201,6 +204,42 @@ def download_close(symbols):
         close = close.to_frame()
 
     return close
+
+
+@st.cache_data(ttl=30)
+def get_latest_market_price(symbol):
+    """오늘 화면용 최신 시세. 프리/애프터마켓 포함 1분봉 우선."""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(
+            period="1d",
+            interval="1m",
+            prepost=True,
+            auto_adjust=True,
+        )
+        if hist is not None and not hist.empty:
+            close_s = hist["Close"].dropna()
+            if not close_s.empty:
+                return float(close_s.iloc[-1]), "1분봉(프리/애프터 포함)"
+    except Exception:
+        pass
+
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(
+            period="5d",
+            interval="5m",
+            prepost=True,
+            auto_adjust=True,
+        )
+        if hist is not None and not hist.empty:
+            close_s = hist["Close"].dropna()
+            if not close_s.empty:
+                return float(close_s.iloc[-1]), "5분봉(프리/애프터 포함)"
+    except Exception:
+        pass
+
+    return None, "최근 일봉"
 
 
 def calc_rsi(series, period=14):
@@ -935,7 +974,12 @@ try:
 
     with st.expander("➕ 매수/매도 기록 입력", expanded=False):
         record_date = st.date_input("거래일", value=date.today())
-        selected_live_price = float(close[actual_trade_symbol].dropna().iloc[-1])
+        latest_record_price, _record_price_source = get_latest_market_price(actual_trade_symbol)
+        selected_live_price = (
+            latest_record_price
+            if latest_record_price is not None
+            else float(close[actual_trade_symbol].dropna().iloc[-1])
+        )
 
         record_price = st.number_input(
             f"실제 체결가격 ({unit})",
@@ -1025,7 +1069,13 @@ try:
     # 신호 ETF 가격은 1위 전략의 신호 기준을 사용하고,
     # 실제 매수/매도 판단 가격은 사용자가 선택한 실제 거래 종목을 사용합니다.
     signal_price = float(latest["SIGNAL"])
-    trade_price = float(close[actual_trade_symbol].dropna().iloc[-1])
+    daily_trade_price = float(close[actual_trade_symbol].dropna().iloc[-1])
+    latest_trade_price, latest_price_source = get_latest_market_price(actual_trade_symbol)
+    trade_price = (
+        latest_trade_price
+        if latest_trade_price is not None
+        else daily_trade_price
+    )
     live_anchor = float(latest["ANCHOR"])
     live_dd = max(0.0, 1 - signal_price / live_anchor)
 
@@ -1131,7 +1181,11 @@ try:
     a1, a2, a3 = st.columns(3)
     a1.metric("오늘 신호", signal)
     a2.metric("신호 ETF 가격", f"{currency}{signal_price:,.2f}")
-    a3.metric("실제 매수 ETF 가격", f"{currency}{trade_price:,.2f}")
+    a3.metric("실제 매수 ETF 최신가", f"{currency}{trade_price:,.2f}")
+    st.caption(
+        f"현재가 출처: {latest_price_source} · 최대 약 30초 캐시. "
+        "실시간 거래소 직결 시세가 아니라 yfinance 지연/가용 시세입니다."
+    )
 
     st.write(f"**신호 기준:** {best_mode['mode']}")
     st.write(f"**실제 거래 종목:** {actual_trade_target}")
