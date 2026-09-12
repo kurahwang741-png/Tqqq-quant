@@ -654,6 +654,192 @@ def load_autosaved_trades():
         return []
 
 
+
+def simulate_soxl_reverse(
+    df,
+    initial_cash,
+    base_unit=0.05,
+    take_profit=0.06,
+    max_hold_days=None,
+    fee_pct=0.0,
+    slippage_pct=0.0,
+    fx_cost_pct=0.0,
+    deployment_ratio=1.0,
+):
+    """SOXL 주문표에서 확인된 '매일 LOC 격자 + 포지션 블록 관리' 가설 엔진.
+
+    핵심:
+    - 전일 종가를 기준으로 매일 2개의 LOC 매수가를 다시 계산
+    - 시장 상태에 따라 +4/-1, -1/-4, -2/-4, -2/-6% 격자 중 하나를 선택
+    - 각 주문은 총자산의 base_unit 비중, 누적투입은 deployment_ratio(최대 100%)까지 허용
+    - 각 체결 블록은 독립적으로 take_profit 목표에서 LOC 성격으로 청산
+    - 오늘 종가가 LOC 가격 조건을 만족할 때 오늘 종가에 체결된 것으로 처리
+    """
+    cash = float(initial_cash)
+    lots = []
+    trades = []
+    equity_rows = []
+
+    close = df["TRADE"].astype(float).copy()
+    ma20 = close.rolling(20, min_periods=5).mean()
+    ma60 = close.rolling(60, min_periods=10).mean()
+    ret5 = close.pct_change(5)
+    ret20 = close.pct_change(20)
+    vol20 = close.pct_change().rolling(20, min_periods=10).std()
+
+    for i, dt in enumerate(df.index):
+        px = float(close.iloc[i])
+        if not np.isfinite(px) or px <= 0:
+            continue
+
+        # 1) 기존 블록 매도: 각 매수 블록을 독립적으로 관리한다.
+        remaining = []
+        for lot in lots:
+            age = (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days
+            target = lot["price"] * (1 + float(take_profit))
+            hit_tp = px >= target
+            forced = max_hold_days is not None and age >= int(max_hold_days)
+            if hit_tp or forced:
+                sell_px = px * (1 - slippage_pct)
+                proceeds = lot["qty"] * sell_px * (1 - fee_pct - fx_cost_pct)
+                cash += proceeds
+                pnl = proceeds - lot["cash_cost"]
+                trades.append({
+                    "신호일": lot["date"],
+                    "매도일": pd.Timestamp(dt),
+                    "평균매수가": lot["price"],
+                    "매도가": sell_px,
+                    "수익률": proceeds / lot["cash_cost"] - 1 if lot["cash_cost"] > 0 else 0.0,
+                    "실현손익": pnl,
+                    "보유일수": age,
+                    "매수횟수": 1,
+                    "청산사유": "익절" if hit_tp else "기간청산",
+                })
+            else:
+                remaining.append(lot)
+        lots = remaining
+
+        # 2) 오늘 주문은 반드시 전일까지의 정보만 사용한다.
+        if i > 0:
+            prev = float(close.iloc[i - 1])
+            r5 = float(ret5.iloc[i - 1]) if np.isfinite(ret5.iloc[i - 1]) else 0.0
+            r20 = float(ret20.iloc[i - 1]) if np.isfinite(ret20.iloc[i - 1]) else 0.0
+            v20 = float(vol20.iloc[i - 1]) if np.isfinite(vol20.iloc[i - 1]) else 0.0
+            m20 = float(ma20.iloc[i - 1]) if np.isfinite(ma20.iloc[i - 1]) else prev
+            m60 = float(ma60.iloc[i - 1]) if np.isfinite(ma60.iloc[i - 1]) else prev
+
+            # 실제 주문표에서 발견된 대표적인 정수 % LOC 격자를 상태별로 선택한다.
+            if r20 >= 0.15 and prev >= m20 and m20 >= m60:
+                state = "강한상승"
+                offsets = (0.04, -0.01)
+                unit_mult = (1.0, 1.0)
+            elif r5 >= 0.04 and r20 > -0.10:
+                state = "반등"
+                offsets = (-0.01, -0.04)
+                unit_mult = (1.0, 1.0)
+            elif r20 <= -0.20 or v20 >= 0.075:
+                state = "고위험"
+                offsets = (-0.02, -0.06)
+                unit_mult = (1.0, 1.0)
+            else:
+                state = "기본"
+                offsets = (-0.02, -0.04)
+                unit_mult = (1.0, 1.0)
+
+            # 현재 총자산 및 노출을 기준으로 주문 비중을 계산한다.
+            mark_value = sum(lot["qty"] * px for lot in lots)
+            equity_now = cash + mark_value
+            max_invested = equity_now * float(deployment_ratio)
+            invested_now = mark_value
+
+            for off, mult in zip(offsets, unit_mult):
+                limit_px = prev * (1 + off)
+                if px > limit_px + 1e-12:
+                    continue
+                room = max(0.0, max_invested - invested_now)
+                planned = equity_now * float(base_unit) * float(mult)
+                budget = min(planned, room, cash)
+                if budget <= max(1e-9, equity_now * 0.001):
+                    continue
+                buy_px = px * (1 + slippage_pct)
+                unit_cost = buy_px * (1 + fee_pct + fx_cost_pct)
+                qty = budget / unit_cost
+                cash -= budget
+                lots.append({
+                    "date": pd.Timestamp(dt),
+                    "price": buy_px,
+                    "qty": qty,
+                    "cash_cost": budget,
+                    "state": state,
+                    "loc_offset": off,
+                })
+                invested_now += qty * px
+
+        shares = sum(lot["qty"] for lot in lots)
+        invested_value = shares * px * (1 - slippage_pct) * (1 - fee_pct - fx_cost_pct)
+        equity = cash + invested_value
+        exposure = invested_value / equity if equity > 0 else 0.0
+        equity_rows.append((pd.Timestamp(dt), equity, cash, shares, px, exposure))
+
+    if not equity_rows:
+        raise ValueError("SOXL 역추적 백테스트에 사용할 데이터가 없습니다.")
+
+    eq = pd.DataFrame(
+        equity_rows,
+        columns=["Date", "Equity", "Cash", "Shares", "TradePrice", "Exposure"],
+    ).set_index("Date")
+    # 기존 화면 호환용 열
+    eq["SignalPrice"] = eq["TradePrice"]
+    eq["Drawdown"] = 1 - eq["TradePrice"] / eq["TradePrice"].cummax()
+
+    final_value = float(eq["Equity"].iloc[-1])
+    total_return = final_value / float(initial_cash) - 1
+    years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1 / 365.25)
+    cagr = (final_value / float(initial_cash)) ** (1 / years) - 1 if final_value > 0 else -1.0
+    peak = eq["Equity"].cummax()
+    mdd = float((eq["Equity"] / peak - 1).min())
+
+    trades_df = pd.DataFrame(trades)
+    trade_count = len(trades_df)
+    win_rate = float((trades_df["실현손익"] > 0).mean()) if trade_count else np.nan
+    avg_hold = float(trades_df["보유일수"].mean()) if trade_count else np.nan
+    max_hold = float(trades_df["보유일수"].max()) if trade_count else 0.0
+    forced_exit_count = int((trades_df["청산사유"] == "기간청산").sum()) if trade_count else 0
+
+    shares = sum(lot["qty"] for lot in lots)
+    total_cost = sum(lot["cash_cost"] for lot in lots)
+    avg_entry = (sum(lot["qty"] * lot["price"] for lot in lots) / shares) if shares > 0 else np.nan
+    unrealized_pct = (float(close.iloc[-1]) / avg_entry - 1) if shares > 0 and avg_entry > 0 else np.nan
+    if lots:
+        ongoing = max((pd.Timestamp(df.index[-1]) - pd.Timestamp(lot["date"])).days for lot in lots)
+        max_hold = max(max_hold, float(ongoing))
+
+    return {
+        "final_value": final_value,
+        "total_return": total_return,
+        "cagr": cagr,
+        "mdd": mdd,
+        "trade_count": trade_count,
+        "win_rate": win_rate,
+        "avg_hold": avg_hold,
+        "max_hold": max_hold,
+        "avg_exposure": float(eq["Exposure"].mean()),
+        "max_exposure": float(eq["Exposure"].max()),
+        "deployment_ratio": float(deployment_ratio),
+        "forced_exit_count": forced_exit_count,
+        "equity": eq,
+        "trades": trades_df,
+        "cash": cash,
+        "shares": shares,
+        "avg_entry": avg_entry,
+        "unrealized_pct": unrealized_pct,
+        "next_level": min(len(lots) + 1, 20),
+        "tranche_budget": float(initial_cash) * float(base_unit),
+        "tranche_budgets": [float(initial_cash) * float(base_unit)] * 20,
+        "allocation_weights": [float(base_unit)] * 20,
+    }
+
+
 def simulate(
     df,
     initial_cash,
@@ -673,6 +859,19 @@ def simulate(
     fx_cost_pct=0.0,
     deployment_ratio=1.0,
 ):
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        return simulate_soxl_reverse(
+            df=df,
+            initial_cash=initial_cash,
+            base_unit=float(step_pct),
+            take_profit=float(take_profit),
+            max_hold_days=max_hold_days,
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+            fx_cost_pct=float(fx_cost_pct),
+            deployment_ratio=float(deployment_ratio),
+        )
+
     cash = float(initial_cash)
     shares = 0.0
     total_cost = 0.0
@@ -939,6 +1138,17 @@ try:
 
     allocation_candidates = make_allocation_candidates(tranche_count)
 
+    # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
+    # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        effective_buy_steps = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]
+        effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
+        effective_max_holds = [None, 30, 60, 90, 180]
+        filter_candidates = [(None, None)]
+        allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
+        loc_buy_ratios = [1.0]
+        deployment_ratios = [0.70, 0.80, 0.90, 1.00]
+
     current_params = (
         market,
         float(investment),
@@ -1021,6 +1231,12 @@ try:
         st.stop()
 
     st.divider()
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        st.info(
+            "🧪 SOXL 역추적 LOC 엔진 적용: 전일 종가 기준으로 매일 2개 LOC 주문을 새로 계산하고, "
+            "강한상승(+4/-1) · 반등(-1/-4) · 기본(-2/-4) · 고위험(-2/-6) 격자를 자동 전환합니다. "
+            "각 주문은 총자산의 3~10%를 비교하고 누적투입은 최대 100%까지 허용합니다."
+        )
     st.subheader("🏆 전략 자동 비교")
 
     if run_backtest:
@@ -1143,7 +1359,7 @@ try:
                 sell_exec_name = "종가 매도"
                 exec_name = "종가"
             strategy_name = (
-                f"{mode['mode']} | {step_pct:.0%} 간격 / {tp:.0%} 익절 / "
+                f"{mode['mode']} | {step_pct:.0%} 주문비중 / {tp:.0%} 블록익절 / "
                 f"운용 {deployment_ratio:.0%} / 자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
             )
 
