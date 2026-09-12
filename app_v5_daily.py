@@ -732,32 +732,43 @@ def simulate_soxl_reverse(
             if r20 >= 0.15 and prev >= m20 and m20 >= m60:
                 state = "강한상승"
                 offsets = (0.04, -0.01)
-                unit_mult = (1.0, 1.0)
+                # 강한 상승에서는 첫 주문을 크게, 눌림 추가주문은 작게
+                unit_mult = (1.40, 0.70)
             elif r5 >= 0.04 and r20 > -0.10:
                 state = "반등"
                 offsets = (-0.01, -0.04)
-                unit_mult = (1.0, 1.0)
+                unit_mult = (1.20, 0.85)
             elif r20 <= -0.20 or v20 >= 0.075:
                 state = "고위험"
                 offsets = (-0.02, -0.06)
-                unit_mult = (1.0, 1.0)
+                # 위험구간은 얕은 주문을 줄이고 깊은 주문에 더 크게 배분
+                unit_mult = (0.60, 1.40)
             else:
                 state = "기본"
                 offsets = (-0.02, -0.04)
-                unit_mult = (1.0, 1.0)
+                unit_mult = (0.90, 1.10)
 
-            # 현재 총자산 및 노출을 기준으로 주문 비중을 계산한다.
+            # 현재 총자산 및 노출을 기준으로 주문 비중을 자동 조절한다.
             mark_value = sum(lot["qty"] * px for lot in lots)
             equity_now = cash + mark_value
             max_invested = equity_now * float(deployment_ratio)
             invested_now = mark_value
+            exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
+            if exposure_now < 0.25:
+                exposure_mult = 1.20
+            elif exposure_now < 0.50:
+                exposure_mult = 1.00
+            elif exposure_now < 0.75:
+                exposure_mult = 0.80
+            else:
+                exposure_mult = 0.55
 
             for off, mult in zip(offsets, unit_mult):
                 limit_px = prev * (1 + off)
                 if px > limit_px + 1e-12:
                     continue
                 room = max(0.0, max_invested - invested_now)
-                planned = equity_now * float(base_unit) * float(mult)
+                planned = equity_now * float(base_unit) * float(mult) * float(exposure_mult)
                 budget = min(planned, room, cash)
                 if budget <= max(1e-9, equity_now * 0.001):
                     continue
@@ -1143,9 +1154,9 @@ try:
     if market.startswith("🇺🇸") and us_product == "SOXL":
         effective_buy_steps = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]
         effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
-        effective_max_holds = [None, 30, 60, 90, 180]
+        effective_max_holds = [45, 60, 90, 120, 180, 250]
         filter_candidates = [(None, None)]
-        allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
+        allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]  # SOXL actual sizing is state/exposure dynamic
         loc_buy_ratios = [1.0]
         deployment_ratios = [0.70, 0.80, 0.90, 1.00]
 
@@ -1233,7 +1244,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL 역추적 LOC 엔진 적용: 전일 종가 기준으로 매일 2개 LOC 주문을 새로 계산하고, "
+            "🧪 SOXL 역추적 LOC 엔진 적용: 전일 종가 기준으로 매일 2개 LOC 주문을 새로 계산하고, 상태·현재노출에 따라 주문비중을 자동 가중하며, "
             "강한상승(+4/-1) · 반등(-1/-4) · 기본(-2/-4) · 고위험(-2/-6) 격자를 자동 전환합니다. "
             "각 주문은 총자산의 3~10%를 비교하고 누적투입은 최대 100%까지 허용합니다."
         )
@@ -1360,7 +1371,7 @@ try:
                 exec_name = "종가"
             strategy_name = (
                 f"{mode['mode']} | {step_pct:.0%} 주문비중 / {tp:.0%} 블록익절 / "
-                f"운용 {deployment_ratio:.0%} / 자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
+                f"운용 {deployment_ratio:.0%} / 상태별 자동가중 / 최대 {hold_name} / {fname} / {exec_name}" if market.startswith("🇺🇸") and us_product == "SOXL" else f"운용 {deployment_ratio:.0%} / 자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
             )
 
             sims[strategy_name] = {
@@ -1385,7 +1396,7 @@ try:
                 "매수간격": step_pct,
                 "익절률": tp,
                 "총자금 운용률": deployment_ratio,
-                "차수별 매수%": allocation_text(np.asarray(allocation_weights) * deployment_ratio),
+                "차수별 매수%": ("상태별 자동가중" if market.startswith("🇺🇸") and us_product == "SOXL" else allocation_text(np.asarray(allocation_weights) * deployment_ratio)),
                 "이평선": "없음" if ma_period is None else f"{int(ma_period)}일",
                 "필터": fname,
                 "체결방식": exec_name,
@@ -1570,9 +1581,14 @@ try:
             f"LOC {best_loc_buy_ratio:.0%} (전일 종가 대비 -{best_loc_buy_offset:.2%}) · "
             f"익절: {sell_desc}"
         )
+    allocation_desc = (
+        "상태·노출별 매수비중 자동가중"
+        if market.startswith("🇺🇸") and us_product == "SOXL"
+        else "차수별 매수비중 자동 최적화"
+    )
     st.write(
         f"**{best_step:.0%} 간격 / {best_tp:.0%} 익절 / "
-        f"총자금 {best_deployment_ratio:.0%} 운용 / 차수별 매수비중 자동 최적화 / "
+        f"총자금 {best_deployment_ratio:.0%} 운용 / {allocation_desc} / "
         f"{filter_name(best_ma_period, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
     )
