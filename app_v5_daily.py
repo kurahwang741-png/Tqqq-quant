@@ -272,7 +272,8 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
         "최소 완료매매 횟수", min_value=1, max_value=100, value=5, step=1
     ))
     max_allowed_mdd = risk2.number_input(
-        "허용 최대 MDD(%)", min_value=10.0, max_value=95.0, value=60.0, step=5.0
+        "MDD 참고 기준(%)", min_value=10.0, max_value=99.0, value=60.0, step=5.0,
+        help="CAGR 우선 모드에서는 탈락 조건으로 쓰지 않고 참고값으로만 표시합니다."
     ) / 100
 
 if backtest_period_mode == "전체기간":
@@ -1125,16 +1126,9 @@ try:
                 deployment_ratio,
             )
 
-            eligible = (
-                sim["trade_count"] >= int(min_completed_trades)
-                and abs(sim["mdd"]) <= float(max_allowed_mdd)
-            )
-            risk_score = (
-                float(sim["cagr"])
-                - 0.50 * abs(float(sim["mdd"]))
-                - 0.02 * min(float(sim["max_hold"]) / 365.0, 5.0)
-                - 0.05 * (1 - float(sim["avg_exposure"]))
-            )
+            eligible = sim["trade_count"] >= int(min_completed_trades)
+            # CAGR 최우선: MDD는 탈락 조건이 아니라 결과 비교 지표로만 사용합니다.
+            risk_score = float(sim["cagr"])
 
             fname = filter_name(ma_period, rsi_max)
             hold_name = "제한없음" if max_hold_days is None else f"{max_hold_days}일"
@@ -1196,13 +1190,10 @@ try:
                 "실전점수": risk_score,
             }
             results.append(row)
-            scored.append(((1 if eligible else 0, risk_score, float(sim["final_value"])), job))
+            scored.append(((float(sim["cagr"]), float(sim["final_value"]), -abs(float(sim["mdd"]))), job))
             tested.add(job)
-            live_rank = (1 if eligible else 0, risk_score, float(sim["final_value"]))
-            current_rank = (
-                1 if live_best["eligible"] else 0,
-                live_best["score"], live_best["value"]
-            )
+            live_rank = (float(sim["cagr"]), float(sim["final_value"]), -abs(float(sim["mdd"])))
+            current_rank = (live_best["score"], live_best["value"], -999.0)
             if live_rank > current_rank:
                 live_best["eligible"] = eligible
                 live_best["score"] = risk_score
@@ -1288,7 +1279,7 @@ try:
 
         result = (
             pd.DataFrame(results)
-            .sort_values(["실전기준통과", "실전점수", "최종자산"], ascending=False)
+            .sort_values(["CAGR", "최종자산", "MDD"], ascending=[False, False, False])
             .reset_index(drop=True)
         )
 
@@ -1345,12 +1336,12 @@ try:
     )
 
     st.success(
-        f"🥇 실전점수 1위: **{winner['운용방식']}** · "
+        f"🥇 CAGR 1위: **{winner['운용방식']}** · "
         f"완료매매 {int(winner['완료매매'])}회 · MDD {winner['MDD']:.1%}"
     )
     st.caption(
-        f"선정 기준: 완료매매 {min_completed_trades}회 이상, MDD {max_allowed_mdd:.0%} 이내를 우선하고 "
-        "CAGR에서 MDD와 장기 보유 페널티를 차감한 실전점수로 순위를 정합니다."
+        f"선정 기준: CAGR 최우선 · 완료매매 {min_completed_trades}회 이상 확인 · "
+        f"MDD {max_allowed_mdd:.0%}는 참고 기준이며 탈락 조건으로 사용하지 않습니다."
     )
 
     if market.startswith("🇺🇸"):
