@@ -775,10 +775,27 @@ def simulate_soxl_reverse(
             max_invested = equity_now * float(deployment_ratio)
             invested_now = mark_value
             exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
-            plan = get_soxl_loc_plan(close.iloc[:i], exposure_now=exposure_now, base_unit=base_unit)
-            state = plan["state"]
-            offsets = plan["offsets"]
-            weights = plan["weights"]
+            # 속도 최적화: 위에서 이미 계산한 전일까지의 지표를 그대로 사용합니다.
+            # 기존 get_soxl_loc_plan(close.iloc[:i]) 호출은 매 거래일마다 rolling을 처음부터
+            # 다시 계산해 장기 백테스트에서 큰 병목이 되었습니다. 판단 규칙은 동일합니다.
+            if r20 >= 0.15 and prev >= m20 and m20 >= m60:
+                state, offsets, mults = "강한상승", (0.04, -0.01), (1.40, 0.70)
+            elif r5 >= 0.04 and r20 > -0.10:
+                state, offsets, mults = "반등", (-0.01, -0.04), (1.20, 0.85)
+            elif r20 <= -0.20 or v20 >= 0.075:
+                state, offsets, mults = "고위험", (-0.02, -0.06), (0.60, 1.40)
+            else:
+                state, offsets, mults = "기본", (-0.02, -0.04), (0.90, 1.10)
+
+            if exposure_now < 0.25:
+                exposure_mult = 1.20
+            elif exposure_now < 0.50:
+                exposure_mult = 1.00
+            elif exposure_now < 0.75:
+                exposure_mult = 0.80
+            else:
+                exposure_mult = 0.55
+            weights = tuple(float(base_unit) * float(m) * exposure_mult for m in mults)
 
             for off, weight in zip(offsets, weights):
                 limit_px = prev * (1 + off)
@@ -1273,9 +1290,11 @@ try:
 
         # 모든 조합을 무작정 전부 계산하면 Streamlit Cloud에서 실행시간/메모리 한계로
         # 중간에 멈출 수 있습니다. 조합이 많을 때는 1차 넓은 탐색 -> 2차 상위권 정밀탐색으로 줄입니다.
-        exhaustive_limit = 2200
-        stage1_limit = 700
-        stage2_limit = 400
+        # 속도 우선 탐색: 큰 그리드는 대표 후보를 먼저 본 뒤 상위권 주변만 정밀 확인합니다.
+        # SOXL 기본 그리드처럼 1,500개 안팎은 전수 계산하되, 그 이상은 2단계 탐색을 사용합니다.
+        exhaustive_limit = 1500
+        stage1_limit = 420
+        stage2_limit = 220
 
         # 각 운용방식의 데이터프레임은 한 번만 계산해 재사용합니다.
         prepared = []
