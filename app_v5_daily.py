@@ -35,6 +35,10 @@ def _checkpoint_path(market_key):
     safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(market_key))
     return BACKTEST_CHECKPOINT_DIR / f"backtest_{safe}.pkl.gz"
 
+def _last_result_path(market_key):
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(market_key))
+    return BACKTEST_CHECKPOINT_DIR / f"last_result_{safe}.pkl.gz"
+
 def _save_backtest_checkpoint(path, payload):
     tmp = path.with_suffix(path.suffix + ".tmp")
     with gzip.open(tmp, "wb", compresslevel=3) as f:
@@ -1278,7 +1282,29 @@ try:
     checkpoint_sig = _checkpoint_signature(current_params)
     checkpoint_file = _checkpoint_path(active_market_key)
     checkpoint_preview = _load_backtest_checkpoint(checkpoint_file)
+    last_result_file = _last_result_path(active_market_key)
+    last_result_preview = _load_backtest_checkpoint(last_result_file)
     resume_checkpoint = False
+
+    # 직전 완료 백테스트는 진행 중 체크포인트와 별도로 보관합니다.
+    # 따라서 새 백테스트가 중간에 멈춰도 마지막 완료 결과를 다시 볼 수 있습니다.
+    if last_result_preview and last_result_preview.get("results") and last_result_preview.get("sims"):
+        saved_at = str(last_result_preview.get("saved_at", ""))[:19].replace("T", " ")
+        st.caption(f"📚 직전 완료 백테스트 저장됨" + (f" · {saved_at} UTC" if saved_at else ""))
+        if st.button("📂 직전 백테스트 결과 불러오기", use_container_width=True):
+            try:
+                loaded_result = pd.DataFrame(last_result_preview["results"])
+                if loaded_result.empty:
+                    raise ValueError("저장된 결과가 비어 있습니다.")
+                loaded_result = loaded_result.sort_values(
+                    ["CAGR", "최종자산", "MDD"], ascending=[False, False, False]
+                ).reset_index(drop=True)
+                st.session_state.backtest_result = loaded_result
+                st.session_state.backtest_sims = last_result_preview["sims"]
+                st.session_state.backtest_params = last_result_preview.get("params")
+                st.success("직전 완료 백테스트 결과를 불러왔습니다.")
+            except Exception as e:
+                st.warning(f"직전 결과를 불러오지 못했습니다: {e}")
 
     if checkpoint_preview and checkpoint_preview.get("signature") == checkpoint_sig:
         cp_tested = len(checkpoint_preview.get("tested", []))
@@ -1687,6 +1713,22 @@ try:
         st.session_state.backtest_sims = sims
         st.session_state.backtest_params = current_params
         save_checkpoint("완료", refine_jobs=(refine if total_grid > exhaustive_limit else []), force=True)
+
+        # 마지막으로 정상 완료된 결과는 별도 파일에 영구 스냅샷으로 보관합니다.
+        # 다음 실행의 진행 체크포인트가 덮어써져도 이 결과는 유지됩니다.
+        try:
+            _save_backtest_checkpoint(last_result_file, {
+                "version": 1,
+                "signature": checkpoint_sig,
+                "market_key": active_market_key,
+                "phase": "완료",
+                "params": current_params,
+                "results": results,
+                "sims": sims,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            st.caption(f"⚠️ 직전 완료 결과 저장 실패: {e}")
 
         progress.empty()
         status.empty()
@@ -2991,6 +3033,10 @@ try:
         signal = "안전대기"
         detail = f"주문 후 총투입금액이 안전한도 {max_total_deployed_pct:.0%}를 초과해 주문을 보류합니다."
 
+    # SOXL 주문표는 매일 가격을 제시하는 방식이므로 상단에도 '대기' 대신 주문표 상태를 표시한다.
+    if market.startswith("🇺🇸") and us_product == "SOXL" and signal in ["대기", "안전대기"]:
+        signal = "LOC 주문값 제시" if data_safe else "LOC 주문값 제시 · 데이터확인"
+
     a1, a2, a3 = st.columns(3)
     signal_display = (
         f"{signal} · 총자금 {current_weight_pct:.2%}"
@@ -3035,36 +3081,58 @@ try:
             shown_weights.append(max(0.0, use_w))
             room -= use_w
 
-        st.markdown("### 📌 SOXL 다음 거래일 LOC 주문")
+        # 원래 주문표처럼 신호 충족/불충족에 따라 '대기'로 숨기지 않고,
+        # 매 거래일 매수 2개 + 매도 2개의 LOC 기준값을 항상 제시한다.
+        # 매도 기준은 오늘 제시되는 각 매수 블록이 전략 익절률에 도달하는 가격이다.
+        # 실제 보유 블록은 각 블록의 실제 체결가를 기준으로 같은 익절률을 적용한다.
+        soxl_sell_prices = [float(px) * (1 + float(live_best_tp)) for px in soxl_prices]
+
+        st.markdown("### 📌 SOXL 다음 거래일 LOC 주문 — 매일 매수·매도 동시 제시")
         st.caption(
             f"상태: **{soxl_plan['state']}** · 현재 추정 투입 {exposure_now_live:.1%} · "
-            f"최대 누적투입 {cap:.0%} · 전일종가 {currency}{prev_close_live:,.2f}"
+            f"최대 누적투입 {cap:.0%} · 전일종가 {currency}{prev_close_live:,.2f} · "
+            "조건이 약한 날도 '대기'로 바꾸지 않고 주문 기준값을 표시합니다."
         )
-        c1, c2 = st.columns(2)
-        for idx, (col, price, off, w) in enumerate(zip((c1, c2), soxl_prices, soxl_offsets, shown_weights), start=1):
+
+        b1, b2 = st.columns(2)
+        for idx, (col, price, off, w) in enumerate(zip((b1, b2), soxl_prices, soxl_offsets, shown_weights), start=1):
             with col:
-                st.metric(f"{idx}차 LOC 매수가", f"{currency}{price:,.2f} 이하")
+                st.metric(f"매수 LOC {idx}", f"{currency}{price:,.2f}")
                 st.caption(
                     f"전일종가 대비 {off:+.0%} · 총자산 {w:.2%} "
                     f"({currency}{float(investment)*w:,.0f})"
                 )
 
+        s1, s2 = st.columns(2)
+        for idx, (col, sell_px, w) in enumerate(zip((s1, s2), soxl_sell_prices, shown_weights), start=1):
+            with col:
+                st.metric(f"매도 LOC {idx}", f"{currency}{sell_px:,.2f}")
+                st.caption(
+                    f"대응 매수 LOC {idx} 기준 +{live_best_tp:.0%} · "
+                    f"기준 비중 {w:.2%}"
+                )
+
         st.write(
-            f"**오늘 신규 매수 예정 합계:** 총자산 {sum(shown_weights):.2%} "
+            f"**오늘 제시 매수비중 합계:** 총자산 {sum(shown_weights):.2%} "
             f"({currency}{float(investment)*sum(shown_weights):,.0f})"
         )
         if sum(shown_weights) <= 1e-12:
-            st.info("현재 누적투입 한도에 도달해 신규 LOC 매수 주문은 없습니다.")
+            st.warning(
+                "총투입 한도 때문에 신규 매수 가능비중은 0%입니다. "
+                "가격 기준값은 계속 표시하지만 신규 매수 주문금액은 0입니다."
+            )
 
-        # SOXL 역추적 엔진은 체결 블록별 익절을 사용한다. 평균단가 전량매도 표시는 하지 않는다.
         if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
             approx_sell = float(avg_buy_price) * (1 + live_best_tp)
-            st.metric("참고 익절 기준", f"{currency}{approx_sell:,.2f} 이상")
-            st.caption("실제 백테스트 엔진은 각 매수 블록별로 독립 익절합니다. 이 값은 평균단가 기준 참고치입니다.")
+            st.metric("현재 보유분 평균단가 기준 매도 참고값", f"{currency}{approx_sell:,.2f}")
+            st.caption(
+                "실제 백테스트 엔진은 각 매수 블록의 실제 체결가에 익절률을 적용해 독립 청산합니다. "
+                "위 매도 LOC 1·2는 매일 주문표를 만들기 위한 신규 블록 기준값입니다."
+            )
 
-        st.info(
-            "SOXL 모드에서는 차수별 균등분할표를 사용하지 않습니다. 매 거래일 시장 상태와 현재 노출에 따라 "
-            "두 LOC 가격과 각 주문의 총자산 대비 비중을 새로 계산합니다."
+        st.success(
+            "✅ SOXL은 매 거래일 **매수 LOC 2개 + 매도 LOC 2개**를 항상 계산합니다. "
+            "가격에 닿지 않으면 미체결될 뿐, 앱이 별도로 '대기' 신호로 주문값을 숨기지 않습니다."
         )
 
     elif market.startswith("🇺🇸"):
@@ -3189,7 +3257,12 @@ try:
             f"예정 매수금액 {currency}{tranche_budget:,.0f}"
         )
 
-    if signal.endswith("매수"):
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        st.success(
+            "✅ 다음 거래일: 위의 **매수 LOC 2개 + 매도 LOC 2개** 기준값을 사용합니다. "
+            "미체결은 가격 결과이며 별도의 '대기' 신호로 처리하지 않습니다."
+        )
+    elif signal.endswith("매수"):
         expected_close_amount = tranche_budget * (1 - live_best_loc_buy_ratio)
         expected_loc_amount = tranche_budget * live_best_loc_buy_ratio
         st.success(
