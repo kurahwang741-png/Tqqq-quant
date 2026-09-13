@@ -6,6 +6,8 @@ from datetime import date, datetime, timezone
 import time
 import json
 import hashlib
+import gzip
+import pickle
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,38 @@ st.title("📈 TQQQ / SOXL / 코코레 QUANT V31")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
+BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
+BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+BACKTEST_CHECKPOINT_EVERY = 20
+
+def _checkpoint_signature(params):
+    return hashlib.sha256(repr(params).encode("utf-8")).hexdigest()[:20]
+
+def _checkpoint_path(market_key):
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(market_key))
+    return BACKTEST_CHECKPOINT_DIR / f"backtest_{safe}.pkl.gz"
+
+def _save_backtest_checkpoint(path, payload):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with gzip.open(tmp, "wb", compresslevel=3) as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+def _load_backtest_checkpoint(path):
+    try:
+        if not path.exists():
+            return None
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+def _delete_backtest_checkpoint(path):
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
 
 market = st.radio(
     "시장",
@@ -1240,6 +1274,31 @@ try:
         float(max_allowed_mdd),
     )
 
+    # 장시간 백테스트 체크포인트: 브라우저/앱을 나갔다 돌아와도 마지막 저장 지점부터 재개
+    checkpoint_sig = _checkpoint_signature(current_params)
+    checkpoint_file = _checkpoint_path(active_market_key)
+    checkpoint_preview = _load_backtest_checkpoint(checkpoint_file)
+    resume_checkpoint = False
+
+    if checkpoint_preview and checkpoint_preview.get("signature") == checkpoint_sig:
+        cp_tested = len(checkpoint_preview.get("tested", []))
+        cp_total = int(checkpoint_preview.get("total_grid", 0) or 0)
+        cp_phase = checkpoint_preview.get("phase", "탐색 중")
+        st.info(
+            f"💾 저장된 백테스트 진행상태: {cp_tested:,}개 완료"
+            + (f" / 전체 후보 {cp_total:,}개" if cp_total else "")
+            + f" · {cp_phase}"
+        )
+        cpr1, cpr2 = st.columns(2)
+        if cpr1.button("▶️ 이전 백테스트 이어하기", use_container_width=True):
+            resume_checkpoint = True
+            run_backtest = True
+        if cpr2.button("🗑️ 진행상태 삭제", use_container_width=True):
+            _delete_backtest_checkpoint(checkpoint_file)
+            st.rerun()
+    elif checkpoint_preview:
+        st.caption("💾 이전 진행상태가 있지만 현재 설정과 달라서 자동 재개하지 않습니다.")
+
     # 현재 지표 표시용: 레버리지 신호 + 기초 ETF/본주 RSI 및 추세
     current_signal_symbol = modes[0]["signal_symbol"]
     current_ref_symbol = modes[0]["ref_symbol"]
@@ -1301,8 +1360,20 @@ try:
     st.subheader("🏆 전략 자동 비교")
 
     if run_backtest:
-        results = []
-        sims = {}
+        checkpoint_state = None
+        if resume_checkpoint:
+            checkpoint_state = _load_backtest_checkpoint(checkpoint_file)
+            if not checkpoint_state or checkpoint_state.get("signature") != checkpoint_sig:
+                st.warning("저장된 진행상태를 사용할 수 없어 처음부터 계산합니다.")
+                checkpoint_state = None
+
+        if checkpoint_state:
+            results = checkpoint_state.get("results", [])
+            sims = checkpoint_state.get("sims", {})
+        else:
+            results = []
+            sims = {}
+            _delete_backtest_checkpoint(checkpoint_file)
 
         # 모든 조합을 무작정 전부 계산하면 Streamlit Cloud에서 실행시간/메모리 한계로
         # 중간에 멈출 수 있습니다. 조합이 많을 때는 1차 넓은 탐색 -> 2차 상위권 정밀탐색으로 줄입니다.
@@ -1374,9 +1445,40 @@ try:
         status = st.empty()
         detail = st.empty()
         started_at = time.time()
-        tested = set()
-        scored = []
-        live_best = {"eligible": False, "score": -float("inf"), "value": -float("inf"), "name": "-"}
+        if checkpoint_state:
+            tested = {tuple(x) for x in checkpoint_state.get("tested", [])}
+            scored = checkpoint_state.get("scored", [])
+            live_best = checkpoint_state.get("live_best", {"eligible": False, "score": -float("inf"), "value": -float("inf"), "name": "-"})
+            saved_refine = [tuple(x) for x in checkpoint_state.get("refine", [])]
+            saved_phase = checkpoint_state.get("phase", "stage1")
+        else:
+            tested = set()
+            scored = []
+            live_best = {"eligible": False, "score": -float("inf"), "value": -float("inf"), "name": "-"}
+            saved_refine = []
+            saved_phase = "stage1"
+
+        def save_checkpoint(phase, refine_jobs=None, force=False):
+            if not force and (len(tested) == 0 or len(tested) % BACKTEST_CHECKPOINT_EVERY != 0):
+                return
+            payload = {
+                "version": 1,
+                "signature": checkpoint_sig,
+                "market_key": active_market_key,
+                "phase": phase,
+                "total_grid": total_grid,
+                "tested": list(tested),
+                "scored": scored,
+                "results": results,
+                "sims": sims,
+                "live_best": live_best,
+                "refine": list(refine_jobs or []),
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                _save_backtest_checkpoint(checkpoint_file, payload)
+            except Exception as e:
+                detail.caption(f"⚠️ 진행상태 저장 실패: {e}")
 
         def run_one(job):
             mi, si, ti, fi, hi, wi, xi, di = job
@@ -1496,12 +1598,17 @@ try:
         with st.spinner("백테스트 계산 중..."):
             if total_grid <= exhaustive_limit:
                 status.caption(f"전체 조합 {total_grid:,}개를 정밀 계산합니다.")
+                if checkpoint_state:
+                    status.caption(f"💾 {len(tested):,}개 완료 지점부터 이어서 계산합니다.")
                 for i, job in enumerate(all_jobs, 1):
-                    run_one(job)
+                    if job not in tested:
+                        run_one(job)
+                        save_checkpoint("전체 정밀탐색")
                     if i == 1 or i % 10 == 0 or i == total_grid:
-                        show_progress("전체 정밀탐색", i, total_grid)
+                        show_progress("전체 정밀탐색", len(tested), total_grid)
+                refine = []
+                save_checkpoint("완료", force=True)
             else:
-                # 1차: 전체 공간에 골고루 퍼진 조합만 빠르게 탐색
                 n1 = min(stage1_limit, total_grid)
                 stage1_idx = np.linspace(0, total_grid - 1, n1, dtype=int)
                 stage1_jobs = [all_jobs[i] for i in dict.fromkeys(stage1_idx)]
@@ -1509,56 +1616,66 @@ try:
                     f"전체 {total_grid:,}개 조합은 너무 커서 빠른 2단계 탐색을 사용합니다. "
                     f"1차 {len(stage1_jobs):,}개 → 상위권 주변 정밀탐색"
                 )
+
+                # 1차는 이미 끝낸 조합을 건너뜁니다.
                 for i, job in enumerate(stage1_jobs, 1):
-                    run_one(job)
+                    if job not in tested:
+                        run_one(job)
+                        save_checkpoint("1차 넓은 탐색")
+                    done1 = sum(1 for j in stage1_jobs if j in tested)
                     if i == 1 or i % 10 == 0 or i == len(stage1_jobs):
-                        show_progress("1차 넓은 탐색", i, len(stage1_jobs))
+                        show_progress("1차 넓은 탐색", done1, len(stage1_jobs))
+                save_checkpoint("1차 완료", force=True)
 
-                # 2차: 1차 상위 전략들의 각 파라미터 인접값(±1칸)을 후보로 확장
-                top_jobs = [j for _, j in sorted(scored, key=lambda x: x[0], reverse=True)[:20]]
-                refine = []
-                for mi, si, ti, fi, hi, wi, xi, di in top_jobs:
-                    neighborhoods = [
-                        range(max(0, si - 1), min(len(effective_buy_steps), si + 2)),
-                        range(max(0, ti - 1), min(len(effective_take_profits), ti + 2)),
-                        range(max(0, fi - 1), min(len(filter_candidates), fi + 2)),
-                        range(max(0, hi - 1), min(len(effective_max_holds), hi + 2)),
-                        range(max(0, wi - 1), min(len(allocation_candidates), wi + 2)),
-                        range(max(0, xi - 1), min(len(loc_buy_ratios), xi + 2)),
-                        range(max(0, di - 1), min(len(deployment_ratios), di + 2)),
-                    ]
-                    for nsi in neighborhoods[0]:
-                        for nti in neighborhoods[1]:
-                            for nfi in neighborhoods[2]:
-                                for nhi in neighborhoods[3]:
-                                    for nwi in neighborhoods[4]:
-                                        for nxi in neighborhoods[5]:
-                                            for ndi in neighborhoods[6]:
-                                                candidate = (mi, nsi, nti, nfi, nhi, nwi, nxi, ndi)
-                                                if candidate not in tested:
-                                                    refine.append(candidate)
+                # 2차 후보는 중단 시점과 동일하게 유지합니다.
+                if checkpoint_state and saved_phase in ("2차 상위권 정밀탐색", "완료") and saved_refine:
+                    refine = list(saved_refine)
+                else:
+                    top_jobs = [j for _, j in sorted(scored, key=lambda x: x[0], reverse=True)[:20]]
+                    refine = []
+                    for mi, si, ti, fi, hi, wi, xi, di in top_jobs:
+                        neighborhoods = [
+                            range(max(0, si - 1), min(len(effective_buy_steps), si + 2)),
+                            range(max(0, ti - 1), min(len(effective_take_profits), ti + 2)),
+                            range(max(0, fi - 1), min(len(filter_candidates), fi + 2)),
+                            range(max(0, hi - 1), min(len(effective_max_holds), hi + 2)),
+                            range(max(0, wi - 1), min(len(allocation_candidates), wi + 2)),
+                            range(max(0, xi - 1), min(len(loc_buy_ratios), xi + 2)),
+                            range(max(0, di - 1), min(len(deployment_ratios), di + 2)),
+                        ]
+                        for nsi in neighborhoods[0]:
+                            for nti in neighborhoods[1]:
+                                for nfi in neighborhoods[2]:
+                                    for nhi in neighborhoods[3]:
+                                        for nwi in neighborhoods[4]:
+                                            for nxi in neighborhoods[5]:
+                                                for ndi in neighborhoods[6]:
+                                                    candidate = (mi, nsi, nti, nfi, nhi, nwi, nxi, ndi)
+                                                    if candidate not in tested:
+                                                        refine.append(candidate)
+                    refine = list(dict.fromkeys(refine))
+                    if len(refine) > stage2_limit:
+                        idx = np.linspace(0, len(refine) - 1, stage2_limit, dtype=int)
+                        refine = [refine[i] for i in dict.fromkeys(idx)]
+                    save_checkpoint("2차 상위권 정밀탐색", refine_jobs=refine, force=True)
 
-                # 중복 제거 후 후보가 많으면 전체 후보에서 균등 샘플링
-                refine = list(dict.fromkeys(refine))
-                if len(refine) > stage2_limit:
-                    idx = np.linspace(0, len(refine) - 1, stage2_limit, dtype=int)
-                    refine = [refine[i] for i in dict.fromkeys(idx)]
-
-                # 2차 진행률은 별도로 0~100% 표시
                 progress.progress(0)
-                stage2_start_tested = len(tested)
                 stage2_started = time.time()
+                stage2_initial_done = sum(1 for j in refine if j in tested)
                 for i, job in enumerate(refine, 1):
-                    run_one(job)
+                    if job not in tested:
+                        run_one(job)
+                        save_checkpoint("2차 상위권 정밀탐색", refine_jobs=refine)
+                    done2 = sum(1 for j in refine if j in tested)
                     elapsed2 = max(time.time() - stage2_started, 0.001)
-                    rate2 = i / elapsed2
-                    eta2 = (len(refine) - i) / rate2 if rate2 > 0 else 0
-                    progress.progress(i / max(len(refine), 1))
-                    status.caption(
-                        f"2차 상위권 정밀탐색... {i}/{len(refine)} · 예상 남은 시간 약 {eta2:,.0f}초"
-                    )
+                    new_done2 = max(done2 - stage2_initial_done, 0)
+                    rate2 = new_done2 / elapsed2 if new_done2 > 0 else 0
+                    eta2 = (len(refine) - done2) / rate2 if rate2 > 0 else 0
+                    progress.progress(done2 / max(len(refine), 1))
+                    status.caption(f"2차 상위권 정밀탐색... {done2}/{len(refine)} · 예상 남은 시간 약 {eta2:,.0f}초")
                     if i == 1 or i % 10 == 0 or i == len(refine):
                         detail.caption(f"현재 최고 최종자산: {currency}{live_best['value']:,.0f} · {live_best['name']}")
+                save_checkpoint("완료", refine_jobs=refine, force=True)
 
         result = (
             pd.DataFrame(results)
@@ -1569,6 +1686,7 @@ try:
         st.session_state.backtest_result = result
         st.session_state.backtest_sims = sims
         st.session_state.backtest_params = current_params
+        save_checkpoint("완료", refine_jobs=(refine if total_grid > exhaustive_limit else []), force=True)
 
         progress.empty()
         status.empty()
