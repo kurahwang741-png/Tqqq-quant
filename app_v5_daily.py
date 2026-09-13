@@ -655,6 +655,47 @@ def load_autosaved_trades():
 
 
 
+
+
+def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.05):
+    """Return SOXL reverse-engineered daily LOC state, offsets and total-equity weights.
+    Uses only data available through the latest supplied close.
+    """
+    ser = pd.Series(close_series).dropna().astype(float)
+    if ser.empty:
+        return {"state": "기본", "offsets": (-0.02, -0.04), "weights": (base_unit*0.90, base_unit*1.10)}
+    prev = float(ser.iloc[-1])
+    ma20 = ser.rolling(20, min_periods=5).mean()
+    ma60 = ser.rolling(60, min_periods=10).mean()
+    ret5 = ser.pct_change(5)
+    ret20 = ser.pct_change(20)
+    vol20 = ser.pct_change().rolling(20, min_periods=10).std()
+    r5 = float(ret5.iloc[-1]) if np.isfinite(ret5.iloc[-1]) else 0.0
+    r20 = float(ret20.iloc[-1]) if np.isfinite(ret20.iloc[-1]) else 0.0
+    v20 = float(vol20.iloc[-1]) if np.isfinite(vol20.iloc[-1]) else 0.0
+    m20 = float(ma20.iloc[-1]) if np.isfinite(ma20.iloc[-1]) else prev
+    m60 = float(ma60.iloc[-1]) if np.isfinite(ma60.iloc[-1]) else prev
+
+    if r20 >= 0.15 and prev >= m20 and m20 >= m60:
+        state, offsets, mults = "강한상승", (0.04, -0.01), (1.40, 0.70)
+    elif r5 >= 0.04 and r20 > -0.10:
+        state, offsets, mults = "반등", (-0.01, -0.04), (1.20, 0.85)
+    elif r20 <= -0.20 or v20 >= 0.075:
+        state, offsets, mults = "고위험", (-0.02, -0.06), (0.60, 1.40)
+    else:
+        state, offsets, mults = "기본", (-0.02, -0.04), (0.90, 1.10)
+
+    if exposure_now < 0.25:
+        em = 1.20
+    elif exposure_now < 0.50:
+        em = 1.00
+    elif exposure_now < 0.75:
+        em = 0.80
+    else:
+        em = 0.55
+    weights = tuple(float(base_unit) * float(m) * em for m in mults)
+    return {"state": state, "offsets": offsets, "weights": weights, "prev_close": prev}
+
 def simulate_soxl_reverse(
     df,
     initial_cash,
@@ -728,47 +769,23 @@ def simulate_soxl_reverse(
             m20 = float(ma20.iloc[i - 1]) if np.isfinite(ma20.iloc[i - 1]) else prev
             m60 = float(ma60.iloc[i - 1]) if np.isfinite(ma60.iloc[i - 1]) else prev
 
-            # 실제 주문표에서 발견된 대표적인 정수 % LOC 격자를 상태별로 선택한다.
-            if r20 >= 0.15 and prev >= m20 and m20 >= m60:
-                state = "강한상승"
-                offsets = (0.04, -0.01)
-                # 강한 상승에서는 첫 주문을 크게, 눌림 추가주문은 작게
-                unit_mult = (1.40, 0.70)
-            elif r5 >= 0.04 and r20 > -0.10:
-                state = "반등"
-                offsets = (-0.01, -0.04)
-                unit_mult = (1.20, 0.85)
-            elif r20 <= -0.20 or v20 >= 0.075:
-                state = "고위험"
-                offsets = (-0.02, -0.06)
-                # 위험구간은 얕은 주문을 줄이고 깊은 주문에 더 크게 배분
-                unit_mult = (0.60, 1.40)
-            else:
-                state = "기본"
-                offsets = (-0.02, -0.04)
-                unit_mult = (0.90, 1.10)
-
-            # 현재 총자산 및 노출을 기준으로 주문 비중을 자동 조절한다.
+            # 현재 총자산 및 노출을 기준으로 오늘의 2개 LOC 주문과 비중을 계산한다.
             mark_value = sum(lot["qty"] * px for lot in lots)
             equity_now = cash + mark_value
             max_invested = equity_now * float(deployment_ratio)
             invested_now = mark_value
             exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
-            if exposure_now < 0.25:
-                exposure_mult = 1.20
-            elif exposure_now < 0.50:
-                exposure_mult = 1.00
-            elif exposure_now < 0.75:
-                exposure_mult = 0.80
-            else:
-                exposure_mult = 0.55
+            plan = get_soxl_loc_plan(close.iloc[:i], exposure_now=exposure_now, base_unit=base_unit)
+            state = plan["state"]
+            offsets = plan["offsets"]
+            weights = plan["weights"]
 
-            for off, mult in zip(offsets, unit_mult):
+            for off, weight in zip(offsets, weights):
                 limit_px = prev * (1 + off)
                 if px > limit_px + 1e-12:
                     continue
                 room = max(0.0, max_invested - invested_now)
-                planned = equity_now * float(base_unit) * float(mult) * float(exposure_mult)
+                planned = equity_now * float(weight)
                 budget = min(planned, room, cash)
                 if budget <= max(1e-9, equity_now * 0.001):
                     continue
@@ -2740,7 +2757,58 @@ try:
         st.write(f"**🔒 사이클 고정 전략:** 차수별 매수 % 저장됨 · {live_best_step:.0%} 간격 / {live_best_tp:.0%} 익절")
     elif auto_stage == 0:
         st.write(f"**새 사이클 적용 예정:** 현재 1위 차수별 매수 %")
-    if market.startswith("🇺🇸"):
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        trade_series = close[actual_trade_symbol].dropna()
+        exposure_now_live = min(1.0, max(0.0, float(live_cost) / float(investment))) if float(investment) > 0 else 0.0
+        base_unit_live = float(live_best_step) if 0.02 <= float(live_best_step) <= 0.10 else 0.05
+        soxl_plan = get_soxl_loc_plan(trade_series, exposure_now=exposure_now_live, base_unit=base_unit_live)
+        prev_close_live = float(soxl_plan.get("prev_close", trade_series.iloc[-1]))
+        soxl_offsets = soxl_plan["offsets"]
+        soxl_weights = soxl_plan["weights"]
+        soxl_prices = [prev_close_live * (1 + x) for x in soxl_offsets]
+
+        # 배치 후 총투입한도를 넘지 않도록 화면 주문비중도 순차적으로 제한한다.
+        cap = min(float(live_best_deployment_ratio), 1.0)
+        room = max(0.0, cap - exposure_now_live)
+        shown_weights = []
+        for w in soxl_weights:
+            use_w = min(float(w), room)
+            shown_weights.append(max(0.0, use_w))
+            room -= use_w
+
+        st.markdown("### 📌 SOXL 다음 거래일 LOC 주문")
+        st.caption(
+            f"상태: **{soxl_plan['state']}** · 현재 추정 투입 {exposure_now_live:.1%} · "
+            f"최대 누적투입 {cap:.0%} · 전일종가 {currency}{prev_close_live:,.2f}"
+        )
+        c1, c2 = st.columns(2)
+        for idx, (col, price, off, w) in enumerate(zip((c1, c2), soxl_prices, soxl_offsets, shown_weights), start=1):
+            with col:
+                st.metric(f"{idx}차 LOC 매수가", f"{currency}{price:,.2f} 이하")
+                st.caption(
+                    f"전일종가 대비 {off:+.0%} · 총자산 {w:.2%} "
+                    f"({currency}{float(investment)*w:,.0f})"
+                )
+
+        st.write(
+            f"**오늘 신규 매수 예정 합계:** 총자산 {sum(shown_weights):.2%} "
+            f"({currency}{float(investment)*sum(shown_weights):,.0f})"
+        )
+        if sum(shown_weights) <= 1e-12:
+            st.info("현재 누적투입 한도에 도달해 신규 LOC 매수 주문은 없습니다.")
+
+        # SOXL 역추적 엔진은 체결 블록별 익절을 사용한다. 평균단가 전량매도 표시는 하지 않는다.
+        if live_stage > 0 and avg_buy_price and avg_buy_price > 0:
+            approx_sell = float(avg_buy_price) * (1 + live_best_tp)
+            st.metric("참고 익절 기준", f"{currency}{approx_sell:,.2f} 이상")
+            st.caption("실제 백테스트 엔진은 각 매수 블록별로 독립 익절합니다. 이 값은 평균단가 기준 참고치입니다.")
+
+        st.info(
+            "SOXL 모드에서는 차수별 균등분할표를 사용하지 않습니다. 매 거래일 시장 상태와 현재 노출에 따라 "
+            "두 LOC 가격과 각 주문의 총자산 대비 비중을 새로 계산합니다."
+        )
+
+    elif market.startswith("🇺🇸"):
         # 매일 실제 주문에 바로 쓸 수 있도록 '가격'을 하나로 정리합니다.
         # 매수는 전략의 낙폭 신호가격과 LOC 한도가격을 모두 만족해야 하므로 더 낮은 값을 사용합니다.
         loc_effective_buy = None
@@ -2833,33 +2901,34 @@ try:
             "매수·매도 주문을 동시에 낼 수 있는지는 증권사 주문가능금액/수량 및 주문 방식에 따라 다릅니다. "
             "LOC는 마감 경매에서 한도가격 조건을 만족해야 체결되며, 표시 가격에 반드시 체결되는 것은 아닙니다."
         )
-    allocation_view = pd.DataFrame(
-        {
-            "차수": [f"{i}차" for i in range(1, tranche_count + 1)],
-            "총자금 대비 매수비중": [
-                f"{w * live_best_deployment_ratio:.2%}" for w in live_tranche_weights
-            ],
-            "예정금액": [f"{currency}{x:,.0f}" for x in live_tranche_budgets],
-            "종가금액": [f"{currency}{x * (1-live_best_loc_buy_ratio):,.0f}" for x in live_tranche_budgets],
-            "LOC금액": [f"{currency}{x * live_best_loc_buy_ratio:,.0f}" for x in live_tranche_budgets],
-        }
-    )
-    st.write("**전체 투자금 기준 분할매수 계획**")
-    st.caption(
-        f"총자금 {live_best_deployment_ratio:.0%} 운용 · 종가 {1-live_best_loc_buy_ratio:.0%} + "
-        f"LOC {live_best_loc_buy_ratio:.0%} · 아래 비중 합계는 총자금의 "
-        f"{live_best_deployment_ratio:.0%}입니다."
-    )
-    st.dataframe(
-        allocation_view,
-        use_container_width=True,
-        hide_index=True,
-        height=min(38 * (tranche_count + 1), 500),
-    )
-    st.write(
-        f"**{min(next_stage, tranche_count)}차 예정 비중:** {current_weight_pct:.2%} · "
-        f"예정 매수금액 {currency}{tranche_budget:,.0f}"
-    )
+    if not (market.startswith("🇺🇸") and us_product == "SOXL"):
+        allocation_view = pd.DataFrame(
+            {
+                "차수": [f"{i}차" for i in range(1, tranche_count + 1)],
+                "총자금 대비 매수비중": [
+                    f"{w * live_best_deployment_ratio:.2%}" for w in live_tranche_weights
+                ],
+                "예정금액": [f"{currency}{x:,.0f}" for x in live_tranche_budgets],
+                "종가금액": [f"{currency}{x * (1-live_best_loc_buy_ratio):,.0f}" for x in live_tranche_budgets],
+                "LOC금액": [f"{currency}{x * live_best_loc_buy_ratio:,.0f}" for x in live_tranche_budgets],
+            }
+        )
+        st.write("**전체 투자금 기준 분할매수 계획**")
+        st.caption(
+            f"총자금 {live_best_deployment_ratio:.0%} 운용 · 종가 {1-live_best_loc_buy_ratio:.0%} + "
+            f"LOC {live_best_loc_buy_ratio:.0%} · 아래 비중 합계는 총자금의 "
+            f"{live_best_deployment_ratio:.0%}입니다."
+        )
+        st.dataframe(
+            allocation_view,
+            use_container_width=True,
+            hide_index=True,
+            height=min(38 * (tranche_count + 1), 500),
+        )
+        st.write(
+            f"**{min(next_stage, tranche_count)}차 예정 비중:** {current_weight_pct:.2%} · "
+            f"예정 매수금액 {currency}{tranche_budget:,.0f}"
+        )
 
     if signal.endswith("매수"):
         expected_close_amount = tranche_budget * (1 - live_best_loc_buy_ratio)
