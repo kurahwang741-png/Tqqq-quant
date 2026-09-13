@@ -197,6 +197,21 @@ with st.expander("⚙️ 백테스트 설정", expanded=False):
             value=date.today(),
         )
 
+    blind_validation_2026 = st.checkbox(
+        "🧪 2026년 블라인드 검증",
+        value=True,
+        help=(
+            "켜면 전략 최적화에는 2026년 데이터를 전혀 사용하지 않습니다. "
+            "2025-12-31까지의 데이터로 1위 파라미터를 고른 뒤, 그 파라미터를 고정해 "
+            "2026년 성과를 별도로 검증합니다."
+        ),
+    )
+    if blind_validation_2026:
+        st.info(
+            "블라인드 모드: 최적화 데이터는 2025-12-31까지만 사용합니다. "
+            "선정된 1위 전략은 파라미터 변경 없이 2026년 구간에 다시 적용합니다."
+        )
+
     st.caption(
         "💡 실전 전략 선정 권장: 전체기간 결과를 기본으로 보고, 최근 3년·5년·10년에서도 "
         "비슷한 전략이 반복해서 상위권인지 확인하세요."
@@ -1210,6 +1225,7 @@ try:
         selected_end_year,
         selected_start_date,
         selected_end_date,
+        bool(blind_validation_2026),
         use_rsi_candidates,
         tuple(rsi_thresholds),
         short_mode,
@@ -1315,6 +1331,10 @@ try:
                 selected_start_date,
                 selected_end_date,
             )
+
+            # 2026 블라인드 검증: 파라미터 탐색에는 2026년 데이터를 절대 넣지 않습니다.
+            if blind_validation_2026:
+                df = df.loc[df.index <= pd.Timestamp("2025-12-31")].copy()
 
             if len(df) < min_rows:
                 if required_ma > 0:
@@ -1590,6 +1610,80 @@ try:
     best_loc_buy_offset = winner_bundle.get("loc_buy_offset", 0.0)
     best_loc_sell_offset = winner_bundle.get("loc_sell_offset", 0.0)
 
+    # ------------------------------------------------------------
+    # 2026 완전 블라인드 검증
+    # ------------------------------------------------------------
+    blind_2026 = None
+    if blind_validation_2026:
+        validation_mode = best_mode
+        vdf = pd.DataFrame(index=close.index)
+        vdf["SIGNAL"] = close[validation_mode["signal_symbol"]]
+        vdf["TRADE"] = close[validation_mode["trade_symbol"]]
+        vdf["REF"] = close[validation_mode["ref_symbol"]]
+        vdf = vdf.dropna()
+        # 사용자가 선택한 시작/종료 범위는 존중하되, 최적화 때만 2025-12-31에서 잘랐습니다.
+        vdf = apply_backtest_period(
+            vdf,
+            backtest_period_mode,
+            selected_start_year,
+            selected_end_year,
+            selected_start_date,
+            selected_end_date,
+        )
+        if not vdf.empty:
+            # 모든 지표는 전체 선택구간으로 먼저 계산합니다. 따라서 2026-01-01의 신호는
+            # 2025년까지 이미 알고 있던 과거 정보만 자연스럽게 사용합니다.
+            vdf["ANCHOR"] = anchor_series(vdf["SIGNAL"], anchor_mode)
+            vdf["RSI14"] = calc_rsi(vdf["REF"], 14)
+            for p_ma in ma_periods:
+                p_ma = int(p_ma)
+                vdf[f"MA{p_ma}"] = vdf["REF"].rolling(p_ma).mean()
+                vdf[f"TREND_OK_{p_ma}"] = vdf["REF"] > vdf[f"MA{p_ma}"]
+            req = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
+            req += [f"TREND_OK_{int(p_ma)}" for p_ma in ma_periods]
+            vdf = vdf.dropna(subset=req)
+
+        if not vdf.empty and (vdf.index >= pd.Timestamp("2026-01-01")).any():
+            fixed_sim = simulate(
+                vdf, float(investment), best_step, best_tp, tranche_count,
+                best_ma_period, best_rsi, best_allocation_weights, best_max_hold,
+                best_execution_mode, float(best_loc_buy_offset), float(best_loc_sell_offset),
+                best_loc_buy_ratio, float(fee_pct), float(slippage_pct), float(fx_cost_pct),
+                best_deployment_ratio,
+            )
+            eq_full = fixed_sim["equity"].copy()
+            test_eq = eq_full.loc[eq_full.index >= pd.Timestamp("2026-01-01")].copy()
+            pre_eq = eq_full.loc[eq_full.index < pd.Timestamp("2026-01-01")]
+            if not test_eq.empty:
+                start_equity = float(pre_eq["Equity"].iloc[-1]) if not pre_eq.empty else float(test_eq["Equity"].iloc[0])
+                end_equity = float(test_eq["Equity"].iloc[-1])
+                test_return = end_equity / start_equity - 1 if start_equity > 0 else np.nan
+                test_days = max((pd.Timestamp(test_eq.index[-1]) - pd.Timestamp("2026-01-01")).days, 1)
+                test_years = test_days / 365.25
+                test_cagr = (end_equity / start_equity) ** (1 / test_years) - 1 if start_equity > 0 and end_equity > 0 else np.nan
+                # MDD는 2026 시작자산도 직전 고점 후보로 포함해 계산합니다.
+                eq_for_dd = pd.concat([
+                    pd.Series([start_equity], index=[pd.Timestamp("2025-12-31")]),
+                    test_eq["Equity"],
+                ])
+                test_peak = eq_for_dd.cummax()
+                test_mdd = float((eq_for_dd / test_peak - 1).min())
+                test_trades = fixed_sim["trades"]
+                if isinstance(test_trades, pd.DataFrame) and not test_trades.empty and "매도일" in test_trades.columns:
+                    test_trade_count = int((pd.to_datetime(test_trades["매도일"]) >= pd.Timestamp("2026-01-01")).sum())
+                else:
+                    test_trade_count = 0
+                blind_2026 = {
+                    "return": float(test_return),
+                    "cagr": float(test_cagr),
+                    "mdd": float(test_mdd),
+                    "trade_count": test_trade_count,
+                    "start_equity": start_equity,
+                    "end_equity": end_equity,
+                    "end_date": pd.Timestamp(test_eq.index[-1]),
+                    "sim": fixed_sim,
+                }
+
     bt_start = pd.Timestamp(best_df.index.min())
     bt_end = pd.Timestamp(best_df.index.max())
     bt_years = max((bt_end - bt_start).days / 365.25, 0)
@@ -1597,6 +1691,34 @@ try:
         f"📅 실제 백테스트 사용기간: {bt_start:%Y-%m-%d} ~ {bt_end:%Y-%m-%d} "
         f"(약 {bt_years:.1f}년) · 선택모드: {backtest_period_mode}"
     )
+
+    if blind_validation_2026:
+        st.subheader("🧪 2026 블라인드 검증")
+        if blind_2026 is None:
+            st.warning(
+                "현재 선택한 기간에는 2026년 검증 데이터가 충분하지 않습니다. "
+                "전체기간 또는 2026년을 포함하는 기간으로 실행해 주세요."
+            )
+        else:
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("2026 수익률", f"{blind_2026['return']:.1%}")
+            b2.metric("2026 연환산", f"{blind_2026['cagr']:.1%}")
+            b3.metric("2026 MDD", f"{blind_2026['mdd']:.1%}")
+            b4.metric("2026 완료매매", f"{blind_2026['trade_count']}회")
+            st.caption(
+                f"최적화: ~ 2025-12-31 · 검증: 2026-01-01 ~ {blind_2026['end_date']:%Y-%m-%d} · "
+                "2026 데이터는 전략/파라미터 선정에 사용하지 않았습니다."
+            )
+            if blind_2026["return"] > 0:
+                st.success(
+                    "✅ 2026 미사용 데이터에서도 플러스 성과입니다. "
+                    "최근 구간만 보고 맞춘 전략일 가능성을 한 단계 낮춰주는 결과입니다."
+                )
+            else:
+                st.warning(
+                    "⚠️ 2026 미사용 데이터 성과가 마이너스입니다. "
+                    "학습구간 성과 대비 과최적화 가능성을 더 강하게 점검해야 합니다."
+                )
 
     st.success(
         f"🥇 CAGR 1위: **{winner['운용방식']}** · "
