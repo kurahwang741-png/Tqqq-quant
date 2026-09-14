@@ -1377,12 +1377,12 @@ try:
         # V32-C의 4+4/5+5/6+6/7+7은 고정 템플릿입니다.
         # 매수비중 자체를 다시 최적화하지 않고 익절/보유기간/총투입한도만 비교합니다.
         effective_buy_steps = [0.06]
-        effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
-        effective_max_holds = [45, 60, 90, 120, 180]
+        effective_take_profits = [0.04, 0.06, 0.08, 0.10]
+        effective_max_holds = [60, 120, 180]
         filter_candidates = [(None, None)]
         allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
         loc_buy_ratios = [1.0]
-        deployment_ratios = [0.70, 0.80, 0.90, 1.00]
+        deployment_ratios = [0.80, 0.90]
 
     current_params = (
         market,
@@ -1516,7 +1516,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C FAST 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
@@ -1542,9 +1542,9 @@ try:
         # 중간에 멈출 수 있습니다. 조합이 많을 때는 1차 넓은 탐색 -> 2차 상위권 정밀탐색으로 줄입니다.
         # 속도 우선 탐색: 큰 그리드는 대표 후보를 먼저 본 뒤 상위권 주변만 정밀 확인합니다.
         # SOXL 기본 그리드처럼 1,500개 안팎은 전수 계산하되, 그 이상은 2단계 탐색을 사용합니다.
-        exhaustive_limit = 1500
-        stage1_limit = 420
-        stage2_limit = 220
+        exhaustive_limit = 120
+        stage1_limit = 36
+        stage2_limit = 24
 
         # 각 운용방식의 데이터프레임은 한 번만 계산해 재사용합니다.
         prepared = []
@@ -1763,7 +1763,7 @@ try:
 
         with st.spinner("백테스트 계산 중..."):
             if total_grid <= exhaustive_limit:
-                status.caption(f"전체 조합 {total_grid:,}개를 정밀 계산합니다.")
+                status.caption(f"고속 모드: 핵심 후보 {total_grid:,}개만 계산합니다.")
                 if checkpoint_state:
                     status.caption(f"💾 {len(tested):,}개 완료 지점부터 이어서 계산합니다.")
                 for i, job in enumerate(all_jobs, 1):
