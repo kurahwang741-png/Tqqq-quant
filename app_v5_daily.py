@@ -22,10 +22,15 @@ st.set_page_config(
 
 st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
+st.caption("V32-C SAFE BOOT · QQQ + SMH 상대강도 · VIX 제외")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
-BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    BACKTEST_CHECKPOINT_DIR = Path("/tmp/.quant_backtest_checkpoints")
+    BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 BACKTEST_CHECKPOINT_EVERY = 20
 
 def _checkpoint_signature(params):
@@ -399,35 +404,96 @@ for key in ["backtest_result", "backtest_sims", "backtest_params"]:
         st.session_state[key] = None
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900, show_spinner=False)
 def download_close(symbols):
-    raw = yf.download(
-        symbols,
-        period="max",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-    )
+    """Streamlit Cloud에서 멈춤을 줄이기 위한 안전한 일봉 다운로드.
 
-    if raw.empty:
-        raise ValueError("가격 데이터를 받지 못했습니다.")
+    여러 종목을 한 번에 받지 않고 하나씩 짧은 timeout으로 받아
+    특정 티커 응답 지연이 앱 전체 부팅을 막지 않도록 합니다.
+    """
+    symbols = list(dict.fromkeys(list(symbols)))
+    out = []
+    errors = []
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" in raw.columns.get_level_values(0):
-            close = raw["Close"].copy()
-        elif "Close" in raw.columns.get_level_values(-1):
-            close = raw.xs("Close", axis=1, level=-1).copy()
-        else:
-            raise ValueError("종가(Close) 데이터를 찾지 못했습니다.")
-    else:
-        if "Close" not in raw.columns:
-            raise ValueError("종가(Close) 데이터를 찾지 못했습니다.")
-        close = raw[["Close"]].copy()
+    for sym in symbols:
+        raw = None
+        last_err = None
+        # max 우선, 실패하면 10y로 한 번 더 시도
+        for period in ("max", "10y"):
+            try:
+                raw = yf.download(
+                    sym,
+                    period=period,
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    group_by="column",
+                    threads=False,
+                    timeout=12,
+                )
+                if raw is not None and not raw.empty:
+                    break
+            except TypeError:
+                # 구버전 yfinance가 timeout 인자를 지원하지 않는 경우
+                try:
+                    raw = yf.download(
+                        sym,
+                        period=period,
+                        interval="1d",
+                        auto_adjust=True,
+                        progress=False,
+                        group_by="column",
+                        threads=False,
+                    )
+                    if raw is not None and not raw.empty:
+                        break
+                except Exception as e:
+                    last_err = e
+            except Exception as e:
+                last_err = e
 
-    if isinstance(close, pd.Series):
-        close = close.to_frame()
+        if raw is None or raw.empty:
+            errors.append(f"{sym}: {last_err or 'no data'}")
+            continue
 
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Close" in raw.columns.get_level_values(0):
+                    c = raw["Close"]
+                elif "Close" in raw.columns.get_level_values(-1):
+                    c = raw.xs("Close", axis=1, level=-1)
+                else:
+                    raise ValueError("Close column missing")
+                if isinstance(c, pd.DataFrame):
+                    if sym in c.columns:
+                        c = c[sym]
+                    else:
+                        c = c.iloc[:, 0]
+            else:
+                if "Close" not in raw.columns:
+                    raise ValueError("Close column missing")
+                c = raw["Close"]
+
+            c = pd.Series(c, index=raw.index, name=sym).astype(float).dropna()
+            # yfinance 버전에 따라 timezone이 붙는 경우를 통일
+            try:
+                c.index = pd.to_datetime(c.index).tz_localize(None)
+            except Exception:
+                c.index = pd.to_datetime(c.index)
+            out.append(c)
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
+
+    if not out:
+        raise ValueError("가격 데이터를 받지 못했습니다. " + " | ".join(errors))
+
+    close = pd.concat(out, axis=1).sort_index()
+    missing = [sym for sym in symbols if sym not in close.columns]
+    if missing:
+        raise ValueError(
+            "필수 가격 데이터 누락: " + ", ".join(missing) +
+            (" | " + " | ".join(errors) if errors else "")
+        )
     return close
 
 
@@ -866,9 +932,6 @@ def simulate_soxl_reverse(
     close = df["TRADE"].astype(float).copy()
     qqq = df["QQQ"].astype(float).copy()
     smh = df["SMH"].astype(float).copy()
-    feat = _soxl_c_features(close, qqq, smh)
-    feat = feat.reindex(df.index)
-
     for i, dt in enumerate(df.index):
         px = float(close.iloc[i])
         if not np.isfinite(px) or px <= 0:
@@ -960,7 +1023,7 @@ def simulate_soxl_reverse(
         columns=["Date", "Equity", "Cash", "Shares", "TradePrice", "Exposure"],
     ).set_index("Date")
     eq["SignalPrice"] = eq["TradePrice"]
-    eq["Drawdown"] = 1 - eq["TradePrice"] / eq["TradePrice"].cummax()
+    eq["Drawdown"] = eq["Equity"] / eq["Equity"].cummax() - 1
 
     final_value = float(eq["Equity"].iloc[-1])
     total_return = final_value / float(initial_cash) - 1
@@ -1245,7 +1308,8 @@ try:
     # ------------------------------------------------------------
     if market.startswith("🇺🇸"):
         symbols = [us_product, "QQQ"] if us_product == "TQQQ" else ["SOXL", "QQQ", "SMH"]
-        close = download_close(symbols).dropna()
+        with st.spinner("가격 데이터를 불러오는 중입니다..."):
+            close = download_close(symbols).dropna()
 
         modes = [
             {
@@ -1257,7 +1321,8 @@ try:
         ]
     else:
         symbols = ["233740.KS", "229200.KS"]
-        close = download_close(symbols).dropna()
+        with st.spinner("가격 데이터를 불러오는 중입니다..."):
+            close = download_close(symbols).dropna()
 
         modes = [
             {
