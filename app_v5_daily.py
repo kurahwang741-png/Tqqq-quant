@@ -15,14 +15,14 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32-C5 LOC-SELL",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32-C6 HYBRID",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C5 LOC-SELL")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C6 HYBRID")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C5 LOC-SELL · CAGR 60% 우선 · 최대낙폭 구간 진단 추가")
+st.caption("V32-C6 HYBRID · CAGR 60% 우선 · LOC 회전 + 추세추종 코어")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
@@ -872,18 +872,18 @@ def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
 
     # LOC 위치를 실제 역추적 패턴처럼 장세별로 크게 다르게 둡니다.
     if strong and exp < 0.60:
-        return "C5-상승추종", (0.060, -0.005), (0.08, 0.07), risk
+        return "C6-상승추종", (0.060, -0.005), (0.09, 0.09), risk
     if deep_reversion and exp < 0.70:
-        return "C5-과매도반등", (0.025, -0.025), (0.08, 0.08), risk
+        return "C6-과매도반등", (0.025, -0.025), (0.09, 0.08), risk
     if rebound and exp < 0.65:
-        return "C5-반등", (0.040, -0.010), (0.08, 0.07), risk
+        return "C6-반등", (0.040, -0.010), (0.08, 0.08), risk
     if risk <= 4:
-        return "C5-정상", (0.015, -0.025), (0.07, 0.07), risk
+        return "C6-정상", (0.015, -0.025), (0.07, 0.07), risk
     if risk <= 6:
-        return "C5-약세", (-0.020, -0.060), (0.05, 0.07), risk
+        return "C6-약세", (-0.020, -0.060), (0.05, 0.06), risk
     if exp >= 0.65:
-        return "C5-고LOT약세", (-0.055, -0.120), (0.03, 0.05), risk
-    return "C5-강약세", (-0.040, -0.095), (0.04, 0.06), risk
+        return "C6-고LOT약세", (-0.055, -0.120), (0.03, 0.04), risk
+    return "C6-강약세", (-0.040, -0.095), (0.04, 0.05), risk
 
 def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None):
     """V32-C 계획.
@@ -1025,27 +1025,31 @@ def simulate_soxl_reverse(
         remaining = []
         for lot in lots:
             age = (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days
-            # C5 반등 회수 엔진: LOT가 쌓였을수록 목표수익을 낮춰 현금 회전 속도를 높입니다.
+            # C6 HYBRID: trading LOT은 LOC 익절로 회전, core LOT은 추세가 살아있는 동안 보유.
             mark_before = sum(x["qty"] * px for x in lots)
             eq_before = cash + mark_before
             exp_before = mark_before / eq_before if eq_before > 0 else 0.0
             tp_eff = float(take_profit)
-            # 진입 당시 장세에 따라 목표수익도 다르게 운용
             entry_state = str(lot.get("state", ""))
-            if "상승추종" in entry_state:
-                tp_eff = max(tp_eff, 0.045)
-            elif "반등" in entry_state:
-                tp_eff = min(tp_eff, 0.045)
-            if exp_before >= 0.75:
-                tp_eff = min(tp_eff, 0.020)
-            elif exp_before >= 0.60:
-                tp_eff = min(tp_eff, 0.030)
-            elif exp_before >= 0.45:
-                tp_eff = min(tp_eff, 0.040)
+            is_core = bool(lot.get("core", False))
             target = lot["price"] * (1 + tp_eff)
-            hit_tp = px >= target
-            forced = max_hold_days is not None and age >= int(max_hold_days)
-            if hit_tp or forced:
+            hit_tp = (px >= target) and (not is_core)
+
+            # 코어 청산은 전일까지 확인된 QQQ/SMH/SOXL 추세가 깨질 때만 실행해 look-ahead를 피합니다.
+            trend_break = False
+            if is_core and i > 0:
+                pr = df.iloc[i - 1]
+                q5 = float(pr.get("C_Q_MA5", np.nan)); q10 = float(pr.get("C_Q_MA10", np.nan))
+                q20 = float(pr.get("C_Q_MA20", np.nan)); qs = float(pr.get("C_Q_MA20_SLOPE5", np.nan))
+                rs = float(pr.get("C_RS5", np.nan)); sd20 = float(pr.get("C_S_DIST20", np.nan))
+                trend_break = ((np.isfinite(q5) and np.isfinite(q10) and q5 < q10) and
+                               (np.isfinite(q10) and np.isfinite(q20) and q10 < q20)) or \
+                              (np.isfinite(qs) and qs < -0.012) or \
+                              (np.isfinite(rs) and rs < -0.035 and np.isfinite(sd20) and sd20 < -0.08)
+            # 코어는 일반 max_hold보다 길게 허용하되 영구보유는 막습니다.
+            hold_limit = (int(max_hold_days) * 2 if is_core and max_hold_days is not None else max_hold_days)
+            forced = hold_limit is not None and age >= int(hold_limit)
+            if hit_tp or trend_break or forced:
                 sell_px = px * (1 - slippage_pct)
                 proceeds = lot["qty"] * sell_px * (1 - fee_pct - fx_cost_pct)
                 cash += proceeds
@@ -1059,7 +1063,7 @@ def simulate_soxl_reverse(
                     "실현손익": pnl,
                     "보유일수": age,
                     "매수횟수": 1,
-                    "청산사유": "익절" if hit_tp else "기간청산",
+                    "청산사유": ("익절" if hit_tp else ("추세이탈" if trend_break else "기간청산")),
                     "진입상태": lot.get("state", ""),
                 })
             else:
@@ -1105,15 +1109,21 @@ def simulate_soxl_reverse(
                 unit_cost = buy_px * (1 + fee_pct + fx_cost_pct)
                 qty = budget / unit_cost
                 cash -= budget
-                lots.append({
-                    "date": pd.Timestamp(dt),
-                    "price": buy_px,
-                    "qty": qty,
-                    "cash_cost": budget,
-                    "state": state,
-                    "loc_offset": float(off),
-                    "risk_score": int(risk_score),
-                })
+                # 상승/반등 진입의 35%는 추세추종 core, 65%는 기존 LOC 회전 LOT.
+                core_frac = 0.35 if ("상승추종" in str(state) or "반등" in str(state)) else 0.0
+                for frac, core_flag in ((1.0 - core_frac, False), (core_frac, True)):
+                    if frac <= 0:
+                        continue
+                    lots.append({
+                        "date": pd.Timestamp(dt),
+                        "price": buy_px,
+                        "qty": qty * frac,
+                        "cash_cost": budget * frac,
+                        "state": state,
+                        "loc_offset": float(off),
+                        "risk_score": int(risk_score),
+                        "core": core_flag,
+                    })
                 invested_now += qty * px
 
         shares = sum(lot["qty"] for lot in lots)
@@ -1481,15 +1491,15 @@ try:
     # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
     # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
     if market.startswith("🇺🇸") and us_product == "SOXL":
-        # V32-C5 LOC-SELL: CAGR을 끌어올리기 위해 회전율/재진입을 우선 탐색합니다.
+        # V32-C6 HYBRID: CAGR을 끌어올리기 위해 회전율/재진입을 우선 탐색합니다.
         # 상태별 매수비중은 C4 템플릿으로 고정하고 익절/보유기간/총투입한도를 비교합니다.
         effective_buy_steps = [0.06]
-        effective_take_profits = [0.02, 0.03, 0.04, 0.05, 0.06]
+        effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.08]
         effective_max_holds = [45, 90, 180]
         filter_candidates = [(None, None)]
         allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
         loc_buy_ratios = [1.0]
-        deployment_ratios = [0.85, 0.95, 1.00]
+        deployment_ratios = [0.85, 0.90, 0.95]
 
     current_params = (
         market,
@@ -1623,7 +1633,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C5 LOC-SELL 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C6 HYBRID 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
@@ -2201,7 +2211,7 @@ try:
             recovery_text = f"{recovery_date:%Y-%m-%d}" if recovery_date is not None else "백테스트 종료까지 미회복"
             recovery_days = int((recovery_date - peak_date).days) if recovery_date is not None else None
 
-            st.subheader("🔎 C5 최대낙폭 구간")
+            st.subheader("🔎 C6 최대낙폭 구간")
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("직전 자산고점", f"{peak_date:%Y-%m-%d}", f"${peak_equity:,.0f}")
             d2.metric("MDD 저점", f"{trough_date:%Y-%m-%d}", f"${trough_equity:,.0f}")
