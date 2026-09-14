@@ -15,14 +15,14 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32-C",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32-C2",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C2")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C TURBO FIX · QQQ + SMH 상대강도 · VIX 제외")
+st.caption("V32-C2 · CAGR 60% 우선 + MDD 방어 · 4+8 Deep LOC + LOT 누적제어")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
@@ -858,13 +858,19 @@ def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
     if float(exposure_now) > 0.30:
         risk += 1
 
+    # C2: 장세판단은 C를 유지하되, 약세에서는 위쪽 추격매수를 줄이고
+    # 아래 LOC로 예산을 이동합니다. LOT가 이미 큰 경우에는 추가 누적을 더 억제합니다.
     if risk <= 2:
-        return "C-공격 7+7", (0.04, -0.01), (0.07, 0.07), risk
+        return "C2-공격 7+7", (0.04, -0.01), (0.07, 0.07), risk
     if risk <= 4:
-        return "C-정상 6+6", (-0.01, -0.04), (0.06, 0.06), risk
+        return "C2-정상 6+6", (-0.01, -0.04), (0.06, 0.06), risk
     if risk <= 7:
-        return "C-방어 5+5", (-0.02, -0.04), (0.05, 0.05), risk
-    return "C-강방어 4+4", (-0.02, -0.06), (0.04, 0.04), risk
+        if float(exposure_now) >= 0.35:
+            return "C2-고LOT 2+6", (-0.06, -0.12), (0.02, 0.06), risk
+        return "C2-방어 4+8", (-0.03, -0.08), (0.04, 0.08), risk
+    if float(exposure_now) >= 0.30:
+        return "C2-강방어 2+4", (-0.07, -0.14), (0.02, 0.04), risk
+    return "C2-강방어 4+4", (-0.05, -0.10), (0.04, 0.04), risk
 
 def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None):
     """V32-C 계획.
@@ -931,21 +937,19 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
 
     # 관측된 4+4 / 5+5 / 6+6 / 7+7을 위험단계로 해석합니다.
     if risk <= 2:
-        state = "C-공격 7+7"
-        offsets = (0.04, -0.01)
-        weights = (0.07, 0.07)
+        state, offsets, weights = "C2-공격 7+7", (0.04, -0.01), (0.07, 0.07)
     elif risk <= 4:
-        state = "C-정상 6+6"
-        offsets = (-0.01, -0.04)
-        weights = (0.06, 0.06)
+        state, offsets, weights = "C2-정상 6+6", (-0.01, -0.04), (0.06, 0.06)
     elif risk <= 7:
-        state = "C-방어 5+5"
-        offsets = (-0.02, -0.04)
-        weights = (0.05, 0.05)
+        if float(exposure_now) >= 0.35:
+            state, offsets, weights = "C2-고LOT 2+6", (-0.06, -0.12), (0.02, 0.06)
+        else:
+            state, offsets, weights = "C2-방어 4+8", (-0.03, -0.08), (0.04, 0.08)
     else:
-        state = "C-강방어 4+4"
-        offsets = (-0.02, -0.06)
-        weights = (0.04, 0.04)
+        if float(exposure_now) >= 0.30:
+            state, offsets, weights = "C2-강방어 2+4", (-0.07, -0.14), (0.02, 0.04)
+        else:
+            state, offsets, weights = "C2-강방어 4+4", (-0.05, -0.10), (0.04, 0.04)
 
     return {
         "state": state,
@@ -1001,7 +1005,16 @@ def simulate_soxl_reverse(
         remaining = []
         for lot in lots:
             age = (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days
-            target = lot["price"] * (1 + float(take_profit))
+            # C2 LOT 회수: 보유비중이 커질수록 반등 시 더 빨리 현금을 회수합니다.
+            mark_before = sum(x["qty"] * px for x in lots)
+            eq_before = cash + mark_before
+            exp_before = mark_before / eq_before if eq_before > 0 else 0.0
+            tp_eff = float(take_profit)
+            if exp_before >= 0.55:
+                tp_eff = min(tp_eff, 0.03)
+            elif exp_before >= 0.40:
+                tp_eff = min(tp_eff, 0.04)
+            target = lot["price"] * (1 + tp_eff)
             hit_tp = px >= target
             forced = max_hold_days is not None and age >= int(max_hold_days)
             if hit_tp or forced:
@@ -1440,15 +1453,15 @@ try:
     # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
     # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
     if market.startswith("🇺🇸") and us_product == "SOXL":
-        # V32-C의 4+4/5+5/6+6/7+7은 고정 템플릿입니다.
+        # V32-C2의 장세별 7+7/6+6/4+8/LOT방어은 고정 템플릿입니다.
         # 매수비중 자체를 다시 최적화하지 않고 익절/보유기간/총투입한도만 비교합니다.
         effective_buy_steps = [0.06]
-        effective_take_profits = [0.04, 0.06, 0.08, 0.10]
+        effective_take_profits = [0.03, 0.04, 0.06, 0.08]
         effective_max_holds = [60, 120, 180]
         filter_candidates = [(None, None)]
         allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
         loc_buy_ratios = [1.0]
-        deployment_ratios = [0.80, 0.90]
+        deployment_ratios = [0.70, 0.80, 0.90]
 
     current_params = (
         market,
@@ -1582,7 +1595,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C TURBO 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C2 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
