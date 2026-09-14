@@ -15,22 +15,17 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR4",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32 DUAL",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR4")
-st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C4 BEAR4 · BEAR → RECOVERY60 → RECOVERY80 → NORMAL 4단계 · 회복 지속 시 80% 선복귀 · 중기확인 후 C4 100% 복귀")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32 DUAL")
+st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
-try:
-    BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    BACKTEST_CHECKPOINT_DIR = Path("/tmp/.quant_backtest_checkpoints")
-    BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 BACKTEST_CHECKPOINT_EVERY = 20
 
 def _checkpoint_signature(params):
@@ -73,6 +68,21 @@ market = st.radio(
 )
 
 us_product = "SOXL" if "SOXL" in market else "TQQQ"
+
+# SOXL 연구 목표를 분리합니다. ORIGINAL은 관측 주문 재현, ALPHA는 장기 CAGR 개선용입니다.
+if market.startswith("🇺🇸") and us_product == "SOXL":
+    soxl_track = st.radio(
+        "🧭 SOXL 연구 트랙",
+        ["C-ORIGINAL · 원본 주문 역추적", "C-ALPHA · CAGR 연구"],
+        horizontal=True,
+        help="ORIGINAL은 실제 주문 템플릿 4+4/5+5/6+6/7+7 재현이 1차 목표입니다. ALPHA는 ORIGINAL을 복사해 장기 CAGR을 높이는 별도 실험입니다.",
+    )
+    if soxl_track.startswith("C-ORIGINAL"):
+        st.info("🔎 C-ORIGINAL: 3~7월 실제 주문 재현이 1차 목표 · 8월은 블라인드 검증용으로 고정 · CAGR은 2차 평가")
+    else:
+        st.warning("🧪 C-ALPHA: 원본을 훼손하지 않는 별도 연구 트랙 · 2016~2025 장기 CAGR 평가 · 8월/9월은 튜닝 금지")
+else:
+    soxl_track = "C-ORIGINAL · 원본 주문 역추적"
 
 if market.startswith("🇺🇸"):
     currency = "$"
@@ -404,96 +414,35 @@ for key in ["backtest_result", "backtest_sims", "backtest_params"]:
         st.session_state[key] = None
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900)
 def download_close(symbols):
-    """Streamlit Cloud에서 멈춤을 줄이기 위한 안전한 일봉 다운로드.
+    raw = yf.download(
+        symbols,
+        period="max",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+    )
 
-    여러 종목을 한 번에 받지 않고 하나씩 짧은 timeout으로 받아
-    특정 티커 응답 지연이 앱 전체 부팅을 막지 않도록 합니다.
-    """
-    symbols = list(dict.fromkeys(list(symbols)))
-    out = []
-    errors = []
+    if raw.empty:
+        raise ValueError("가격 데이터를 받지 못했습니다.")
 
-    for sym in symbols:
-        raw = None
-        last_err = None
-        # max 우선, 실패하면 10y로 한 번 더 시도
-        for period in ("max", "10y"):
-            try:
-                raw = yf.download(
-                    sym,
-                    period=period,
-                    interval="1d",
-                    auto_adjust=True,
-                    progress=False,
-                    group_by="column",
-                    threads=False,
-                    timeout=12,
-                )
-                if raw is not None and not raw.empty:
-                    break
-            except TypeError:
-                # 구버전 yfinance가 timeout 인자를 지원하지 않는 경우
-                try:
-                    raw = yf.download(
-                        sym,
-                        period=period,
-                        interval="1d",
-                        auto_adjust=True,
-                        progress=False,
-                        group_by="column",
-                        threads=False,
-                    )
-                    if raw is not None and not raw.empty:
-                        break
-                except Exception as e:
-                    last_err = e
-            except Exception as e:
-                last_err = e
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):
+            close = raw["Close"].copy()
+        elif "Close" in raw.columns.get_level_values(-1):
+            close = raw.xs("Close", axis=1, level=-1).copy()
+        else:
+            raise ValueError("종가(Close) 데이터를 찾지 못했습니다.")
+    else:
+        if "Close" not in raw.columns:
+            raise ValueError("종가(Close) 데이터를 찾지 못했습니다.")
+        close = raw[["Close"]].copy()
 
-        if raw is None or raw.empty:
-            errors.append(f"{sym}: {last_err or 'no data'}")
-            continue
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
 
-        try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                if "Close" in raw.columns.get_level_values(0):
-                    c = raw["Close"]
-                elif "Close" in raw.columns.get_level_values(-1):
-                    c = raw.xs("Close", axis=1, level=-1)
-                else:
-                    raise ValueError("Close column missing")
-                if isinstance(c, pd.DataFrame):
-                    if sym in c.columns:
-                        c = c[sym]
-                    else:
-                        c = c.iloc[:, 0]
-            else:
-                if "Close" not in raw.columns:
-                    raise ValueError("Close column missing")
-                c = raw["Close"]
-
-            c = pd.Series(c, index=raw.index, name=sym).astype(float).dropna()
-            # yfinance 버전에 따라 timezone이 붙는 경우를 통일
-            try:
-                c.index = pd.to_datetime(c.index).tz_localize(None)
-            except Exception:
-                c.index = pd.to_datetime(c.index)
-            out.append(c)
-        except Exception as e:
-            errors.append(f"{sym}: {e}")
-
-    if not out:
-        raise ValueError("가격 데이터를 받지 못했습니다. " + " | ".join(errors))
-
-    close = pd.concat(out, axis=1).sort_index()
-    missing = [sym for sym in symbols if sym not in close.columns]
-    if missing:
-        raise ValueError(
-            "필수 가격 데이터 누락: " + ", ".join(missing) +
-            (" | " + " | ".join(errors) if errors else "")
-        )
     return close
 
 
@@ -806,170 +755,6 @@ def _soxl_c_features(soxl_series, qqq_series, smh_series):
     return d
 
 
-
-def _attach_soxl_c_precomputed(df):
-    """SOXL V32-C 정적 지표/기본 위험점수를 1회만 계산합니다.
-
-    LOT(exposure) 관련 2개 위험 플래그만 시뮬레이션 중 동적으로 더합니다.
-    이렇게 하면 각 거래일마다 rolling/RSI를 처음부터 다시 계산하던 O(n^2) 병목을 제거합니다.
-    """
-    out = df.copy()
-    s = out["TRADE"].astype(float)
-    q = out["QQQ"].astype(float)
-    h = out["SMH"].astype(float)
-
-    for period in (5, 10, 20):
-        out[f"C_S_MA{period}"] = s.rolling(period, min_periods=max(3, period // 2)).mean()
-        out[f"C_Q_MA{period}"] = q.rolling(period, min_periods=max(3, period // 2)).mean()
-
-    # C4-BEAR: 구조적 약세장 판별용 장기 QQQ 지표. 오늘 주문에는 전일 값만 사용됩니다.
-    out["C_Q_MA50"] = q.rolling(50, min_periods=40).mean()
-    out["C_Q_MA100"] = q.rolling(100, min_periods=80).mean()
-    out["C_Q_MA200"] = q.rolling(200, min_periods=160).mean()
-    out["C_Q_MA200_SLOPE20"] = out["C_Q_MA200"].pct_change(20)
-    out["C_Q_HIGH252"] = q.rolling(252, min_periods=160).max()
-    out["C_Q_DD252"] = q / out["C_Q_HIGH252"] - 1.0
-    # 단기 폭락(예: 2020)과 장기 하락(예: 2022)을 구분하기 위해 4개 중 3개 이상일 때만 발동.
-    bear_votes = (
-        (q < out["C_Q_MA200"]).fillna(False).astype("int16")
-        + (out["C_Q_MA50"] < out["C_Q_MA200"]).fillna(False).astype("int16")
-        + (out["C_Q_MA200_SLOPE20"] < -0.005).fillna(False).astype("int16")
-        + (out["C_Q_DD252"] < -0.18).fillna(False).astype("int16")
-    )
-    out["C_BEAR_VOTES"] = bear_votes
-    out["C_STRUCT_BEAR"] = bear_votes >= 3
-
-    out["C_S_RSI14"] = calc_rsi(s, 14)
-    out["C_S_DIST10"] = s / out["C_S_MA10"] - 1
-    out["C_S_DIST20"] = s / out["C_S_MA20"] - 1
-    out["C_S_DIST10_D3"] = out["C_S_DIST10"].diff(3)
-    out["C_S_RSI_D3"] = out["C_S_RSI14"].diff(3)
-    out["C_Q_MA20_SLOPE5"] = out["C_Q_MA20"].pct_change(5)
-    out["C_SMH_R5"] = h.pct_change(5)
-    out["C_QQQ_R5"] = q.pct_change(5)
-    out["C_RS5"] = out["C_SMH_R5"] - out["C_QQQ_R5"]
-
-    # BEAR4: 구조약세 → 60% 회복 → 80% 회복 → 정상 100%의 4단계 복귀.
-    # 핵심은 MA200 완전 회복까지 기다리지 않고 '지속되는 중기 회복'이면 먼저 80%까지 복귀시키는 것입니다.
-    # 오늘 주문에는 전일 행만 사용하므로 look-ahead는 없습니다.
-    out["C_Q_MA50_SLOPE10"] = out["C_Q_MA50"].pct_change(10)
-    out["C_Q_MA100"] = q.rolling(100, min_periods=80).mean()
-
-    recover60_votes = (
-        (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
-        + (out["C_Q_MA20_SLOPE5"] > 0.0).fillna(False).astype("int16")
-        + (out["C_RS5"] > 0.0).fillna(False).astype("int16")
-    )
-    recover80_votes = (
-        (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
-        + (out["C_Q_MA50_SLOPE10"] > 0.0).fillna(False).astype("int16")
-        + (out["C_RS5"] > 0.0).fillna(False).astype("int16")
-        + (q > out["C_Q_MA100"]).fillna(False).astype("int16")
-    )
-    # 80% 복귀는 하루짜리 가짜반등을 피하려고 최근 4거래일 중 3일 이상 확인.
-    recover80_raw = recover80_votes >= 3
-    recover80_confirmed = recover80_raw.astype("int16").rolling(4, min_periods=3).sum() >= 3
-
-    normal_votes = (
-        (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
-        + (out["C_Q_MA50_SLOPE10"] > 0.0).fillna(False).astype("int16")
-        + (out["C_RS5"] > 0.0).fillna(False).astype("int16")
-        + (q > out["C_Q_MA100"]).fillna(False).astype("int16")
-    )
-    normal_raw = normal_votes >= 3
-    # NORMAL은 MA200 대신 중기회복의 지속성을 사용: 최근 6일 중 5일 + MA50 상승.
-    normal_confirmed = (normal_raw.astype("int16").rolling(6, min_periods=5).sum() >= 5) & (out["C_Q_MA50_SLOPE10"] > 0.0)
-
-    out["C_BEAR_RECOVER_VOTES"] = recover60_votes
-    out["C_BEAR_RECOVER80_VOTES"] = recover80_votes
-    out["C_BEAR_NORMAL_VOTES"] = normal_votes
-    out["C_BEAR_RECOVER60"] = recover60_votes >= 2
-    out["C_BEAR_RECOVER80"] = recover80_confirmed
-    out["C_BEAR_FAST_NORMAL"] = normal_confirmed
-
-    # 구조약세 신호가 남아 있어도 회복이 충분히 지속되면 80%/100%로 단계적으로 탈출합니다.
-    out["C_BEAR_PHASE"] = np.select(
-        [
-            out["C_BEAR_FAST_NORMAL"],
-            out["C_BEAR_RECOVER80"],
-            out["C_STRUCT_BEAR"] & out["C_BEAR_RECOVER60"],
-            out["C_STRUCT_BEAR"],
-        ],
-        ["NORMAL", "RECOVERY80", "RECOVERY60", "BEAR"],
-        default="NORMAL",
-    )
-    out["C_EFFECTIVE_BEAR"] = out["C_BEAR_PHASE"].eq("BEAR")
-    out["C_EFFECTIVE_RECOVERY"] = out["C_BEAR_PHASE"].isin(["RECOVERY60", "RECOVERY80"])
-
-    # LOT를 제외한 8개 정적 위험조건. bool을 int로 바꿔 행별 합산합니다.
-    conditions = [
-        out["C_Q_MA5"] < out["C_Q_MA10"],
-        out["C_Q_MA10"] < out["C_Q_MA20"],
-        out["C_Q_MA20_SLOPE5"] < 0,
-        out["C_RS5"] < 0,
-        s < out["C_S_MA10"],
-        s < out["C_S_MA20"],
-        out["C_S_DIST10_D3"] < 0,
-        out["C_S_RSI_D3"] < 0,
-    ]
-    risk = pd.Series(0, index=out.index, dtype="int16")
-    for cond in conditions:
-        risk = risk + cond.fillna(False).astype("int16")
-    out["C_STATIC_RISK"] = risk
-    return out
-
-
-def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
-    """V32-C4 BEAR4: CAGR 최우선. 구조약세는 방어하되 회복이 지속되면 60→80→100%로 빠르게 복귀."""
-    risk = int(prev_row.get("C_STATIC_RISK", 0))
-    exp = float(exposure_now)
-    # LOT 패널티를 C3보다 약하게 적용해 상승/반등 구간의 재진입을 막지 않습니다.
-    if exp > 0.35:
-        risk += 1
-    if exp > 0.60:
-        risk += 1
-
-    d3 = float(prev_row.get("C_S_DIST10_D3", np.nan))
-    rsi_d3 = float(prev_row.get("C_S_RSI_D3", np.nan))
-    q_slope = float(prev_row.get("C_Q_MA20_SLOPE5", np.nan))
-    rs5 = float(prev_row.get("C_RS5", np.nan))
-
-    rebound = (np.isfinite(d3) and d3 > 0.025 and np.isfinite(rsi_d3) and rsi_d3 > 1.5
-               and np.isfinite(q_slope) and q_slope >= -0.006 and np.isfinite(rs5) and rs5 > -0.015)
-    strong = (risk <= 3 and np.isfinite(q_slope) and q_slope >= 0 and np.isfinite(rs5) and rs5 >= 0)
-    phase = str(prev_row.get("C_BEAR_PHASE", "BEAR" if bool(prev_row.get("C_STRUCT_BEAR", False)) else "NORMAL"))
-    structural_bear = phase == "BEAR"
-    recovery60 = phase == "RECOVERY60"
-    recovery80 = phase == "RECOVERY80"
-
-    # BEAR 35% → RECOVERY60 60% → RECOVERY80 80% → NORMAL 원래 C4 순서.
-    if structural_bear:
-        return "C4-BEAR4 구조약세 2+3", (-0.060, -0.120), (0.02, 0.03), max(risk, 7)
-    if recovery60:
-        if rebound and exp < 0.45:
-            return "C4-BEAR4 회복60 반등 6+6", (0.015, -0.030), (0.06, 0.06), min(max(risk, 4), 6)
-        return "C4-BEAR4 회복60 5+6", (-0.015, -0.055), (0.05, 0.06), min(max(risk, 5), 7)
-    if recovery80:
-        if rebound and exp < 0.65:
-            return "C4-BEAR4 회복80 반등 8+8", (0.030, -0.015), (0.08, 0.08), min(max(risk, 3), 5)
-        if risk <= 5:
-            return "C4-BEAR4 회복80 7+7", (0.015, -0.035), (0.07, 0.07), min(max(risk, 4), 6)
-        return "C4-BEAR4 회복80 6+7", (-0.010, -0.045), (0.06, 0.07), min(max(risk, 5), 7)
-
-    if strong and exp < 0.55:
-        return "C4-강공격 9+9", (0.055, 0.000), (0.09, 0.09), risk
-    if rebound and exp < 0.55:
-        return "C4-반등공격 9+8", (0.040, -0.010), (0.09, 0.08), risk
-    if risk <= 4:
-        return "C4-공격 8+8", (0.025, -0.020), (0.08, 0.08), risk
-    if risk <= 6:
-        if exp >= 0.65:
-            return "C4-고LOT 4+5", (-0.030, -0.070), (0.04, 0.05), risk
-        return "C4-중립 6+7", (-0.010, -0.045), (0.06, 0.07), risk
-    if exp >= 0.60:
-        return "C4-강약세 3+4", (-0.055, -0.110), (0.03, 0.04), risk
-    return "C4-약세 5+6", (-0.035, -0.080), (0.05, 0.06), risk
-
 def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None):
     """V32-C 계획.
 
@@ -1033,28 +818,54 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
     add(float(exposure_now) > 0.15, "LOT>15%")
     add(float(exposure_now) > 0.30, "LOT>30%")
 
-    exp = float(exposure_now)
-    rebound = (np.isfinite(r["S_DIST10_D3"]) and r["S_DIST10_D3"] > 0.035 and
-               np.isfinite(r["S_RSI_D3"]) and r["S_RSI_D3"] > 3.0 and
-               np.isfinite(r["Q_MA20_SLOPE5"]) and r["Q_MA20_SLOPE5"] >= -0.004 and
-               np.isfinite(r["RS5"]) and r["RS5"] > -0.01)
-    strong = risk <= 2 and np.isfinite(r["Q_MA20_SLOPE5"]) and r["Q_MA20_SLOPE5"] > 0 and np.isfinite(r["RS5"]) and r["RS5"] > 0
-    if strong and exp < 0.30:
-        state, offsets, weights = "C3-강공격 8+8", (0.05, -0.005), (0.08, 0.08)
-    elif rebound and exp < 0.25:
-        state, offsets, weights = "C3-반등공격 8+7", (0.035, -0.015), (0.08, 0.07)
-    elif risk <= 4:
-        state, offsets, weights = "C3-정상 7+7", (0.02, -0.025), (0.07, 0.07)
-    elif risk <= 6:
-        if exp >= 0.45:
-            state, offsets, weights = "C3-LOT방어 3+5", (-0.04, -0.09), (0.03, 0.05)
+    # ------------------------------------------------------------
+    # 두 연구 트랙을 완전히 분리합니다.
+    # C-ORIGINAL: 실제 주문에서 관측한 4+4 / 5+5 / 6+6 / 7+7만 사용.
+    # C-ALPHA: ORIGINAL을 보존한 채 CAGR만 별도 연구하는 공격형 복사본(C4 계열).
+    # ------------------------------------------------------------
+    if soxl_track.startswith("C-ORIGINAL"):
+        if risk <= 2:
+            state = "ORIGINAL-공격 7+7"
+            offsets = (0.04, -0.01)
+            weights = (0.07, 0.07)
+        elif risk <= 4:
+            state = "ORIGINAL-정상 6+6"
+            offsets = (-0.01, -0.04)
+            weights = (0.06, 0.06)
+        elif risk <= 7:
+            state = "ORIGINAL-방어 5+5"
+            offsets = (-0.02, -0.04)
+            weights = (0.05, 0.05)
         else:
-            state, offsets, weights = "C3-선택방어 5+7", (-0.025, -0.065), (0.05, 0.07)
+            state = "ORIGINAL-강방어 4+4"
+            offsets = (-0.02, -0.06)
+            weights = (0.04, 0.04)
     else:
-        if exp >= 0.40:
-            state, offsets, weights = "C3-강방어 2+4", (-0.065, -0.13), (0.02, 0.04)
+        # C4 RETURN 계열을 ALPHA의 기준선으로만 유지합니다.
+        # ORIGINAL 채점에는 절대 사용하지 않습니다.
+        exp = float(exposure_now)
+        d3 = float(r["S_DIST10_D3"]) if np.isfinite(r["S_DIST10_D3"]) else np.nan
+        rsi_d3 = float(r["S_RSI_D3"]) if np.isfinite(r["S_RSI_D3"]) else np.nan
+        q_slope = float(r["Q_MA20_SLOPE5"]) if np.isfinite(r["Q_MA20_SLOPE5"]) else np.nan
+        rs5v = float(r["RS5"]) if np.isfinite(r["RS5"]) else np.nan
+        rebound = (np.isfinite(d3) and d3 > 0.025 and np.isfinite(rsi_d3) and rsi_d3 > 1.5
+                   and np.isfinite(q_slope) and q_slope >= -0.006 and np.isfinite(rs5v) and rs5v > -0.015)
+        strong = (risk <= 3 and np.isfinite(q_slope) and q_slope >= 0 and np.isfinite(rs5v) and rs5v >= 0)
+        if strong and exp < 0.55:
+            state, offsets, weights = "ALPHA-강공격 9+9", (0.055, 0.000), (0.09, 0.09)
+        elif rebound and exp < 0.55:
+            state, offsets, weights = "ALPHA-반등공격 9+8", (0.040, -0.010), (0.09, 0.08)
+        elif risk <= 4:
+            state, offsets, weights = "ALPHA-공격 8+8", (0.025, -0.020), (0.08, 0.08)
+        elif risk <= 6:
+            if exp >= 0.65:
+                state, offsets, weights = "ALPHA-고LOT 4+5", (-0.030, -0.070), (0.04, 0.05)
+            else:
+                state, offsets, weights = "ALPHA-중립 6+7", (-0.010, -0.045), (0.06, 0.07)
+        elif exp >= 0.60:
+            state, offsets, weights = "ALPHA-강약세 3+4", (-0.055, -0.110), (0.03, 0.04)
         else:
-            state, offsets, weights = "C3-약세 4+5", (-0.045, -0.09), (0.04, 0.05)
+            state, offsets, weights = "ALPHA-약세 5+6", (-0.035, -0.080), (0.05, 0.06)
 
     return {
         "state": state,
@@ -1082,7 +893,7 @@ def simulate_soxl_reverse(
     fx_cost_pct=0.0,
     deployment_ratio=1.0,
 ):
-    """SOXL V32-C 백테스트 엔진.
+    """SOXL DUAL 백테스트 엔진.
 
     - C타입: SOXL 이평/RSI + LOT + QQQ 이평구조 + SMH/QQQ 5일 상대강도
     - VIX 제외
@@ -1101,6 +912,9 @@ def simulate_soxl_reverse(
     close = df["TRADE"].astype(float).copy()
     qqq = df["QQQ"].astype(float).copy()
     smh = df["SMH"].astype(float).copy()
+    feat = _soxl_c_features(close, qqq, smh)
+    feat = feat.reindex(df.index)
+
     for i, dt in enumerate(df.index):
         px = float(close.iloc[i])
         if not np.isfinite(px) or px <= 0:
@@ -1110,17 +924,18 @@ def simulate_soxl_reverse(
         remaining = []
         for lot in lots:
             age = (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days
-            # C4 RETURN 회전 엔진: 고LOT는 빠르게 회수하고, 낮은 LOT/강한 장에서는 목표수익을 충분히 유지합니다.
-            mark_before = sum(x["qty"] * px for x in lots)
-            eq_before = cash + mark_before
-            exp_before = mark_before / eq_before if eq_before > 0 else 0.0
             tp_eff = float(take_profit)
-            if exp_before >= 0.75:
-                tp_eff = min(tp_eff, 0.025)
-            elif exp_before >= 0.60:
-                tp_eff = min(tp_eff, 0.035)
-            elif exp_before >= 0.45:
-                tp_eff = min(tp_eff, 0.045)
+            if soxl_track.startswith("C-ALPHA"):
+                # ALPHA 기준선(C4)의 회전 규칙. ORIGINAL에는 적용하지 않음.
+                mark_before = sum(x["qty"] * px for x in lots)
+                eq_before = cash + mark_before
+                exp_before = mark_before / eq_before if eq_before > 0 else 0.0
+                if exp_before >= 0.75:
+                    tp_eff = min(tp_eff, 0.025)
+                elif exp_before >= 0.60:
+                    tp_eff = min(tp_eff, 0.035)
+                elif exp_before >= 0.45:
+                    tp_eff = min(tp_eff, 0.045)
             target = lot["price"] * (1 + tp_eff)
             hit_tp = px >= target
             forced = max_hold_days is not None and age >= int(max_hold_days)
@@ -1153,77 +968,17 @@ def simulate_soxl_reverse(
             invested_now = mark_value
             exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
 
-            prev_row = df.iloc[i - 1]
-            prev = float(close.iloc[i - 1])
-
-            # BEAR4 노출 캡: BEAR 35% / RECOVERY60 60% / RECOVERY80 80% / NORMAL 원래 운용률.
-            # 당일 QQQ/SOXL 미래정보는 사용하지 않습니다. 오래된 LOT부터 유지하고 최근 LOT부터 줄입니다.
-            phase = str(prev_row.get("C_BEAR_PHASE", "BEAR" if bool(prev_row.get("C_STRUCT_BEAR", False)) else "NORMAL"))
-            structural_bear = phase == "BEAR"
-            recovery60 = phase == "RECOVERY60"
-            recovery80 = phase == "RECOVERY80"
-            phase_cap = 0.35 if structural_bear else (0.60 if recovery60 else (0.80 if recovery80 else float(deployment_ratio)))
-            bear_cap = min(float(deployment_ratio), phase_cap)
-            if (structural_bear or recovery60 or recovery80) and exposure_now > bear_cap + 1e-12 and lots:
-                target_value = equity_now * bear_cap
-                excess = max(0.0, invested_now - target_value)
-                new_lots = []
-                # 최근 진입 LOT부터 축소하여 오래 버틴 저가 LOT는 최대한 보존
-                for lot in reversed(lots):
-                    if excess <= 1e-9:
-                        new_lots.append(lot)
-                        continue
-                    lot_value = lot["qty"] * px
-                    sell_value = min(lot_value, excess)
-                    sell_qty = sell_value / px if px > 0 else 0.0
-                    if sell_qty > 0:
-                        sell_px = px * (1 - slippage_pct)
-                        frac = min(1.0, sell_qty / lot["qty"])
-                        cost_part = lot["cash_cost"] * frac
-                        proceeds = sell_qty * sell_px * (1 - fee_pct - fx_cost_pct)
-                        cash += proceeds
-                        trades.append({
-                            "신호일": lot["date"], "매도일": pd.Timestamp(dt),
-                            "평균매수가": lot["price"], "매도가": sell_px,
-                            "수익률": proceeds / cost_part - 1 if cost_part > 0 else 0.0,
-                            "실현손익": proceeds - cost_part,
-                            "보유일수": (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days,
-                            "매수횟수": 1, "청산사유": "구조약세축소" if structural_bear else ("회복60노출조정" if recovery60 else "회복80노출조정"),
-                            "진입상태": lot.get("state", ""),
-                        })
-                        remain_frac = 1.0 - frac
-                        if remain_frac > 1e-9:
-                            kept = dict(lot)
-                            kept["qty"] = lot["qty"] * remain_frac
-                            kept["cash_cost"] = lot["cash_cost"] * remain_frac
-                            new_lots.append(kept)
-                        excess -= sell_value
-                    else:
-                        new_lots.append(lot)
-                lots = list(reversed(new_lots))
-                mark_value = sum(lot["qty"] * px for lot in lots)
-                equity_now = cash + mark_value
-                invested_now = mark_value
-                exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
-                max_invested = equity_now * bear_cap
-            else:
-                max_invested = equity_now * bear_cap
-
-            if "C_STATIC_RISK" in df.columns:
-                state, offsets, weights, risk_score = _soxl_c_plan_from_precomputed(prev_row, exposure_now)
-            else:
-                # 호환 폴백: 사전계산 열이 없는 외부 호출도 정상 동작
-                plan = get_soxl_loc_plan(
-                    close.iloc[:i],
-                    exposure_now=exposure_now,
-                    base_unit=base_unit,
-                    qqq_series=qqq.iloc[:i],
-                    smh_series=smh.iloc[:i],
-                )
-                state = plan["state"]
-                offsets = plan["offsets"]
-                weights = plan["weights"]
-                risk_score = int(plan.get("risk_score", -1))
+            plan = get_soxl_loc_plan(
+                close.iloc[:i],
+                exposure_now=exposure_now,
+                base_unit=base_unit,
+                qqq_series=qqq.iloc[:i],
+                smh_series=smh.iloc[:i],
+            )
+            prev = float(plan["prev_close"])
+            state = plan["state"]
+            offsets = plan["offsets"]
+            weights = plan["weights"]
 
             for off, weight in zip(offsets, weights):
                 limit_px = prev * (1 + float(off))
@@ -1245,7 +1000,7 @@ def simulate_soxl_reverse(
                     "cash_cost": budget,
                     "state": state,
                     "loc_offset": float(off),
-                    "risk_score": int(risk_score),
+                    "risk_score": int(plan.get("risk_score", -1)),
                 })
                 invested_now += qty * px
 
@@ -1263,7 +1018,7 @@ def simulate_soxl_reverse(
         columns=["Date", "Equity", "Cash", "Shares", "TradePrice", "Exposure"],
     ).set_index("Date")
     eq["SignalPrice"] = eq["TradePrice"]
-    eq["Drawdown"] = eq["Equity"] / eq["Equity"].cummax() - 1
+    eq["Drawdown"] = 1 - eq["TradePrice"] / eq["TradePrice"].cummax()
 
     final_value = float(eq["Equity"].iloc[-1])
     total_return = final_value / float(initial_cash) - 1
@@ -1548,8 +1303,7 @@ try:
     # ------------------------------------------------------------
     if market.startswith("🇺🇸"):
         symbols = [us_product, "QQQ"] if us_product == "TQQQ" else ["SOXL", "QQQ", "SMH"]
-        with st.spinner("가격 데이터를 불러오는 중입니다..."):
-            close = download_close(symbols).dropna()
+        close = download_close(symbols).dropna()
 
         modes = [
             {
@@ -1561,8 +1315,7 @@ try:
         ]
     else:
         symbols = ["233740.KS", "229200.KS"]
-        with st.spinner("가격 데이터를 불러오는 중입니다..."):
-            close = download_close(symbols).dropna()
+        close = download_close(symbols).dropna()
 
         modes = [
             {
@@ -1614,18 +1367,19 @@ try:
     # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
     # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
     if market.startswith("🇺🇸") and us_product == "SOXL":
-        # V32-C4 BEAR3: CAGR을 끌어올리기 위해 회전율/재진입을 우선 탐색합니다.
-        # 상태별 매수비중은 C4 템플릿으로 고정하고 익절/보유기간/총투입한도를 비교합니다.
+        # V32-C의 4+4/5+5/6+6/7+7은 고정 템플릿입니다.
+        # 매수비중 자체를 다시 최적화하지 않고 익절/보유기간/총투입한도만 비교합니다.
         effective_buy_steps = [0.06]
-        effective_take_profits = [0.025, 0.035, 0.045, 0.06, 0.08]
-        effective_max_holds = [45, 90, 180]
+        effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
+        effective_max_holds = [45, 60, 90, 120, 180]
         filter_candidates = [(None, None)]
         allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
         loc_buy_ratios = [1.0]
-        deployment_ratios = [0.90, 1.00]
+        deployment_ratios = [0.70, 0.80, 0.90, 1.00]
 
     current_params = (
         market,
+        soxl_track,
         float(investment),
         anchor_mode,
         tuple(effective_buy_steps),
@@ -1756,11 +1510,16 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C4 BEAR4 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL DUAL 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
     st.subheader("🏆 전략 자동 비교")
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        if soxl_track.startswith("C-ORIGINAL"):
+            st.caption("채점 우선순위: 실제 주문 재현 → 8월 블라인드 → 장기 CAGR/MDD. 9+9/8+8 같은 ALPHA 주문은 사용하지 않습니다.")
+        else:
+            st.caption("평가 우선순위: 2016~2025 CAGR → 연도별 병목 확인. ORIGINAL 로직과 점수는 별도 보존합니다.")
 
     if run_backtest:
         checkpoint_state = None
@@ -1782,9 +1541,9 @@ try:
         # 중간에 멈출 수 있습니다. 조합이 많을 때는 1차 넓은 탐색 -> 2차 상위권 정밀탐색으로 줄입니다.
         # 속도 우선 탐색: 큰 그리드는 대표 후보를 먼저 본 뒤 상위권 주변만 정밀 확인합니다.
         # SOXL 기본 그리드처럼 1,500개 안팎은 전수 계산하되, 그 이상은 2단계 탐색을 사용합니다.
-        exhaustive_limit = 120
-        stage1_limit = 36
-        stage2_limit = 24
+        exhaustive_limit = 1500
+        stage1_limit = 420
+        stage2_limit = 220
 
         # 각 운용방식의 데이터프레임은 한 번만 계산해 재사용합니다.
         prepared = []
@@ -1832,8 +1591,6 @@ try:
             for p in ma_periods:
                 required_cols.append(f"TREND_OK_{int(p)}")
             df = df.dropna(subset=required_cols)
-            if market.startswith("🇺🇸") and us_product == "SOXL":
-                df = _attach_soxl_c_precomputed(df)
             prepared.append((mode, df))
 
         # 조합을 인덱스로 만들어 1차/2차 탐색에서 동일한 조건을 중복 계산하지 않습니다.
@@ -1936,7 +1693,7 @@ try:
                 sell_exec_name = "종가 매도"
                 exec_name = "종가"
             strategy_name = (
-                f"{mode['mode']} | C3 공격/선택방어 자동비중 / {tp:.0%} 블록익절 / "
+                f"{mode['mode']} | C타입 4/5/6/7% 자동비중 / {tp:.0%} 블록익절 / "
                 f"운용 {deployment_ratio:.0%} / QQQ+SMH+SOXL+LOT / 최대 {hold_name} / {fname} / {exec_name}" if market.startswith("🇺🇸") and us_product == "SOXL" else f"운용 {deployment_ratio:.0%} / 자동비중#{wi + 1} / 최대 {hold_name} / {fname} / {exec_name}"
             )
 
@@ -1981,10 +1738,9 @@ try:
                 "최대 투자금 사용률": sim["max_exposure"],
                 "실전기준통과": eligible,
                 "실전점수": risk_score,
-                "CAGR55달성": bool(sim["cagr"] >= 0.55),
             }
             results.append(row)
-            scored.append((((1.0 if float(sim["cagr"]) >= 0.55 else 0.0), (float(sim["mdd"]) if float(sim["cagr"]) >= 0.55 else float(sim["cagr"])), float(sim["cagr"]), float(sim["final_value"])), job))
+            scored.append(((float(sim["cagr"]), float(sim["final_value"]), -abs(float(sim["mdd"]))), job))
             tested.add(job)
             live_rank = (float(sim["cagr"]), float(sim["final_value"]), -abs(float(sim["mdd"])))
             current_rank = (live_best["score"], live_best["value"], -999.0)
@@ -2006,7 +1762,7 @@ try:
 
         with st.spinner("백테스트 계산 중..."):
             if total_grid <= exhaustive_limit:
-                status.caption(f"고속 모드: 핵심 후보 {total_grid:,}개만 계산합니다.")
+                status.caption(f"전체 조합 {total_grid:,}개를 정밀 계산합니다.")
                 if checkpoint_state:
                     status.caption(f"💾 {len(tested):,}개 완료 지점부터 이어서 계산합니다.")
                 for i, job in enumerate(all_jobs, 1):
@@ -2163,12 +1919,6 @@ try:
         vdf["SIGNAL"] = close[validation_mode["signal_symbol"]]
         vdf["TRADE"] = close[validation_mode["trade_symbol"]]
         vdf["REF"] = close[validation_mode["ref_symbol"]]
-        # SOXL C타입 블라인드 검증도 학습/탐색 구간과 동일하게 QQQ·SMH를 반드시 포함합니다.
-        if market.startswith("🇺🇸") and us_product == "SOXL":
-            if "QQQ" not in close.columns or "SMH" not in close.columns:
-                raise ValueError("V32-C SOXL 블라인드 검증에는 QQQ와 SMH 일봉이 필요합니다.")
-            vdf["QQQ"] = close["QQQ"]
-            vdf["SMH"] = close["SMH"]
         vdf = vdf.dropna()
         # 사용자가 선택한 시작/종료 범위는 존중하되, 최적화 때만 2025-12-31에서 잘랐습니다.
         vdf = apply_backtest_period(
@@ -2191,9 +1941,6 @@ try:
             req = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
             req += [f"TREND_OK_{int(p_ma)}" for p_ma in ma_periods]
             vdf = vdf.dropna(subset=req)
-            if market.startswith("🇺🇸") and us_product == "SOXL":
-                # TURBO용 정적 C타입 지표를 블라인드 검증 데이터에도 동일하게 사전계산합니다.
-                vdf = _attach_soxl_c_precomputed(vdf)
 
         if not vdf.empty and (vdf.index >= pd.Timestamp("2026-01-01")).any():
             fixed_sim = simulate(
@@ -2302,177 +2049,6 @@ try:
         f"{filter_name(best_ma_period, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
     )
-
-    # ------------------------------------------------------------
-    # C4 연도별 성과 분석
-    # ------------------------------------------------------------
-    if market.startswith("🇺🇸") and us_product == "SOXL":
-        eq_year = best.get("equity")
-        trades_year = best.get("trades")
-        if isinstance(eq_year, pd.DataFrame) and not eq_year.empty and "Equity" in eq_year.columns:
-            eq_year = eq_year.copy().sort_index()
-            eq_year.index = pd.to_datetime(eq_year.index)
-            annual_rows = []
-            years = sorted(eq_year.index.year.unique())
-
-            for yr in years:
-                ydf = eq_year.loc[eq_year.index.year == int(yr)].copy()
-                if ydf.empty:
-                    continue
-
-                first_idx = ydf.index[0]
-                prev = eq_year.loc[eq_year.index < first_idx]
-                start_equity = float(prev["Equity"].iloc[-1]) if not prev.empty else float(ydf["Equity"].iloc[0])
-                end_equity = float(ydf["Equity"].iloc[-1])
-                year_return = end_equity / start_equity - 1.0 if start_equity > 0 else np.nan
-
-                # 연초 자산을 직전 고점 후보로 포함한 해당 연도 MDD
-                dd_base = pd.concat([
-                    pd.Series([start_equity], index=[first_idx - pd.Timedelta(days=1)]),
-                    ydf["Equity"],
-                ])
-                year_peak = dd_base.cummax()
-                year_mdd = float((dd_base / year_peak - 1.0).min())
-
-                avg_exp = float(ydf["Exposure"].mean()) if "Exposure" in ydf.columns else np.nan
-                max_exp = float(ydf["Exposure"].max()) if "Exposure" in ydf.columns else np.nan
-
-                trade_count = 0
-                if isinstance(trades_year, pd.DataFrame) and not trades_year.empty:
-                    if "매도일" in trades_year.columns:
-                        sell_dates = pd.to_datetime(trades_year["매도일"], errors="coerce")
-                        trade_count = int((sell_dates.dt.year == int(yr)).sum())
-
-                annual_rows.append({
-                    "연도": int(yr),
-                    "연초자산": start_equity,
-                    "연말/현재자산": end_equity,
-                    "연간수익률": float(year_return),
-                    "연도 MDD": year_mdd,
-                    "평균 투자율": avg_exp,
-                    "최대 투자율": max_exp,
-                    "완료매매": trade_count,
-                })
-
-            if annual_rows:
-                annual = pd.DataFrame(annual_rows)
-                st.subheader("📅 C4 연도별 성과 분석")
-                annual_view = annual.copy()
-                annual_view["연초자산"] = annual_view["연초자산"].map(lambda x: f"{currency}{x:,.0f}")
-                annual_view["연말/현재자산"] = annual_view["연말/현재자산"].map(lambda x: f"{currency}{x:,.0f}")
-                annual_view["연간수익률"] = annual_view["연간수익률"].map(lambda x: f"{x:.1%}")
-                annual_view["연도 MDD"] = annual_view["연도 MDD"].map(lambda x: f"{x:.1%}")
-                annual_view["평균 투자율"] = annual_view["평균 투자율"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-                annual_view["최대 투자율"] = annual_view["최대 투자율"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-                st.dataframe(annual_view, use_container_width=True, hide_index=True)
-
-                best_y = annual.loc[annual["연간수익률"].idxmax()]
-                worst_y = annual.loc[annual["연간수익률"].idxmin()]
-                loss_years = annual.loc[annual["연간수익률"] < 0].copy()
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("최고 수익 연도", str(int(best_y["연도"])), f"{best_y['연간수익률']:.1%}")
-                c2.metric("최저 수익 연도", str(int(worst_y["연도"])), f"{worst_y['연간수익률']:.1%}")
-                c3.metric("손실 연도 수", f"{len(loss_years)}개", f"전체 {len(annual)}개")
-
-                if not loss_years.empty:
-                    loss_txt = ", ".join(
-                        f"{int(r['연도'])} {r['연간수익률']:.1%}"
-                        for _, r in loss_years.sort_values("연간수익률").iterrows()
-                    )
-                    st.warning(f"📉 CAGR을 깎은 손실 연도: {loss_txt}")
-                else:
-                    st.success("✅ 이 백테스트 구간에는 연간 기준 손실 연도가 없습니다.")
-
-                # 3년 이동 기하수익률: 특정 몇 년이 전체 CAGR을 깎는지 보조 진단
-                if len(annual) >= 3:
-                    rolling_rows = []
-                    vals = annual["연간수익률"].to_numpy(dtype=float)
-                    yrs = annual["연도"].to_numpy(dtype=int)
-                    for i in range(2, len(annual)):
-                        gross = float(np.prod(1.0 + vals[i-2:i+1]))
-                        ann = gross ** (1.0/3.0) - 1.0 if gross > 0 else np.nan
-                        rolling_rows.append({
-                            "3년구간": f"{yrs[i-2]}~{yrs[i]}",
-                            "3년 연환산": ann,
-                        })
-                    rolling = pd.DataFrame(rolling_rows).sort_values("3년 연환산")
-                    st.caption("🔬 가장 약한 3년 구간 (CAGR 병목 확인)")
-                    rv = rolling.head(5).copy()
-                    rv["3년 연환산"] = rv["3년 연환산"].map(lambda x: f"{x:.1%}")
-                    st.dataframe(rv, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------
-    # 최대낙폭(MDD) 원인 구간 진단
-    # ------------------------------------------------------------
-    if market.startswith("🇺🇸") and us_product == "SOXL":
-        eq_diag = best.get("equity")
-        if isinstance(eq_diag, pd.DataFrame) and not eq_diag.empty and "Equity" in eq_diag.columns:
-            eq_diag = eq_diag.copy().sort_index()
-            running_peak = eq_diag["Equity"].cummax()
-            dd_series = eq_diag["Equity"] / running_peak - 1.0
-            trough_date = pd.Timestamp(dd_series.idxmin())
-            trough_pos = eq_diag.index.get_loc(trough_date)
-            peak_slice = eq_diag.iloc[:trough_pos + 1]["Equity"]
-            peak_date = pd.Timestamp(peak_slice.idxmax())
-            peak_equity = float(eq_diag.loc[peak_date, "Equity"])
-            trough_equity = float(eq_diag.loc[trough_date, "Equity"])
-            mdd_value = trough_equity / peak_equity - 1.0 if peak_equity > 0 else np.nan
-
-            # 고점 회복일: 저점 이후 처음으로 이전 고점 자산을 회복한 날
-            after_trough = eq_diag.loc[trough_date:]
-            recovered = after_trough[after_trough["Equity"] >= peak_equity]
-            recovery_date = pd.Timestamp(recovered.index[0]) if not recovered.empty else None
-
-            peak_exp = float(eq_diag.loc[peak_date, "Exposure"]) if "Exposure" in eq_diag.columns else np.nan
-            trough_exp = float(eq_diag.loc[trough_date, "Exposure"]) if "Exposure" in eq_diag.columns else np.nan
-            peak_px = float(eq_diag.loc[peak_date, "TradePrice"]) if "TradePrice" in eq_diag.columns else np.nan
-            trough_px = float(eq_diag.loc[trough_date, "TradePrice"]) if "TradePrice" in eq_diag.columns else np.nan
-            px_dd = trough_px / peak_px - 1.0 if np.isfinite(peak_px) and peak_px > 0 else np.nan
-            fall_days = int((trough_date - peak_date).days)
-            recovery_text = f"{recovery_date:%Y-%m-%d}" if recovery_date is not None else "백테스트 종료까지 미회복"
-            recovery_days = int((recovery_date - peak_date).days) if recovery_date is not None else None
-
-            st.subheader("🔎 C4 최대낙폭 구간")
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("직전 자산고점", f"{peak_date:%Y-%m-%d}", f"${peak_equity:,.0f}")
-            d2.metric("MDD 저점", f"{trough_date:%Y-%m-%d}", f"${trough_equity:,.0f}")
-            d3.metric("최대낙폭", f"{mdd_value:.1%}", f"{fall_days}일")
-            d4.metric("SOXL 동기간", f"{px_dd:.1%}" if np.isfinite(px_dd) else "-")
-
-            if recovery_date is not None:
-                st.caption(
-                    f"고점 회복일: **{recovery_text}** · 고점→회복 {recovery_days}일 · "
-                    f"고점 투자율 {peak_exp:.1%} → 저점 투자율 {trough_exp:.1%}"
-                )
-            else:
-                st.caption(
-                    f"고점 회복: **{recovery_text}** · "
-                    f"고점 투자율 {peak_exp:.1%} → 저점 투자율 {trough_exp:.1%}"
-                )
-
-            # 저점 전후 10거래일씩을 표로 보여서 LOT 누적/회복 과정을 바로 확인
-            left = max(0, trough_pos - 10)
-            right = min(len(eq_diag), trough_pos + 11)
-            around = eq_diag.iloc[left:right].copy()
-            around["Drawdown"] = around["Equity"] / around["Equity"].cummax().combine_first(running_peak.loc[around.index]) - 1.0
-            # 위 계산의 로컬 peak 왜곡 방지를 위해 전체기간 running peak로 다시 계산
-            around["Drawdown"] = eq_diag.loc[around.index, "Equity"] / running_peak.loc[around.index] - 1.0
-            cols = [c for c in ["Equity", "Drawdown", "Exposure", "TradePrice", "Cash"] if c in around.columns]
-            around_view = around[cols].copy()
-            around_view.index = pd.to_datetime(around_view.index).strftime("%Y-%m-%d")
-            if "Equity" in around_view.columns:
-                around_view["Equity"] = around_view["Equity"].map(lambda x: f"${x:,.0f}")
-            if "Cash" in around_view.columns:
-                around_view["Cash"] = around_view["Cash"].map(lambda x: f"${x:,.0f}")
-            if "Drawdown" in around_view.columns:
-                around_view["Drawdown"] = around_view["Drawdown"].map(lambda x: f"{x:.1%}")
-            if "Exposure" in around_view.columns:
-                around_view["Exposure"] = around_view["Exposure"].map(lambda x: f"{x:.1%}")
-            if "TradePrice" in around_view.columns:
-                around_view["TradePrice"] = around_view["TradePrice"].map(lambda x: f"${x:,.2f}")
-            st.dataframe(around_view, use_container_width=True)
-            st.caption("↑ MDD 저점 전후 10거래일. 투자율이 급격히 올라가면서 낙폭이 커지는지 확인하는 진단표입니다.")
 
     st.subheader("🧪 기간별 전략 검증 가이드")
     st.caption(
