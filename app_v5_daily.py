@@ -22,7 +22,7 @@ st.set_page_config(
 
 st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C SAFE BOOT · QQQ + SMH 상대강도 · VIX 제외")
+st.caption("V32-C TURBO FIX · QQQ + SMH 상대강도 · VIX 제외")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
@@ -1988,6 +1988,12 @@ try:
         vdf["SIGNAL"] = close[validation_mode["signal_symbol"]]
         vdf["TRADE"] = close[validation_mode["trade_symbol"]]
         vdf["REF"] = close[validation_mode["ref_symbol"]]
+        # SOXL C타입 블라인드 검증도 학습/탐색 구간과 동일하게 QQQ·SMH를 반드시 포함합니다.
+        if market.startswith("🇺🇸") and us_product == "SOXL":
+            if "QQQ" not in close.columns or "SMH" not in close.columns:
+                raise ValueError("V32-C SOXL 블라인드 검증에는 QQQ와 SMH 일봉이 필요합니다.")
+            vdf["QQQ"] = close["QQQ"]
+            vdf["SMH"] = close["SMH"]
         vdf = vdf.dropna()
         # 사용자가 선택한 시작/종료 범위는 존중하되, 최적화 때만 2025-12-31에서 잘랐습니다.
         vdf = apply_backtest_period(
@@ -2010,6 +2016,9 @@ try:
             req = ["SIGNAL", "TRADE", "REF", "ANCHOR", "RSI14"]
             req += [f"TREND_OK_{int(p_ma)}" for p_ma in ma_periods]
             vdf = vdf.dropna(subset=req)
+            if market.startswith("🇺🇸") and us_product == "SOXL":
+                # TURBO용 정적 C타입 지표를 블라인드 검증 데이터에도 동일하게 사전계산합니다.
+                vdf = _attach_soxl_c_precomputed(vdf)
 
         if not vdf.empty and (vdf.index >= pd.Timestamp("2026-01-01")).any():
             fixed_sim = simulate(
