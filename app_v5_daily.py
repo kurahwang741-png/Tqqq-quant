@@ -1305,6 +1305,30 @@ try:
         symbols = [us_product, "QQQ"] if us_product == "TQQQ" else ["SOXL", "QQQ", "SMH"]
         close = download_close(symbols).dropna()
 
+        # SOXL 연구용 원천 일봉을 한 번 저장해두면 이후에는 ChatGPT 쪽에서
+        # Streamlit 재실행 없이 같은 데이터로 C-ORIGINAL / C-ALPHA를 반복 검증할 수 있습니다.
+        if us_product == "SOXL":
+            export_df = close[["SOXL", "QQQ", "SMH"]].copy()
+            export_df.index.name = "Date"
+            export_csv = export_df.reset_index().to_csv(index=False).encode("utf-8-sig")
+            with st.expander("📦 SOXL·QQQ·SMH 연구 데이터 저장", expanded=False):
+                st.caption(
+                    "이 CSV를 한 번 저장해두면 이후 백테스트는 같은 가격데이터로 바로 반복할 수 있습니다. "
+                    "원본 일봉만 담고 전략 결과나 8월 주문 정답은 포함하지 않습니다."
+                )
+                st.download_button(
+                    "⬇️ SOXL_QQQ_SMH 일봉 CSV 받기",
+                    data=export_csv,
+                    file_name="SOXL_QQQ_SMH_daily.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_soxl_research_csv",
+                )
+                st.caption(
+                    f"데이터 범위: {export_df.index.min().date()} ~ {export_df.index.max().date()} · "
+                    f"{len(export_df):,} 거래일"
+                )
+
         modes = [
             {
                  "mode": f"{us_product} 신호 → {us_product} 매수",
@@ -2303,6 +2327,19 @@ try:
                     st.dataframe(detail, use_container_width=True, hide_index=True)
         else:
             st.warning("전체 연도 워크포워드에 사용할 데이터가 충분하지 않습니다.")
+
+    # C-ORIGINAL은 원본 주문 역추적 전용입니다. 기존 MA/운용률/배분/혼합 최적화 화면은
+    # 결과를 혼동시키므로 여기서 종료하고 고정 로직 성과만 표시합니다.
+    if market.startswith("🇺🇸") and us_product == "SOXL" and soxl_track.startswith("C-ORIGINAL"):
+        st.subheader("🎯 C-ORIGINAL 고정 로직 결과")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("최종자산", f"{currency}{best['final_value']:,.0f}")
+        c2.metric("CAGR", f"{best['cagr']:.1%}")
+        c3.metric("MDD", f"{best['mdd']:.1%}")
+        c4.metric("완료매매", f"{int(best.get('trade_count', 0)):,}회")
+        st.caption("고정 C-ORIGINAL 1개만 계산한 결과입니다. 이동평균선·총자금 운용률·매수비중·종가/LOC 혼합 최적화는 실행하지 않습니다.")
+        st.info("다음 단계는 CAGR 최적화가 아니라 3~7월 실제 SOXL 주문과 날짜별 예측 주문을 채점하는 것입니다. 8월 데이터는 블라인드 검증용으로 유지합니다.")
+        st.stop()
 
     st.subheader("📈 이동평균선 방식 비교")
     ma_summary = (
