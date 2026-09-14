@@ -1367,15 +1367,20 @@ try:
     # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
     # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
     if market.startswith("🇺🇸") and us_product == "SOXL":
-        # V32-C의 4+4/5+5/6+6/7+7은 고정 템플릿입니다.
-        # 매수비중 자체를 다시 최적화하지 않고 익절/보유기간/총투입한도만 비교합니다.
+        # C-ORIGINAL은 최적화가 아니라 원본 주문 재현이 목적이므로 단 하나의 고정 후보만 실행합니다.
+        # C-ALPHA에서만 여러 조합을 탐색합니다.
         effective_buy_steps = [0.06]
-        effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
-        effective_max_holds = [45, 60, 90, 120, 180]
         filter_candidates = [(None, None)]
         allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
         loc_buy_ratios = [1.0]
-        deployment_ratios = [0.70, 0.80, 0.90, 1.00]
+        if soxl_track.startswith("C-ORIGINAL"):
+            effective_take_profits = [0.06]
+            effective_max_holds = [180]
+            deployment_ratios = [1.00]
+        else:
+            effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
+            effective_max_holds = [45, 60, 90, 120, 180]
+            deployment_ratios = [0.70, 0.80, 0.90, 1.00]
 
     current_params = (
         market,
@@ -1517,7 +1522,7 @@ try:
     st.subheader("🏆 전략 자동 비교")
     if market.startswith("🇺🇸") and us_product == "SOXL":
         if soxl_track.startswith("C-ORIGINAL"):
-            st.caption("채점 우선순위: 실제 주문 재현 → 8월 블라인드 → 장기 CAGR/MDD. 9+9/8+8 같은 ALPHA 주문은 사용하지 않습니다.")
+            st.caption("C-ORIGINAL은 최적화 없이 고정 로직 1개만 즉시 계산합니다. 실제 주문 재현 → 8월 블라인드 → 장기 CAGR/MDD 순으로 평가합니다.")
         else:
             st.caption("평가 우선순위: 2016~2025 CAGR → 연도별 병목 확인. ORIGINAL 로직과 점수는 별도 보존합니다.")
 
