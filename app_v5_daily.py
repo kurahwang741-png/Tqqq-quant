@@ -15,14 +15,14 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32-C4 YEARLY",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C4 YEARLY")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C4 YEARLY · C4 원본 로직 · 연도별 CAGR 원인 분석")
+st.caption("V32-C4 BEAR · C4 상승장 로직 유지 · 구조적 장기 약세장에서만 방어 스위치")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
@@ -822,6 +822,23 @@ def _attach_soxl_c_precomputed(df):
         out[f"C_S_MA{period}"] = s.rolling(period, min_periods=max(3, period // 2)).mean()
         out[f"C_Q_MA{period}"] = q.rolling(period, min_periods=max(3, period // 2)).mean()
 
+    # C4-BEAR: 구조적 약세장 판별용 장기 QQQ 지표. 오늘 주문에는 전일 값만 사용됩니다.
+    out["C_Q_MA50"] = q.rolling(50, min_periods=40).mean()
+    out["C_Q_MA100"] = q.rolling(100, min_periods=80).mean()
+    out["C_Q_MA200"] = q.rolling(200, min_periods=160).mean()
+    out["C_Q_MA200_SLOPE20"] = out["C_Q_MA200"].pct_change(20)
+    out["C_Q_HIGH252"] = q.rolling(252, min_periods=160).max()
+    out["C_Q_DD252"] = q / out["C_Q_HIGH252"] - 1.0
+    # 단기 폭락(예: 2020)과 장기 하락(예: 2022)을 구분하기 위해 4개 중 3개 이상일 때만 발동.
+    bear_votes = (
+        (q < out["C_Q_MA200"]).fillna(False).astype("int16")
+        + (out["C_Q_MA50"] < out["C_Q_MA200"]).fillna(False).astype("int16")
+        + (out["C_Q_MA200_SLOPE20"] < -0.005).fillna(False).astype("int16")
+        + (out["C_Q_DD252"] < -0.18).fillna(False).astype("int16")
+    )
+    out["C_BEAR_VOTES"] = bear_votes
+    out["C_STRUCT_BEAR"] = bear_votes >= 3
+
     out["C_S_RSI14"] = calc_rsi(s, 14)
     out["C_S_DIST10"] = s / out["C_S_MA10"] - 1
     out["C_S_DIST20"] = s / out["C_S_MA20"] - 1
@@ -851,7 +868,7 @@ def _attach_soxl_c_precomputed(df):
 
 
 def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
-    """V32-C4 RETURN: CAGR 최우선. 상승/반등에서는 체결과 재진입을 빠르게, 약세에서만 제한 방어."""
+    """V32-C4 BEAR: CAGR 최우선. 상승/반등에서는 체결과 재진입을 빠르게, 약세에서만 제한 방어."""
     risk = int(prev_row.get("C_STATIC_RISK", 0))
     exp = float(exposure_now)
     # LOT 패널티를 C3보다 약하게 적용해 상승/반등 구간의 재진입을 막지 않습니다.
@@ -868,6 +885,12 @@ def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
     rebound = (np.isfinite(d3) and d3 > 0.025 and np.isfinite(rsi_d3) and rsi_d3 > 1.5
                and np.isfinite(q_slope) and q_slope >= -0.006 and np.isfinite(rs5) and rs5 > -0.015)
     strong = (risk <= 3 and np.isfinite(q_slope) and q_slope >= 0 and np.isfinite(rs5) and rs5 >= 0)
+    structural_bear = bool(prev_row.get("C_STRUCT_BEAR", False))
+
+    # C4-BEAR의 유일한 매수 변경: 장기 구조적 약세에서만 신규 LOC를 깊고 작게 둡니다.
+    # 그 외 모든 구간은 아래 C4 원본 분기를 그대로 사용합니다.
+    if structural_bear:
+        return "C4-BEAR 구조약세 2+3", (-0.060, -0.120), (0.02, 0.03), max(risk, 7)
 
     if strong and exp < 0.55:
         return "C4-강공격 9+9", (0.055, 0.000), (0.09, 0.09), risk
@@ -1068,6 +1091,56 @@ def simulate_soxl_reverse(
 
             prev_row = df.iloc[i - 1]
             prev = float(close.iloc[i - 1])
+
+            # C4-BEAR: 전일까지 구조적 약세가 확인된 날에만 기존 LOT 노출을 35%까지 축소.
+            # 당일 QQQ/SOXL 미래정보는 사용하지 않습니다. 오래된 LOT부터 유지하고 최근 LOT부터 줄입니다.
+            structural_bear = bool(prev_row.get("C_STRUCT_BEAR", False))
+            bear_cap = min(float(deployment_ratio), 0.35) if structural_bear else float(deployment_ratio)
+            if structural_bear and exposure_now > bear_cap + 1e-12 and lots:
+                target_value = equity_now * bear_cap
+                excess = max(0.0, invested_now - target_value)
+                new_lots = []
+                # 최근 진입 LOT부터 축소하여 오래 버틴 저가 LOT는 최대한 보존
+                for lot in reversed(lots):
+                    if excess <= 1e-9:
+                        new_lots.append(lot)
+                        continue
+                    lot_value = lot["qty"] * px
+                    sell_value = min(lot_value, excess)
+                    sell_qty = sell_value / px if px > 0 else 0.0
+                    if sell_qty > 0:
+                        sell_px = px * (1 - slippage_pct)
+                        frac = min(1.0, sell_qty / lot["qty"])
+                        cost_part = lot["cash_cost"] * frac
+                        proceeds = sell_qty * sell_px * (1 - fee_pct - fx_cost_pct)
+                        cash += proceeds
+                        trades.append({
+                            "신호일": lot["date"], "매도일": pd.Timestamp(dt),
+                            "평균매수가": lot["price"], "매도가": sell_px,
+                            "수익률": proceeds / cost_part - 1 if cost_part > 0 else 0.0,
+                            "실현손익": proceeds - cost_part,
+                            "보유일수": (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days,
+                            "매수횟수": 1, "청산사유": "구조약세축소",
+                            "진입상태": lot.get("state", ""),
+                        })
+                        remain_frac = 1.0 - frac
+                        if remain_frac > 1e-9:
+                            kept = dict(lot)
+                            kept["qty"] = lot["qty"] * remain_frac
+                            kept["cash_cost"] = lot["cash_cost"] * remain_frac
+                            new_lots.append(kept)
+                        excess -= sell_value
+                    else:
+                        new_lots.append(lot)
+                lots = list(reversed(new_lots))
+                mark_value = sum(lot["qty"] * px for lot in lots)
+                equity_now = cash + mark_value
+                invested_now = mark_value
+                exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
+                max_invested = equity_now * bear_cap
+            else:
+                max_invested = equity_now * bear_cap
+
             if "C_STATIC_RISK" in df.columns:
                 state, offsets, weights, risk_score = _soxl_c_plan_from_precomputed(prev_row, exposure_now)
             else:
@@ -1473,7 +1546,7 @@ try:
     # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
     # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
     if market.startswith("🇺🇸") and us_product == "SOXL":
-        # V32-C4 RETURN: CAGR을 끌어올리기 위해 회전율/재진입을 우선 탐색합니다.
+        # V32-C4 BEAR: CAGR을 끌어올리기 위해 회전율/재진입을 우선 탐색합니다.
         # 상태별 매수비중은 C4 템플릿으로 고정하고 익절/보유기간/총투입한도를 비교합니다.
         effective_buy_steps = [0.06]
         effective_take_profits = [0.025, 0.035, 0.045, 0.06, 0.08]
@@ -1615,7 +1688,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C4 RETURN 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C4 BEAR 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
