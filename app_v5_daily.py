@@ -806,6 +806,66 @@ def _soxl_c_features(soxl_series, qqq_series, smh_series):
     return d
 
 
+
+def _attach_soxl_c_precomputed(df):
+    """SOXL V32-C 정적 지표/기본 위험점수를 1회만 계산합니다.
+
+    LOT(exposure) 관련 2개 위험 플래그만 시뮬레이션 중 동적으로 더합니다.
+    이렇게 하면 각 거래일마다 rolling/RSI를 처음부터 다시 계산하던 O(n^2) 병목을 제거합니다.
+    """
+    out = df.copy()
+    s = out["TRADE"].astype(float)
+    q = out["QQQ"].astype(float)
+    h = out["SMH"].astype(float)
+
+    for period in (5, 10, 20):
+        out[f"C_S_MA{period}"] = s.rolling(period, min_periods=max(3, period // 2)).mean()
+        out[f"C_Q_MA{period}"] = q.rolling(period, min_periods=max(3, period // 2)).mean()
+
+    out["C_S_RSI14"] = calc_rsi(s, 14)
+    out["C_S_DIST10"] = s / out["C_S_MA10"] - 1
+    out["C_S_DIST20"] = s / out["C_S_MA20"] - 1
+    out["C_S_DIST10_D3"] = out["C_S_DIST10"].diff(3)
+    out["C_S_RSI_D3"] = out["C_S_RSI14"].diff(3)
+    out["C_Q_MA20_SLOPE5"] = out["C_Q_MA20"].pct_change(5)
+    out["C_SMH_R5"] = h.pct_change(5)
+    out["C_QQQ_R5"] = q.pct_change(5)
+    out["C_RS5"] = out["C_SMH_R5"] - out["C_QQQ_R5"]
+
+    # LOT를 제외한 8개 정적 위험조건. bool을 int로 바꿔 행별 합산합니다.
+    conditions = [
+        out["C_Q_MA5"] < out["C_Q_MA10"],
+        out["C_Q_MA10"] < out["C_Q_MA20"],
+        out["C_Q_MA20_SLOPE5"] < 0,
+        out["C_RS5"] < 0,
+        s < out["C_S_MA10"],
+        s < out["C_S_MA20"],
+        out["C_S_DIST10_D3"] < 0,
+        out["C_S_RSI_D3"] < 0,
+    ]
+    risk = pd.Series(0, index=out.index, dtype="int16")
+    for cond in conditions:
+        risk = risk + cond.fillna(False).astype("int16")
+    out["C_STATIC_RISK"] = risk
+    return out
+
+
+def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
+    """전일 사전계산 행 + 현재 LOT만으로 C타입 주문계획을 O(1)에 생성합니다."""
+    risk = int(prev_row.get("C_STATIC_RISK", 0))
+    if float(exposure_now) > 0.15:
+        risk += 1
+    if float(exposure_now) > 0.30:
+        risk += 1
+
+    if risk <= 2:
+        return "C-공격 7+7", (0.04, -0.01), (0.07, 0.07), risk
+    if risk <= 4:
+        return "C-정상 6+6", (-0.01, -0.04), (0.06, 0.06), risk
+    if risk <= 7:
+        return "C-방어 5+5", (-0.02, -0.04), (0.05, 0.05), risk
+    return "C-강방어 4+4", (-0.02, -0.06), (0.04, 0.04), risk
+
 def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None):
     """V32-C 계획.
 
@@ -973,17 +1033,23 @@ def simulate_soxl_reverse(
             invested_now = mark_value
             exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
 
-            plan = get_soxl_loc_plan(
-                close.iloc[:i],
-                exposure_now=exposure_now,
-                base_unit=base_unit,
-                qqq_series=qqq.iloc[:i],
-                smh_series=smh.iloc[:i],
-            )
-            prev = float(plan["prev_close"])
-            state = plan["state"]
-            offsets = plan["offsets"]
-            weights = plan["weights"]
+            prev_row = df.iloc[i - 1]
+            prev = float(close.iloc[i - 1])
+            if "C_STATIC_RISK" in df.columns:
+                state, offsets, weights, risk_score = _soxl_c_plan_from_precomputed(prev_row, exposure_now)
+            else:
+                # 호환 폴백: 사전계산 열이 없는 외부 호출도 정상 동작
+                plan = get_soxl_loc_plan(
+                    close.iloc[:i],
+                    exposure_now=exposure_now,
+                    base_unit=base_unit,
+                    qqq_series=qqq.iloc[:i],
+                    smh_series=smh.iloc[:i],
+                )
+                state = plan["state"]
+                offsets = plan["offsets"]
+                weights = plan["weights"]
+                risk_score = int(plan.get("risk_score", -1))
 
             for off, weight in zip(offsets, weights):
                 limit_px = prev * (1 + float(off))
@@ -1005,7 +1071,7 @@ def simulate_soxl_reverse(
                     "cash_cost": budget,
                     "state": state,
                     "loc_offset": float(off),
-                    "risk_score": int(plan.get("risk_score", -1)),
+                    "risk_score": int(risk_score),
                 })
                 invested_now += qty * px
 
@@ -1516,7 +1582,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C FAST 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C TURBO 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
@@ -1592,6 +1658,8 @@ try:
             for p in ma_periods:
                 required_cols.append(f"TREND_OK_{int(p)}")
             df = df.dropna(subset=required_cols)
+            if market.startswith("🇺🇸") and us_product == "SOXL":
+                df = _attach_soxl_c_precomputed(df)
             prepared.append((mode, df))
 
         # 조합을 인덱스로 만들어 1차/2차 탐색에서 동일한 조건을 중복 계산하지 않습니다.
