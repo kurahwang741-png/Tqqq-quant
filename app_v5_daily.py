@@ -15,14 +15,14 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR3",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR4",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR3")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C4 BEAR4")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C4 BEAR3 · BEAR → RECOVERY → NORMAL 3단계 · 가짜반등은 60% 제한 · 중기회복 확인 시 C4 정상복귀")
+st.caption("V32-C4 BEAR4 · BEAR → RECOVERY60 → RECOVERY80 → NORMAL 4단계 · 회복 지속 시 80% 선복귀 · 중기확인 후 C4 100% 복귀")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
@@ -849,33 +849,57 @@ def _attach_soxl_c_precomputed(df):
     out["C_QQQ_R5"] = q.pct_change(5)
     out["C_RS5"] = out["C_SMH_R5"] - out["C_QQQ_R5"]
 
-    # BEAR3: 구조약세에서 바로 NORMAL로 점프하지 않고 RECOVERY를 거칩니다.
-    # 1) RECOVERY: 단기/중기 회복 3개 중 2개 -> 최대 노출 60%, 중간 강도의 LOC
-    # 2) FAST NORMAL: QQQ가 MA200을 되찾고 MA50도 상승하는 등 중기 회복이 확인되면 C4 정상 복귀
+    # BEAR4: 구조약세 → 60% 회복 → 80% 회복 → 정상 100%의 4단계 복귀.
+    # 핵심은 MA200 완전 회복까지 기다리지 않고 '지속되는 중기 회복'이면 먼저 80%까지 복귀시키는 것입니다.
     # 오늘 주문에는 전일 행만 사용하므로 look-ahead는 없습니다.
     out["C_Q_MA50_SLOPE10"] = out["C_Q_MA50"].pct_change(10)
-    recover_votes = (
+    out["C_Q_MA100"] = q.rolling(100, min_periods=80).mean()
+
+    recover60_votes = (
         (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
         + (out["C_Q_MA20_SLOPE5"] > 0.0).fillna(False).astype("int16")
         + (out["C_RS5"] > 0.0).fillna(False).astype("int16")
     )
-    normal_votes = (
-        (q > out["C_Q_MA200"]).fillna(False).astype("int16")
-        + (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
+    recover80_votes = (
+        (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
         + (out["C_Q_MA50_SLOPE10"] > 0.0).fillna(False).astype("int16")
         + (out["C_RS5"] > 0.0).fillna(False).astype("int16")
+        + (q > out["C_Q_MA100"]).fillna(False).astype("int16")
     )
-    out["C_BEAR_RECOVER_VOTES"] = recover_votes
+    # 80% 복귀는 하루짜리 가짜반등을 피하려고 최근 4거래일 중 3일 이상 확인.
+    recover80_raw = recover80_votes >= 3
+    recover80_confirmed = recover80_raw.astype("int16").rolling(4, min_periods=3).sum() >= 3
+
+    normal_votes = (
+        (out["C_Q_MA20"] > out["C_Q_MA50"]).fillna(False).astype("int16")
+        + (out["C_Q_MA50_SLOPE10"] > 0.0).fillna(False).astype("int16")
+        + (out["C_RS5"] > 0.0).fillna(False).astype("int16")
+        + (q > out["C_Q_MA100"]).fillna(False).astype("int16")
+    )
+    normal_raw = normal_votes >= 3
+    # NORMAL은 MA200 대신 중기회복의 지속성을 사용: 최근 6일 중 5일 + MA50 상승.
+    normal_confirmed = (normal_raw.astype("int16").rolling(6, min_periods=5).sum() >= 5) & (out["C_Q_MA50_SLOPE10"] > 0.0)
+
+    out["C_BEAR_RECOVER_VOTES"] = recover60_votes
+    out["C_BEAR_RECOVER80_VOTES"] = recover80_votes
     out["C_BEAR_NORMAL_VOTES"] = normal_votes
-    out["C_BEAR_RECOVER"] = recover_votes >= 2
-    out["C_BEAR_FAST_NORMAL"] = normal_votes >= 3
-    out["C_BEAR_PHASE"] = np.where(
-        out["C_STRUCT_BEAR"] & (~out["C_BEAR_FAST_NORMAL"]),
-        np.where(out["C_BEAR_RECOVER"], "RECOVERY", "BEAR"),
-        "NORMAL",
+    out["C_BEAR_RECOVER60"] = recover60_votes >= 2
+    out["C_BEAR_RECOVER80"] = recover80_confirmed
+    out["C_BEAR_FAST_NORMAL"] = normal_confirmed
+
+    # 구조약세 신호가 남아 있어도 회복이 충분히 지속되면 80%/100%로 단계적으로 탈출합니다.
+    out["C_BEAR_PHASE"] = np.select(
+        [
+            out["C_BEAR_FAST_NORMAL"],
+            out["C_BEAR_RECOVER80"],
+            out["C_STRUCT_BEAR"] & out["C_BEAR_RECOVER60"],
+            out["C_STRUCT_BEAR"],
+        ],
+        ["NORMAL", "RECOVERY80", "RECOVERY60", "BEAR"],
+        default="NORMAL",
     )
     out["C_EFFECTIVE_BEAR"] = out["C_BEAR_PHASE"].eq("BEAR")
-    out["C_EFFECTIVE_RECOVERY"] = out["C_BEAR_PHASE"].eq("RECOVERY")
+    out["C_EFFECTIVE_RECOVERY"] = out["C_BEAR_PHASE"].isin(["RECOVERY60", "RECOVERY80"])
 
     # LOT를 제외한 8개 정적 위험조건. bool을 int로 바꿔 행별 합산합니다.
     conditions = [
@@ -896,7 +920,7 @@ def _attach_soxl_c_precomputed(df):
 
 
 def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
-    """V32-C4 BEAR3: CAGR 최우선. 상승/반등에서는 체결과 재진입을 빠르게, 약세에서만 제한 방어."""
+    """V32-C4 BEAR4: CAGR 최우선. 구조약세는 방어하되 회복이 지속되면 60→80→100%로 빠르게 복귀."""
     risk = int(prev_row.get("C_STATIC_RISK", 0))
     exp = float(exposure_now)
     # LOT 패널티를 C3보다 약하게 적용해 상승/반등 구간의 재진입을 막지 않습니다.
@@ -915,16 +939,22 @@ def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
     strong = (risk <= 3 and np.isfinite(q_slope) and q_slope >= 0 and np.isfinite(rs5) and rs5 >= 0)
     phase = str(prev_row.get("C_BEAR_PHASE", "BEAR" if bool(prev_row.get("C_STRUCT_BEAR", False)) else "NORMAL"))
     structural_bear = phase == "BEAR"
-    recovery_phase = phase == "RECOVERY"
+    recovery60 = phase == "RECOVERY60"
+    recovery80 = phase == "RECOVERY80"
 
-    # BEAR에서는 깊고 작게, RECOVERY에서는 60% 한도 안에서 중간 강도로 참여합니다.
-    # NORMAL로 확인되면 아래 C4 원본 분기를 그대로 사용합니다.
+    # BEAR 35% → RECOVERY60 60% → RECOVERY80 80% → NORMAL 원래 C4 순서.
     if structural_bear:
-        return "C4-BEAR3 구조약세 2+3", (-0.060, -0.120), (0.02, 0.03), max(risk, 7)
-    if recovery_phase:
+        return "C4-BEAR4 구조약세 2+3", (-0.060, -0.120), (0.02, 0.03), max(risk, 7)
+    if recovery60:
         if rebound and exp < 0.45:
-            return "C4-BEAR3 회복반등 6+6", (0.015, -0.030), (0.06, 0.06), min(max(risk, 4), 6)
-        return "C4-BEAR3 회복대기 5+6", (-0.015, -0.055), (0.05, 0.06), min(max(risk, 5), 7)
+            return "C4-BEAR4 회복60 반등 6+6", (0.015, -0.030), (0.06, 0.06), min(max(risk, 4), 6)
+        return "C4-BEAR4 회복60 5+6", (-0.015, -0.055), (0.05, 0.06), min(max(risk, 5), 7)
+    if recovery80:
+        if rebound and exp < 0.65:
+            return "C4-BEAR4 회복80 반등 8+8", (0.030, -0.015), (0.08, 0.08), min(max(risk, 3), 5)
+        if risk <= 5:
+            return "C4-BEAR4 회복80 7+7", (0.015, -0.035), (0.07, 0.07), min(max(risk, 4), 6)
+        return "C4-BEAR4 회복80 6+7", (-0.010, -0.045), (0.06, 0.07), min(max(risk, 5), 7)
 
     if strong and exp < 0.55:
         return "C4-강공격 9+9", (0.055, 0.000), (0.09, 0.09), risk
@@ -1126,14 +1156,15 @@ def simulate_soxl_reverse(
             prev_row = df.iloc[i - 1]
             prev = float(close.iloc[i - 1])
 
-            # BEAR3 노출 캡: BEAR 35% / RECOVERY 60% / NORMAL 원래 운용률.
+            # BEAR4 노출 캡: BEAR 35% / RECOVERY60 60% / RECOVERY80 80% / NORMAL 원래 운용률.
             # 당일 QQQ/SOXL 미래정보는 사용하지 않습니다. 오래된 LOT부터 유지하고 최근 LOT부터 줄입니다.
             phase = str(prev_row.get("C_BEAR_PHASE", "BEAR" if bool(prev_row.get("C_STRUCT_BEAR", False)) else "NORMAL"))
             structural_bear = phase == "BEAR"
-            recovery_phase = phase == "RECOVERY"
-            phase_cap = 0.35 if structural_bear else (0.60 if recovery_phase else float(deployment_ratio))
+            recovery60 = phase == "RECOVERY60"
+            recovery80 = phase == "RECOVERY80"
+            phase_cap = 0.35 if structural_bear else (0.60 if recovery60 else (0.80 if recovery80 else float(deployment_ratio)))
             bear_cap = min(float(deployment_ratio), phase_cap)
-            if (structural_bear or recovery_phase) and exposure_now > bear_cap + 1e-12 and lots:
+            if (structural_bear or recovery60 or recovery80) and exposure_now > bear_cap + 1e-12 and lots:
                 target_value = equity_now * bear_cap
                 excess = max(0.0, invested_now - target_value)
                 new_lots = []
@@ -1157,7 +1188,7 @@ def simulate_soxl_reverse(
                             "수익률": proceeds / cost_part - 1 if cost_part > 0 else 0.0,
                             "실현손익": proceeds - cost_part,
                             "보유일수": (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days,
-                            "매수횟수": 1, "청산사유": "구조약세축소" if structural_bear else "회복단계노출조정",
+                            "매수횟수": 1, "청산사유": "구조약세축소" if structural_bear else ("회복60노출조정" if recovery60 else "회복80노출조정"),
                             "진입상태": lot.get("state", ""),
                         })
                         remain_frac = 1.0 - frac
@@ -1725,7 +1756,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C4 BEAR3 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C4 BEAR4 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
