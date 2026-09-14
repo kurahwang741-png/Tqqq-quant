@@ -1924,6 +1924,11 @@ try:
         vdf["SIGNAL"] = close[validation_mode["signal_symbol"]]
         vdf["TRADE"] = close[validation_mode["trade_symbol"]]
         vdf["REF"] = close[validation_mode["ref_symbol"]]
+        # SOXL C타입 블라인드 검증도 본 백테스트와 동일하게 QQQ/SMH를 전달해야 합니다.
+        # 기존 코드는 validation dataframe에서 두 열을 빠뜨려 simulate_soxl_reverse()가 즉시 실패했습니다.
+        if market.startswith("🇺🇸") and us_product == "SOXL":
+            vdf["QQQ"] = close["QQQ"]
+            vdf["SMH"] = close["SMH"]
         vdf = vdf.dropna()
         # 사용자가 선택한 시작/종료 범위는 존중하되, 최적화 때만 2025-12-31에서 잘랐습니다.
         vdf = apply_backtest_period(
