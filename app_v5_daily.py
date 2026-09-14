@@ -15,14 +15,14 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32-C3",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32-C4 RETURN",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C3")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32-C4 RETURN")
 st.caption("실전 체결관리 · 안전장치 · 기록 복구 · 다음 거래일 주문")
-st.caption("V32-C3 · CAGR 60% 우선 · 상승/반등 공격 + 약세 선택방어 + LOT 회수")
+st.caption("V32-C4 RETURN · CAGR 60% 우선 · 최대낙폭 구간 진단 추가")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
@@ -851,39 +851,37 @@ def _attach_soxl_c_precomputed(df):
 
 
 def _soxl_c_plan_from_precomputed(prev_row, exposure_now):
-    """V32-C3: C시장판단 + 평균회귀 회복을 공격적으로, 약세에서만 선택 방어."""
+    """V32-C4 RETURN: CAGR 최우선. 상승/반등에서는 체결과 재진입을 빠르게, 약세에서만 제한 방어."""
     risk = int(prev_row.get("C_STATIC_RISK", 0))
     exp = float(exposure_now)
-    if exp > 0.20:
+    # LOT 패널티를 C3보다 약하게 적용해 상승/반등 구간의 재진입을 막지 않습니다.
+    if exp > 0.35:
         risk += 1
-    if exp > 0.40:
+    if exp > 0.60:
         risk += 1
 
-    dist10 = float(prev_row.get("C_S_DIST10", np.nan))
     d3 = float(prev_row.get("C_S_DIST10_D3", np.nan))
     rsi_d3 = float(prev_row.get("C_S_RSI_D3", np.nan))
     q_slope = float(prev_row.get("C_Q_MA20_SLOPE5", np.nan))
     rs5 = float(prev_row.get("C_RS5", np.nan))
 
-    # 손상된 SOXL이 실제로 평균회귀 중이고 시장/반도체가 받쳐주면 공격 복귀.
-    rebound = (np.isfinite(d3) and d3 > 0.035 and np.isfinite(rsi_d3) and rsi_d3 > 3.0
-               and np.isfinite(q_slope) and q_slope >= -0.004 and np.isfinite(rs5) and rs5 > -0.01)
-    strong = (risk <= 2 and np.isfinite(q_slope) and q_slope > 0 and np.isfinite(rs5) and rs5 > 0)
+    rebound = (np.isfinite(d3) and d3 > 0.025 and np.isfinite(rsi_d3) and rsi_d3 > 1.5
+               and np.isfinite(q_slope) and q_slope >= -0.006 and np.isfinite(rs5) and rs5 > -0.015)
+    strong = (risk <= 3 and np.isfinite(q_slope) and q_slope >= 0 and np.isfinite(rs5) and rs5 >= 0)
 
-    if strong and exp < 0.30:
-        return "C3-강공격 8+8", (0.05, -0.005), (0.08, 0.08), risk
-    if rebound and exp < 0.25:
-        return "C3-반등공격 8+7", (0.035, -0.015), (0.08, 0.07), risk
+    if strong and exp < 0.55:
+        return "C4-강공격 9+9", (0.055, 0.000), (0.09, 0.09), risk
+    if rebound and exp < 0.55:
+        return "C4-반등공격 9+8", (0.040, -0.010), (0.09, 0.08), risk
     if risk <= 4:
-        return "C3-정상 7+7", (0.02, -0.025), (0.07, 0.07), risk
+        return "C4-공격 8+8", (0.025, -0.020), (0.08, 0.08), risk
     if risk <= 6:
-        # C2보다 덜 방어적: 총량 12% 유지, 아래 주문만 조금 더 크게.
-        if exp >= 0.45:
-            return "C3-LOT방어 3+5", (-0.04, -0.09), (0.03, 0.05), risk
-        return "C3-선택방어 5+7", (-0.025, -0.065), (0.05, 0.07), risk
-    if exp >= 0.40:
-        return "C3-강방어 2+4", (-0.065, -0.13), (0.02, 0.04), risk
-    return "C3-약세 4+5", (-0.045, -0.09), (0.04, 0.05), risk
+        if exp >= 0.65:
+            return "C4-고LOT 4+5", (-0.030, -0.070), (0.04, 0.05), risk
+        return "C4-중립 6+7", (-0.010, -0.045), (0.06, 0.07), risk
+    if exp >= 0.60:
+        return "C4-강약세 3+4", (-0.055, -0.110), (0.03, 0.04), risk
+    return "C4-약세 5+6", (-0.035, -0.080), (0.05, 0.06), risk
 
 def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None):
     """V32-C 계획.
@@ -1025,15 +1023,17 @@ def simulate_soxl_reverse(
         remaining = []
         for lot in lots:
             age = (pd.Timestamp(dt) - pd.Timestamp(lot["date"])).days
-            # C2 LOT 회수: 보유비중이 커질수록 반등 시 더 빨리 현금을 회수합니다.
+            # C4 RETURN 회전 엔진: 고LOT는 빠르게 회수하고, 낮은 LOT/강한 장에서는 목표수익을 충분히 유지합니다.
             mark_before = sum(x["qty"] * px for x in lots)
             eq_before = cash + mark_before
             exp_before = mark_before / eq_before if eq_before > 0 else 0.0
             tp_eff = float(take_profit)
-            if exp_before >= 0.60:
+            if exp_before >= 0.75:
+                tp_eff = min(tp_eff, 0.025)
+            elif exp_before >= 0.60:
                 tp_eff = min(tp_eff, 0.035)
             elif exp_before >= 0.45:
-                tp_eff = min(tp_eff, 0.05)
+                tp_eff = min(tp_eff, 0.045)
             target = lot["price"] * (1 + tp_eff)
             hit_tp = px >= target
             forced = max_hold_days is not None and age >= int(max_hold_days)
@@ -1473,15 +1473,15 @@ try:
     # SOXL은 기존 고점대비 분할매수 엔진 대신 주문표 역추적 LOC 엔진을 사용합니다.
     # 화면의 "매수 간격" 값은 SOXL에서 '1개 LOC 주문의 총자산 대비 비중'으로 해석됩니다.
     if market.startswith("🇺🇸") and us_product == "SOXL":
-        # V32-C3의 상승/반등 공격 + 약세 선택방어 + LOT회수는 고정 템플릿입니다.
-        # 매수비중 자체를 다시 최적화하지 않고 익절/보유기간/총투입한도만 비교합니다.
+        # V32-C4 RETURN: CAGR을 끌어올리기 위해 회전율/재진입을 우선 탐색합니다.
+        # 상태별 매수비중은 C4 템플릿으로 고정하고 익절/보유기간/총투입한도를 비교합니다.
         effective_buy_steps = [0.06]
-        effective_take_profits = [0.04, 0.06, 0.08, 0.10]
-        effective_max_holds = [60, 120, 180]
+        effective_take_profits = [0.025, 0.035, 0.045, 0.06, 0.08]
+        effective_max_holds = [45, 90, 180]
         filter_candidates = [(None, None)]
         allocation_candidates = [np.ones(int(tranche_count)) / int(tranche_count)]
         loc_buy_ratios = [1.0]
-        deployment_ratios = [0.80, 0.90, 1.00]
+        deployment_ratios = [0.90, 1.00]
 
     current_params = (
         market,
@@ -1615,7 +1615,7 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL V32-C3 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "🧪 SOXL V32-C4 RETURN 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
@@ -2161,6 +2161,78 @@ try:
         f"{filter_name(best_ma_period, best_rsi)} / "
         f"최대보유 {'제한없음' if best_max_hold is None else str(best_max_hold) + '일'}**"
     )
+
+    # ------------------------------------------------------------
+    # 최대낙폭(MDD) 원인 구간 진단
+    # ------------------------------------------------------------
+    if market.startswith("🇺🇸") and us_product == "SOXL":
+        eq_diag = best.get("equity")
+        if isinstance(eq_diag, pd.DataFrame) and not eq_diag.empty and "Equity" in eq_diag.columns:
+            eq_diag = eq_diag.copy().sort_index()
+            running_peak = eq_diag["Equity"].cummax()
+            dd_series = eq_diag["Equity"] / running_peak - 1.0
+            trough_date = pd.Timestamp(dd_series.idxmin())
+            trough_pos = eq_diag.index.get_loc(trough_date)
+            peak_slice = eq_diag.iloc[:trough_pos + 1]["Equity"]
+            peak_date = pd.Timestamp(peak_slice.idxmax())
+            peak_equity = float(eq_diag.loc[peak_date, "Equity"])
+            trough_equity = float(eq_diag.loc[trough_date, "Equity"])
+            mdd_value = trough_equity / peak_equity - 1.0 if peak_equity > 0 else np.nan
+
+            # 고점 회복일: 저점 이후 처음으로 이전 고점 자산을 회복한 날
+            after_trough = eq_diag.loc[trough_date:]
+            recovered = after_trough[after_trough["Equity"] >= peak_equity]
+            recovery_date = pd.Timestamp(recovered.index[0]) if not recovered.empty else None
+
+            peak_exp = float(eq_diag.loc[peak_date, "Exposure"]) if "Exposure" in eq_diag.columns else np.nan
+            trough_exp = float(eq_diag.loc[trough_date, "Exposure"]) if "Exposure" in eq_diag.columns else np.nan
+            peak_px = float(eq_diag.loc[peak_date, "TradePrice"]) if "TradePrice" in eq_diag.columns else np.nan
+            trough_px = float(eq_diag.loc[trough_date, "TradePrice"]) if "TradePrice" in eq_diag.columns else np.nan
+            px_dd = trough_px / peak_px - 1.0 if np.isfinite(peak_px) and peak_px > 0 else np.nan
+            fall_days = int((trough_date - peak_date).days)
+            recovery_text = f"{recovery_date:%Y-%m-%d}" if recovery_date is not None else "백테스트 종료까지 미회복"
+            recovery_days = int((recovery_date - peak_date).days) if recovery_date is not None else None
+
+            st.subheader("🔎 C4 최대낙폭 구간")
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("직전 자산고점", f"{peak_date:%Y-%m-%d}", f"${peak_equity:,.0f}")
+            d2.metric("MDD 저점", f"{trough_date:%Y-%m-%d}", f"${trough_equity:,.0f}")
+            d3.metric("최대낙폭", f"{mdd_value:.1%}", f"{fall_days}일")
+            d4.metric("SOXL 동기간", f"{px_dd:.1%}" if np.isfinite(px_dd) else "-")
+
+            if recovery_date is not None:
+                st.caption(
+                    f"고점 회복일: **{recovery_text}** · 고점→회복 {recovery_days}일 · "
+                    f"고점 투자율 {peak_exp:.1%} → 저점 투자율 {trough_exp:.1%}"
+                )
+            else:
+                st.caption(
+                    f"고점 회복: **{recovery_text}** · "
+                    f"고점 투자율 {peak_exp:.1%} → 저점 투자율 {trough_exp:.1%}"
+                )
+
+            # 저점 전후 10거래일씩을 표로 보여서 LOT 누적/회복 과정을 바로 확인
+            left = max(0, trough_pos - 10)
+            right = min(len(eq_diag), trough_pos + 11)
+            around = eq_diag.iloc[left:right].copy()
+            around["Drawdown"] = around["Equity"] / around["Equity"].cummax().combine_first(running_peak.loc[around.index]) - 1.0
+            # 위 계산의 로컬 peak 왜곡 방지를 위해 전체기간 running peak로 다시 계산
+            around["Drawdown"] = eq_diag.loc[around.index, "Equity"] / running_peak.loc[around.index] - 1.0
+            cols = [c for c in ["Equity", "Drawdown", "Exposure", "TradePrice", "Cash"] if c in around.columns]
+            around_view = around[cols].copy()
+            around_view.index = pd.to_datetime(around_view.index).strftime("%Y-%m-%d")
+            if "Equity" in around_view.columns:
+                around_view["Equity"] = around_view["Equity"].map(lambda x: f"${x:,.0f}")
+            if "Cash" in around_view.columns:
+                around_view["Cash"] = around_view["Cash"].map(lambda x: f"${x:,.0f}")
+            if "Drawdown" in around_view.columns:
+                around_view["Drawdown"] = around_view["Drawdown"].map(lambda x: f"{x:.1%}")
+            if "Exposure" in around_view.columns:
+                around_view["Exposure"] = around_view["Exposure"].map(lambda x: f"{x:.1%}")
+            if "TradePrice" in around_view.columns:
+                around_view["TradePrice"] = around_view["TradePrice"].map(lambda x: f"${x:,.2f}")
+            st.dataframe(around_view, use_container_width=True)
+            st.caption("↑ MDD 저점 전후 10거래일. 투자율이 급격히 올라가면서 낙폭이 커지는지 확인하는 진단표입니다.")
 
     st.subheader("🧪 기간별 전략 검증 가이드")
     st.caption(
