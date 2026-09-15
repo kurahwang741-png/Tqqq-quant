@@ -885,6 +885,53 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
     }
 
 
+
+def _soxl_loc_plan_from_feature_row(r, exposure_now=0.0):
+    """Fast path: use the already-precomputed feature row.
+    Semantics match get_soxl_loc_plan(), but avoids rebuilding rolling indicators
+    for every day of every TP/deployment candidate.
+    """
+    prev = float(r["SOXL"])
+    risk = 0
+    flags = []
+    def add(cond, label):
+        nonlocal risk
+        if bool(cond):
+            risk += 1; flags.append(label)
+    add(np.isfinite(r["Q_MA5"]) and np.isfinite(r["Q_MA10"]) and r["Q_MA5"] < r["Q_MA10"], "QQQ 5<10")
+    add(np.isfinite(r["Q_MA10"]) and np.isfinite(r["Q_MA20"]) and r["Q_MA10"] < r["Q_MA20"], "QQQ 10<20")
+    add(np.isfinite(r["Q_MA20_SLOPE5"]) and r["Q_MA20_SLOPE5"] < 0, "QQQ MA20↓")
+    add(np.isfinite(r["RS5"]) and r["RS5"] < 0, "SMH<QQQ")
+    add(np.isfinite(r["S_MA10"]) and r["SOXL"] < r["S_MA10"], "SOXL<MA10")
+    add(np.isfinite(r["S_MA20"]) and r["SOXL"] < r["S_MA20"], "SOXL<MA20")
+    add(np.isfinite(r["S_DIST10_D3"]) and r["S_DIST10_D3"] < 0, "10일선 이격확대")
+    add(np.isfinite(r["S_RSI_D3"]) and r["S_RSI_D3"] < 0, "RSI↓")
+    add(float(exposure_now) > 0.15, "LOT>15%")
+    add(float(exposure_now) > 0.30, "LOT>30%")
+
+    if soxl_track.startswith("C-ORIGINAL"):
+        if risk <= 2: state, offsets, weights = "ORIGINAL-공격 7+7", (0.04,-0.01), (0.07,0.07)
+        elif risk <= 4: state, offsets, weights = "ORIGINAL-정상 6+6", (-0.01,-0.04), (0.06,0.06)
+        elif risk <= 7: state, offsets, weights = "ORIGINAL-방어 5+5", (-0.02,-0.04), (0.05,0.05)
+        else: state, offsets, weights = "ORIGINAL-강방어 4+4", (-0.02,-0.06), (0.04,0.04)
+    else:
+        exp=float(exposure_now)
+        d3=float(r["S_DIST10_D3"]) if np.isfinite(r["S_DIST10_D3"]) else np.nan
+        rsi_d3=float(r["S_RSI_D3"]) if np.isfinite(r["S_RSI_D3"]) else np.nan
+        q_slope=float(r["Q_MA20_SLOPE5"]) if np.isfinite(r["Q_MA20_SLOPE5"]) else np.nan
+        rs5v=float(r["RS5"]) if np.isfinite(r["RS5"]) else np.nan
+        rebound=(np.isfinite(d3) and d3>0.025 and np.isfinite(rsi_d3) and rsi_d3>1.5 and np.isfinite(q_slope) and q_slope>=-0.006 and np.isfinite(rs5v) and rs5v>-0.015)
+        strong=(risk<=3 and np.isfinite(q_slope) and q_slope>=0 and np.isfinite(rs5v) and rs5v>=0)
+        if strong and exp<0.55: state,offsets,weights="ALPHA-강공격 9+9",(0.055,0.0),(0.09,0.09)
+        elif rebound and exp<0.55: state,offsets,weights="ALPHA-반등공격 9+8",(0.04,-0.01),(0.09,0.08)
+        elif risk<=4: state,offsets,weights="ALPHA-공격 8+8",(0.025,-0.02),(0.08,0.08)
+        elif risk<=6:
+            if exp>=0.65: state,offsets,weights="ALPHA-고LOT 4+5",(-0.03,-0.07),(0.04,0.05)
+            else: state,offsets,weights="ALPHA-중립 6+7",(-0.01,-0.045),(0.06,0.07)
+        elif exp>=0.60: state,offsets,weights="ALPHA-강약세 3+4",(-0.055,-0.11),(0.03,0.04)
+        else: state,offsets,weights="ALPHA-약세 5+6",(-0.035,-0.08),(0.05,0.06)
+    return {"state":state,"offsets":offsets,"weights":weights,"risk_score":int(risk),"risk_flags":flags,"prev_close":prev}
+
 # ============================================================
 # RECON64 — 캡처 기반 복원 상수
 # 1) 기준선: QQQ < MA200 AND DD252 <= -10%, 최대보유 60일
@@ -1014,13 +1061,10 @@ def simulate_soxl_reverse(
             invested_now = mark_value
             exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
 
-            plan = get_soxl_loc_plan(
-                close.iloc[:i],
-                exposure_now=exposure_now,
-                base_unit=base_unit,
-                qqq_series=qqq.iloc[:i],
-                smh_series=smh.iloc[:i],
-            )
+            # FAST: feat was computed once for the whole backtest; reuse yesterday's row.
+            # This preserves the prior-day/no-lookahead semantics while eliminating
+            # repeated rolling-indicator reconstruction inside every grid candidate.
+            plan = _soxl_loc_plan_from_feature_row(feat.iloc[i - 1], exposure_now=exposure_now)
             prev = float(plan["prev_close"])
             state = plan["state"]
             offsets = plan["offsets"]
