@@ -84,6 +84,19 @@ if market.startswith("🇺🇸") and us_product == "SOXL":
 else:
     soxl_track = "C-ORIGINAL · 원본 주문 역추적"
 
+# 코코레는 SOXL 잠금 로직과 완전히 분리해 연구합니다.
+if market.startswith("🇰🇷"):
+    kokore_track = st.radio(
+        "🧭 코코레 연구 트랙",
+        ["K-BASE · 기존 로직", "K-ALPHA · 지정가/CAGR 연구"],
+        horizontal=True,
+        help="K-ALPHA는 KODEX 코스닥150 레버리지(233740)를 코스닥150 ETF(229200)의 추세·RSI와 함께 분석하는 별도 연구 트랙입니다.",
+    )
+    if kokore_track.startswith("K-ALPHA"):
+        st.warning("🧪 K-ALPHA: SOXL 로직은 건드리지 않습니다. 전일 확정 일봉으로 다음 거래일 지정가와 비중을 계산하고 장기 CAGR을 별도로 검증합니다.")
+else:
+    kokore_track = "K-BASE · 기존 로직"
+
 if market.startswith("🇺🇸"):
     currency = "$"
     unit = "달러"
@@ -1383,6 +1396,64 @@ def simulate(
     }
 
 
+def get_kokore_limit_plan(lev_series, base_series, exposure_now=0.0):
+    """K-ALPHA 연구용: 전일 확정 일봉 -> 다음 거래일 지정가 2개/비중.
+    미래값은 사용하지 않는다. SOXL 함수와 완전히 독립적이다.
+    """
+    df = pd.DataFrame({"LEV": lev_series, "BASE": base_series}).dropna().copy()
+    if len(df) < 210:
+        raise ValueError("K-ALPHA 계산에는 최소 210거래일 데이터가 필요합니다.")
+
+    df["MA20"] = df["BASE"].rolling(20).mean()
+    df["MA50"] = df["BASE"].rolling(50).mean()
+    df["MA200"] = df["BASE"].rolling(200).mean()
+    df["RSI14"] = calc_rsi(df["BASE"], 14)
+    df["DD60"] = df["LEV"] / df["LEV"].rolling(60).max() - 1.0
+    df["RET5"] = df["BASE"].pct_change(5)
+    df["SLOPE20_5"] = df["MA20"].pct_change(5)
+    row = df.dropna().iloc[-1]
+
+    risk = 0
+    risk += int(row["BASE"] < row["MA20"])
+    risk += int(row["BASE"] < row["MA50"])
+    risk += int(row["BASE"] < row["MA200"]) * 2
+    risk += int(row["MA20"] < row["MA50"])
+    risk += int(row["RET5"] < -0.04)
+    risk += int(row["DD60"] < -0.20)
+    risk += int(row["SLOPE20_5"] < 0)
+
+    rebound = (
+        row["BASE"] > row["MA20"]
+        and row["SLOPE20_5"] > 0
+        and row["RSI14"] >= 45
+    )
+
+    # 1차 연구 파라미터. 아래 백테스트에서 검증 후에만 잠글 값이다.
+    if risk >= 6 and not rebound:
+        state, offsets, weights = "K-BEAR", (-0.04, -0.08), (0.03, 0.04)
+    elif rebound and risk <= 4:
+        state, offsets, weights = "K-REBOUND", (-0.01, -0.035), (0.10, 0.10)
+    elif risk <= 2:
+        state, offsets, weights = "K-STRONG", (-0.015, -0.04), (0.10, 0.10)
+    else:
+        state, offsets, weights = "K-NORMAL", (-0.025, -0.055), (0.07, 0.08)
+
+    room = max(0.0, 1.0 - float(exposure_now))
+    w1 = min(weights[0], room)
+    room -= w1
+    w2 = min(weights[1], room)
+
+    return {
+        "state": state,
+        "risk_score": int(risk),
+        "prev_close": float(row["LEV"]),
+        "offsets": offsets,
+        "weights": (w1, w2),
+        "rsi14": float(row["RSI14"]),
+        "base_close": float(row["BASE"]),
+    }
+
+
 try:
     # ------------------------------------------------------------
     # 데이터 / 비교할 운용 방식
@@ -1472,6 +1543,40 @@ try:
             },
         ]
 
+        if kokore_track.startswith("K-ALPHA"):
+            try:
+                _kplan = get_kokore_limit_plan(
+                    close["233740.KS"], close["229200.KS"], exposure_now=0.0
+                )
+                _kprev = float(_kplan["prev_close"])
+                _kbuy = [_kprev * (1.0 + float(x)) for x in _kplan["offsets"]]
+                # 연구 시작값: 각 LOT +6% 목표. 백테스트 결과 전에는 확정 파라미터로 취급하지 않는다.
+                _ktp = 0.06
+                _ksell = [x * (1.0 + _ktp) for x in _kbuy]
+
+                st.markdown("## 🧪 K-ALPHA 코코레 다음 거래일 연구 주문")
+                st.warning("아직 **연구용 1차 파라미터**입니다. 백테스트로 검증하기 전에는 실전 확정 신호가 아닙니다.")
+                st.caption(
+                    f"상태 **{_kplan['state']}** · 위험점수 {_kplan['risk_score']}/8 · "
+                    f"코코레 확정종가 ₩{_kprev:,.0f} · 본주 RSI {_kplan['rsi14']:.1f}"
+                )
+                _krows = []
+                for _i, (_px, _w) in enumerate(zip(_kbuy, _kplan["weights"]), 1):
+                    _krows.append({
+                        "주문": f"매수 {_i}", "방식": "지정가",
+                        "가격": f"₩{_px:,.0f}", "총자산 비중": f"{float(_w):.1%}",
+                        "주문금액": f"₩{float(investment)*float(_w):,.0f}",
+                    })
+                for _i, _px in enumerate(_ksell, 1):
+                    _krows.append({
+                        "주문": f"매도 {_i}", "방식": "지정가",
+                        "가격": f"₩{_px:,.0f}", "총자산 비중": "해당 LOT",
+                        "주문금액": "보유수량 기준",
+                    })
+                st.dataframe(pd.DataFrame(_krows), use_container_width=True, hide_index=True)
+            except Exception as _ke:
+                st.warning(f"K-ALPHA 연구 주문 계산 실패: {_ke}")
+
     # 필터 조합: 이평선 없음 + 100/150/200일선, RSI 없음 + 선택값
     ma_candidates = [None] + [int(x) for x in ma_periods]
     rsi_candidates = [None]
@@ -1519,6 +1624,7 @@ try:
     current_params = (
         market,
         soxl_track,
+        kokore_track,
         float(investment),
         anchor_mode,
         tuple(effective_buy_steps),
@@ -1659,20 +1765,37 @@ try:
             _qqq_fast = close["QQQ"].dropna()
             _smh_fast = close["SMH"].dropna()
 
-            # 저장된 실전 기록이 있으면 현재 원금 대비 보유원가로 투입률을 추정한다.
-            _fast_records = load_autosaved_trades()
-            _fast_open_cost = 0.0
-            if _fast_records:
-                for _r in _fast_records:
-                    try:
-                        _status = str(_r.get("상태", _r.get("status", ""))).lower()
-                        if _status in ("매도", "청산", "sold", "closed"):
-                            continue
-                        _amt = _r.get("매수금액", _r.get("금액", _r.get("amount", 0)))
-                        _fast_open_cost += float(_amt or 0)
-                    except Exception:
-                        pass
+            # --------------------------------------------------------
+            # 실전 보유상태
+            # 과거 매매일지를 전부 입력하지 않아도 현재 상태만 입력하면 된다.
+            # 입력값은 session_state에 남아 앱 재실행 중에도 유지된다.
+            # --------------------------------------------------------
+            st.markdown("### 💼 현재 SOXL 보유상태")
+            st.caption("과거 매매일지는 없어도 됩니다. 지금 보유 중인 수량과 평균매수가만 입력하면 오늘 추가매수 가능 비중을 계산합니다.")
+
+            _hold1, _hold2 = st.columns(2)
+            _fast_qty = _hold1.number_input(
+                "SOXL 보유수량(주)",
+                min_value=0.0, value=float(st.session_state.get("soxl_manual_qty", 0.0)),
+                step=1.0, key="soxl_manual_qty"
+            )
+            _fast_avg = _hold2.number_input(
+                "SOXL 평균매수가($)",
+                min_value=0.0, value=float(st.session_state.get("soxl_manual_avg", 0.0)),
+                step=0.01, key="soxl_manual_avg"
+            )
+
+            _fast_open_cost = float(_fast_qty) * float(_fast_avg)
             _fast_exp = min(1.0, max(0.0, _fast_open_cost / float(investment))) if float(investment) > 0 else 0.0
+            _fast_cash = max(0.0, float(investment) - _fast_open_cost)
+
+            _h1, _h2, _h3 = st.columns(3)
+            _h1.metric("현재 투입비중", f"{_fast_exp:.1%}")
+            _h2.metric("보유원가", f"${_fast_open_cost:,.0f}")
+            _h3.metric("남은 운용자금", f"${_fast_cash:,.0f}")
+
+            if _fast_exp > 1.0:
+                st.warning("입력한 보유원가가 설정한 총 투자원금을 초과합니다.")
 
             _fast_plan = get_soxl_loc_plan(
                 _soxl_fast,
@@ -1731,19 +1854,33 @@ try:
                 f"확정종가 ${_fast_prev:,.2f} · 추정 현재투입 {_fast_exp:.1%}"
             )
             _fast_rows = []
+            _remaining_cash = _fast_cash
             for _i, (_px, _w) in enumerate(zip(_fast_buy, _fast_weights), 1):
+                _desired = float(investment) * float(_w)
+                _actual_amt = min(_desired, _remaining_cash)
+                _actual_w = (_actual_amt / float(investment)) if float(investment) > 0 else 0.0
+                _shares = int(_actual_amt // float(_px)) if float(_px) > 0 else 0
+                _remaining_cash -= _actual_amt
                 _fast_rows.append({
                     "주문": f"매수 {_i}", "방식": "LOC",
-                    "가격": f"${_px:,.2f}", "자산비중": f"{float(_w):.1%}",
-                    "금액": f"${float(investment)*float(_w):,.0f}",
+                    "가격": f"${_px:,.2f}", "실제 비중": f"{_actual_w:.1%}",
+                    "주문금액": f"${_actual_amt:,.0f}",
+                    "예상수량": f"{_shares}주",
                 })
-            for _i, (_px, _w) in enumerate(zip(_fast_sell, _fast_weights), 1):
+
+            # 기존 보유분은 과거 LOT 정보가 없으므로 평균단가 기준 매도 참고가를 별도로 표시한다.
+            if float(_fast_qty) > 0 and float(_fast_avg) > 0:
+                _existing_sell = float(_fast_avg) * (1.0 + _fast_tp)
                 _fast_rows.append({
-                    "주문": f"매도 {_i}", "방식": "LOC",
-                    "가격": f"${_px:,.2f}", "자산비중": f"{float(_w):.1%}",
-                    "금액": "보유 LOT 기준",
+                    "주문": "기존 보유분 매도", "방식": "LOC",
+                    "가격": f"${_existing_sell:,.2f}", "실제 비중": f"{_fast_exp:.1%}",
+                    "주문금액": "보유수량 기준",
+                    "예상수량": f"{float(_fast_qty):g}주",
                 })
+
             st.dataframe(pd.DataFrame(_fast_rows), use_container_width=True, hide_index=True)
+            if float(_fast_qty) > 0:
+                st.caption("※ 기존 보유분의 개별 LOT 매수가를 입력하지 않았으므로 기존 물량 매도가는 평균매수가 기준 참고값입니다. 새로 체결되는 매수는 아래 매매기록에 저장하면 이후 LOT별 관리가 가능합니다.")
             st.success("✅ 오늘 주문가격은 위에서 바로 확인할 수 있습니다. 아래 백테스트는 과거 성과를 다시 검증할 때만 실행하세요.")
         except Exception as _fast_e:
             st.warning(f"오늘 SOXL 주문값 즉시 계산 실패: {_fast_e}")
