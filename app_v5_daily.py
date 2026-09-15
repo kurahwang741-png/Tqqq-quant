@@ -460,6 +460,33 @@ def download_close(symbols):
 
 
 
+def confirmed_us_daily_series(series):
+    """미국 정규장 종료(ET 16:00) 전에는 오늘 진행 중인 일봉을 절대 신호에 사용하지 않는다."""
+    s = pd.Series(series).dropna().copy()
+    if s.empty:
+        return s
+
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+        last_date = pd.Timestamp(s.index[-1]).date()
+
+        # yfinance가 장중 '오늘' 일봉을 반환하면 제거한다.
+        # ET 16:00 이후에만 오늘 일봉을 확정 데이터로 허용한다.
+        if last_date == now_et.date() and now_et.time() < datetime.strptime("16:00", "%H:%M").time():
+            s = s.iloc[:-1]
+
+        # 미래 날짜/비정상 날짜가 섞여도 현재 ET 날짜 이후 데이터는 사용하지 않는다.
+        if not s.empty:
+            idx_dates = pd.DatetimeIndex(s.index).date
+            s = s.loc[idx_dates <= now_et.date()]
+    except Exception:
+        # 시간대 판정 실패 시 원본을 훼손하지 않는다.
+        pass
+
+    return s
+
+
 @st.cache_data(ttl=900)
 def download_soxl_ohlc_research():
     """SOXL 지정가 체결 검증용 일봉 OHLC + QQQ/SMH 종가 데이터."""
@@ -1761,9 +1788,11 @@ try:
     # ------------------------------------------------------------
     if market.startswith("🇺🇸") and us_product == "SOXL":
         try:
-            _soxl_fast = close["SOXL"].dropna()
-            _qqq_fast = close["QQQ"].dropna()
-            _smh_fast = close["SMH"].dropna()
+            # 오늘 진행 중인 미국 일봉은 제외한다.
+            # SOXL/QQQ/SMH 모두 같은 '확정 일봉' 원칙을 적용해야 지표와 LOC 가격이 장중 흔들리지 않는다.
+            _soxl_fast = confirmed_us_daily_series(close["SOXL"])
+            _qqq_fast = confirmed_us_daily_series(close["QQQ"])
+            _smh_fast = confirmed_us_daily_series(close["SMH"])
 
             # --------------------------------------------------------
             # 실전 보유상태
@@ -1813,7 +1842,8 @@ try:
             _fast_tp = 0.06 if soxl_track.startswith("C-ORIGINAL") else 0.05
             _fast_sell = [x * (1.0 + _fast_tp) for x in _fast_buy]
 
-            st.markdown("## ⚡ 오늘 SOXL 주문값 — 백테스트 없이 즉시")
+            st.markdown("## ⚡ 오늘 SOXL 주문값 — 확정 일봉 잠금 🔒")
+            st.caption("미국 정규장 종료 전에는 진행 중인 오늘 일봉을 제외합니다. 같은 확정 일봉 기준에서는 새로고침해도 주문가격이 바뀌지 않습니다.")
 
             # 미국 정규장 마감 후 최신 일봉이 실제로 반영됐는지 자동 확인.
             # 단순 시계가 아니라 SOXL 데이터의 마지막 거래일과 미국 동부 현재 날짜/시간을 비교한다.
