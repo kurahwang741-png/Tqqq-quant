@@ -15,12 +15,12 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT RECON64",
+    page_title="TQQQ / SOXL / 코코레 QUANT V32 DUAL",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT RECON64")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT V32 DUAL")
 st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
@@ -444,6 +444,48 @@ def download_close(symbols):
         close = close.to_frame()
 
     return close
+
+
+
+@st.cache_data(ttl=900)
+def download_soxl_ohlc_research():
+    """SOXL 지정가 체결 검증용 일봉 OHLC + QQQ/SMH 종가 데이터."""
+    raw = yf.download(
+        ["SOXL", "QQQ", "SMH"],
+        period="max",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+    )
+    if raw is None or raw.empty:
+        raise ValueError("SOXL OHLC 데이터를 받지 못했습니다.")
+
+    def _field(field, symbol):
+        if isinstance(raw.columns, pd.MultiIndex):
+            lv0 = raw.columns.get_level_values(0)
+            lvl = raw.columns.get_level_values(-1)
+            if field in lv0:
+                obj = raw[field]
+                return obj[symbol] if isinstance(obj, pd.DataFrame) else obj
+            if field in lvl:
+                obj = raw.xs(field, axis=1, level=-1)
+                return obj[symbol] if isinstance(obj, pd.DataFrame) else obj
+        elif field in raw.columns and symbol == "SOXL":
+            return raw[field]
+        raise ValueError(f"{symbol} {field} 데이터를 찾지 못했습니다.")
+
+    df = pd.DataFrame(index=raw.index)
+    df["SOXL_Open"] = _field("Open", "SOXL")
+    df["SOXL_High"] = _field("High", "SOXL")
+    df["SOXL_Low"] = _field("Low", "SOXL")
+    df["SOXL_Close"] = _field("Close", "SOXL")
+    df["QQQ"] = _field("Close", "QQQ")
+    df["SMH"] = _field("Close", "SMH")
+    df = df.dropna().copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df.index.name = "Date"
+    return df
 
 
 @st.cache_data(ttl=30)
@@ -885,68 +927,6 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
     }
 
 
-
-def _soxl_loc_plan_from_feature_row(r, exposure_now=0.0):
-    """Fast path: use the already-precomputed feature row.
-    Semantics match get_soxl_loc_plan(), but avoids rebuilding rolling indicators
-    for every day of every TP/deployment candidate.
-    """
-    prev = float(r["SOXL"])
-    risk = 0
-    flags = []
-    def add(cond, label):
-        nonlocal risk
-        if bool(cond):
-            risk += 1; flags.append(label)
-    add(np.isfinite(r["Q_MA5"]) and np.isfinite(r["Q_MA10"]) and r["Q_MA5"] < r["Q_MA10"], "QQQ 5<10")
-    add(np.isfinite(r["Q_MA10"]) and np.isfinite(r["Q_MA20"]) and r["Q_MA10"] < r["Q_MA20"], "QQQ 10<20")
-    add(np.isfinite(r["Q_MA20_SLOPE5"]) and r["Q_MA20_SLOPE5"] < 0, "QQQ MA20↓")
-    add(np.isfinite(r["RS5"]) and r["RS5"] < 0, "SMH<QQQ")
-    add(np.isfinite(r["S_MA10"]) and r["SOXL"] < r["S_MA10"], "SOXL<MA10")
-    add(np.isfinite(r["S_MA20"]) and r["SOXL"] < r["S_MA20"], "SOXL<MA20")
-    add(np.isfinite(r["S_DIST10_D3"]) and r["S_DIST10_D3"] < 0, "10일선 이격확대")
-    add(np.isfinite(r["S_RSI_D3"]) and r["S_RSI_D3"] < 0, "RSI↓")
-    add(float(exposure_now) > 0.15, "LOT>15%")
-    add(float(exposure_now) > 0.30, "LOT>30%")
-
-    if soxl_track.startswith("C-ORIGINAL"):
-        if risk <= 2: state, offsets, weights = "ORIGINAL-공격 7+7", (0.04,-0.01), (0.07,0.07)
-        elif risk <= 4: state, offsets, weights = "ORIGINAL-정상 6+6", (-0.01,-0.04), (0.06,0.06)
-        elif risk <= 7: state, offsets, weights = "ORIGINAL-방어 5+5", (-0.02,-0.04), (0.05,0.05)
-        else: state, offsets, weights = "ORIGINAL-강방어 4+4", (-0.02,-0.06), (0.04,0.04)
-    else:
-        exp=float(exposure_now)
-        d3=float(r["S_DIST10_D3"]) if np.isfinite(r["S_DIST10_D3"]) else np.nan
-        rsi_d3=float(r["S_RSI_D3"]) if np.isfinite(r["S_RSI_D3"]) else np.nan
-        q_slope=float(r["Q_MA20_SLOPE5"]) if np.isfinite(r["Q_MA20_SLOPE5"]) else np.nan
-        rs5v=float(r["RS5"]) if np.isfinite(r["RS5"]) else np.nan
-        rebound=(np.isfinite(d3) and d3>0.025 and np.isfinite(rsi_d3) and rsi_d3>1.5 and np.isfinite(q_slope) and q_slope>=-0.006 and np.isfinite(rs5v) and rs5v>-0.015)
-        strong=(risk<=3 and np.isfinite(q_slope) and q_slope>=0 and np.isfinite(rs5v) and rs5v>=0)
-        if strong and exp<0.55: state,offsets,weights="ALPHA-강공격 9+9",(0.055,0.0),(0.09,0.09)
-        elif rebound and exp<0.55: state,offsets,weights="ALPHA-반등공격 9+8",(0.04,-0.01),(0.09,0.08)
-        elif risk<=4: state,offsets,weights="ALPHA-공격 8+8",(0.025,-0.02),(0.08,0.08)
-        elif risk<=6:
-            if exp>=0.65: state,offsets,weights="ALPHA-고LOT 4+5",(-0.03,-0.07),(0.04,0.05)
-            else: state,offsets,weights="ALPHA-중립 6+7",(-0.01,-0.045),(0.06,0.07)
-        elif exp>=0.60: state,offsets,weights="ALPHA-강약세 3+4",(-0.055,-0.11),(0.03,0.04)
-        else: state,offsets,weights="ALPHA-약세 5+6",(-0.035,-0.08),(0.05,0.06)
-    return {"state":state,"offsets":offsets,"weights":weights,"risk_score":int(risk),"risk_flags":flags,"prev_close":prev}
-
-# ============================================================
-# RECON64 — 캡처 기반 복원 상수
-# 1) 기준선: QQQ < MA200 AND DD252 <= -10%, 최대보유 60일
-# 2) 위험구간: FAST/BEAR에서는 기존 LOT까지 현금화
-# 3) 반등: SOXL 3일 +6%, 5일 +20%, QQQ 5일 > 0
-# 4) 반등 확인 후 3거래일, 기존 주문비중 2.5배(주문당 최대 30%)
-# 5) 2026은 최적화에서 제외(기존 블라인드 검증 유지)
-RECON_BEAR_DD = -0.10
-RECON_FAST_QQQ_R5 = -0.05
-RECON_REBOUND_S3 = 0.06
-RECON_REBOUND_S5 = 0.20
-RECON_BOOST_DAYS = 3
-RECON_BOOST_MULT = 2.5
-RECON_ORDER_CAP = 0.30
-
 def simulate_soxl_reverse(
     df,
     initial_cash,
@@ -1001,15 +981,15 @@ def simulate_soxl_reverse(
             s5v = float(pr.get("S_R5", np.nan))
             qprev = float(pr.get("QQQ", np.nan))
             alpha_fast = (np.isfinite(qprev) and np.isfinite(q50) and np.isfinite(q5v)
-                          and qprev < q50 and q5v <= RECON_FAST_QQQ_R5)
+                          and qprev < q50 and q5v <= -0.05)
             if (np.isfinite(qprev) and np.isfinite(q200) and np.isfinite(qddv)
-                    and qprev < q200 and qddv <= RECON_BEAR_DD):
+                    and qprev < q200 and qddv <= -0.10):
                 alpha_bear = True
             if (alpha_bear and np.isfinite(s3v) and np.isfinite(s5v) and np.isfinite(q5v)
-                    and s3v >= RECON_REBOUND_S3 and s5v >= RECON_REBOUND_S5 and q5v > 0):
+                    and s3v >= 0.06 and s5v >= 0.20 and q5v > 0):
                 alpha_bear = False
                 alpha_rebound = True
-                alpha_boost_left = RECON_BOOST_DAYS
+                alpha_boost_left = 3
 
         # 1) 기존 블록 청산
         remaining = []
@@ -1029,9 +1009,8 @@ def simulate_soxl_reverse(
                     tp_eff = min(tp_eff, 0.045)
             target = lot["price"] * (1 + tp_eff)
             hit_tp = px >= target
-            effective_hold = 60 if soxl_track.startswith("C-ALPHA") else max_hold_days
-            forced = effective_hold is not None and age >= int(effective_hold)
-            alpha_cash = soxl_track.startswith("C-ALPHA") and alpha_fast
+            forced = max_hold_days is not None and age >= int(max_hold_days)
+            alpha_cash = soxl_track.startswith("C-ALPHA") and (alpha_fast or alpha_bear)
             if hit_tp or forced or alpha_cash:
                 sell_px = px * (1 - slippage_pct)
                 proceeds = lot["qty"] * sell_px * (1 - fee_pct - fx_cost_pct)
@@ -1061,10 +1040,13 @@ def simulate_soxl_reverse(
             invested_now = mark_value
             exposure_now = invested_now / equity_now if equity_now > 0 else 0.0
 
-            # FAST: feat was computed once for the whole backtest; reuse yesterday's row.
-            # This preserves the prior-day/no-lookahead semantics while eliminating
-            # repeated rolling-indicator reconstruction inside every grid candidate.
-            plan = _soxl_loc_plan_from_feature_row(feat.iloc[i - 1], exposure_now=exposure_now)
+            plan = get_soxl_loc_plan(
+                close.iloc[:i],
+                exposure_now=exposure_now,
+                base_unit=base_unit,
+                qqq_series=qqq.iloc[:i],
+                smh_series=smh.iloc[:i],
+            )
             prev = float(plan["prev_close"])
             state = plan["state"]
             offsets = plan["offsets"]
@@ -1072,18 +1054,13 @@ def simulate_soxl_reverse(
 
             # 최신 C-ALPHA: FAST RISK/BEAR 현금화 + 반등 3일 2.5배 BOOST
             if soxl_track.startswith("C-ALPHA"):
-                if alpha_fast:
+                if alpha_fast or alpha_bear:
                     weights = (0.0, 0.0)
-                    state = "ALPHA-FAST-CASH"
-                elif alpha_bear:
-                    # RECON64 1단계 BEAR: 신규 주문만 50% 축소.
-                    # 기존 LOT은 즉시 전량청산하지 않고 TP/최대보유 규칙을 유지한다.
-                    weights = (float(weights[0]) * 0.50, float(weights[1]) * 0.50)
-                    state = "ALPHA-BEAR-50%"
+                    state = "ALPHA-현금방어"
                 elif alpha_boost_left > 0:
                     offsets = (max(float(offsets[0]), 0.04), max(float(offsets[1]), 0.00))
-                    weights = (min(float(weights[0]) * RECON_BOOST_MULT, RECON_ORDER_CAP),
-                               min(float(weights[1]) * RECON_BOOST_MULT, RECON_ORDER_CAP))
+                    weights = (min(float(weights[0]) * 2.5, 0.30),
+                               min(float(weights[1]) * 2.5, 0.30))
                     state = "ALPHA-반등BOOST"
 
             for off, weight in zip(offsets, weights):
@@ -1438,6 +1415,30 @@ try:
                     f"{len(export_df):,} 거래일"
                 )
 
+                st.divider()
+                st.markdown("**🎯 LOC + 지정가 혼합 백테스트용 OHLC**")
+                st.caption(
+                    "SOXL의 Open/High/Low/Close와 QQQ·SMH 종가를 저장합니다. "
+                    "지정가 매수는 당일 Low, 지정가 매도는 당일 High로 실제 체결 여부를 검증합니다."
+                )
+                try:
+                    ohlc_df = download_soxl_ohlc_research()
+                    ohlc_csv = ohlc_df.reset_index().to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "⬇️ SOXL OHLC 지정가 검증 CSV 받기",
+                        data=ohlc_csv,
+                        file_name="SOXL_OHLC_QQQ_SMH_daily.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="download_soxl_ohlc_research_csv",
+                    )
+                    st.caption(
+                        f"OHLC 범위: {ohlc_df.index.min().date()} ~ {ohlc_df.index.max().date()} · "
+                        f"{len(ohlc_df):,} 거래일"
+                    )
+                except Exception as e:
+                    st.warning(f"OHLC 다운로드 실패: {e}")
+
         modes = [
             {
                  "mode": f"{us_product} 신호 → {us_product} 매수",
@@ -1511,10 +1512,8 @@ try:
             effective_max_holds = [180]
             deployment_ratios = [1.00]
         else:
-            # RECON64: 캡처에서 확정된 기준선 최대보유 60일을 잠급니다.
-            # TP와 총 운용률은 원본 앱 방식대로 CAGR 1위를 자동 선택합니다.
             effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
-            effective_max_holds = [60]
+            effective_max_holds = [45, 60, 90, 120, 180]
             deployment_ratios = [0.70, 0.80, 0.90, 1.00]
 
     current_params = (
@@ -3392,11 +3391,14 @@ try:
         # 실제 보유 블록은 각 블록의 실제 체결가를 기준으로 같은 익절률을 적용한다.
         soxl_sell_prices = [float(px) * (1 + float(live_best_tp)) for px in soxl_prices]
 
-        st.markdown("### 📌 SOXL 다음 거래일 LOC 주문 — 매일 매수·매도 동시 제시")
+        # 오늘 주문판: 아래 가격은 표시용 임시값이 아니라 get_soxl_loc_plan()의
+        # 실제 C-ORIGINAL/C-ALPHA offsets/weights에서 직접 계산한다.
+        st.markdown("## 🎯 오늘 SOXL 실제 주문가격")
         st.caption(
-            f"상태: **{soxl_plan['state']}** · C위험점수 {soxl_plan.get('risk_score', '-')}/10 · "
+            f"전략 계산값 직접 연결 · 상태: **{soxl_plan['state']}** · "
+            f"C위험점수 {soxl_plan.get('risk_score', '-')}/10 · "
             f"현재 추정 투입 {exposure_now_live:.1%} · 최대 누적투입 {cap:.0%} · "
-            f"전일종가 {currency}{prev_close_live:,.2f} · 조건이 약한 날도 주문 기준값을 표시합니다."
+            f"기준 확정종가 {currency}{prev_close_live:,.2f}"
         )
         if soxl_plan.get("risk_flags"):
             st.caption("C타입 위험요인: " + " · ".join(soxl_plan["risk_flags"]))
@@ -3404,7 +3406,7 @@ try:
         b1, b2 = st.columns(2)
         for idx, (col, price, off, w) in enumerate(zip((b1, b2), soxl_prices, soxl_offsets, shown_weights), start=1):
             with col:
-                st.metric(f"매수 LOC {idx}", f"{currency}{price:,.2f}")
+                st.metric(f"오늘 매수 LOC {idx}", f"{currency}{price:,.2f}")
                 st.caption(
                     f"전일종가 대비 {off:+.0%} · 총자산 {w:.2%} "
                     f"({currency}{float(investment)*w:,.0f})"
@@ -3413,11 +3415,30 @@ try:
         s1, s2 = st.columns(2)
         for idx, (col, sell_px, w) in enumerate(zip((s1, s2), soxl_sell_prices, shown_weights), start=1):
             with col:
-                st.metric(f"매도 LOC {idx}", f"{currency}{sell_px:,.2f}")
+                st.metric(f"오늘 매도 LOC {idx}", f"{currency}{sell_px:,.2f}")
                 st.caption(
                     f"대응 매수 LOC {idx} 기준 +{live_best_tp:.0%} · "
                     f"기준 비중 {w:.2%}"
                 )
+
+        today_order_rows = []
+        for idx, (price, off, w) in enumerate(zip(soxl_prices, soxl_offsets, shown_weights), start=1):
+            today_order_rows.append({
+                "구분": f"매수 {idx}",
+                "주문방식": "LOC",
+                "가격": f"{currency}{price:,.2f}",
+                "총자산 비중": f"{w:.2%}",
+                "주문금액": f"{currency}{float(investment)*w:,.0f}",
+            })
+        for idx, (sell_px, w) in enumerate(zip(soxl_sell_prices, shown_weights), start=1):
+            today_order_rows.append({
+                "구분": f"매도 {idx}",
+                "주문방식": "LOC",
+                "가격": f"{currency}{sell_px:,.2f}",
+                "총자산 비중": f"{w:.2%}",
+                "주문금액": "보유 LOT 기준",
+            })
+        st.dataframe(pd.DataFrame(today_order_rows), use_container_width=True, hide_index=True)
 
         st.write(
             f"**오늘 제시 매수비중 합계:** 총자산 {sum(shown_weights):.2%} "
