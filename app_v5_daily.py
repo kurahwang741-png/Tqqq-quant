@@ -1647,13 +1647,78 @@ try:
         st.stop()
 
     st.divider()
+
+    # ------------------------------------------------------------
+    # SOXL 오늘 주문값 FAST PATH
+    # 백테스트/최적화를 기다리지 않고 확정 일봉만으로 즉시 계산한다.
+    # 실제 전략 함수 get_soxl_loc_plan()을 그대로 호출하므로 표시용 임시가격이 아니다.
+    # ------------------------------------------------------------
     if market.startswith("🇺🇸") and us_product == "SOXL":
+        try:
+            _soxl_fast = close["SOXL"].dropna()
+            _qqq_fast = close["QQQ"].dropna()
+            _smh_fast = close["SMH"].dropna()
+
+            # 저장된 실전 기록이 있으면 현재 원금 대비 보유원가로 투입률을 추정한다.
+            _fast_records = load_autosaved_trades()
+            _fast_open_cost = 0.0
+            if _fast_records:
+                for _r in _fast_records:
+                    try:
+                        _status = str(_r.get("상태", _r.get("status", ""))).lower()
+                        if _status in ("매도", "청산", "sold", "closed"):
+                            continue
+                        _amt = _r.get("매수금액", _r.get("금액", _r.get("amount", 0)))
+                        _fast_open_cost += float(_amt or 0)
+                    except Exception:
+                        pass
+            _fast_exp = min(1.0, max(0.0, _fast_open_cost / float(investment))) if float(investment) > 0 else 0.0
+
+            _fast_plan = get_soxl_loc_plan(
+                _soxl_fast,
+                exposure_now=_fast_exp,
+                base_unit=0.06,
+                qqq_series=_qqq_fast,
+                smh_series=_smh_fast,
+            )
+            _fast_prev = float(_fast_plan["prev_close"])
+            _fast_offsets = tuple(_fast_plan["offsets"])
+            _fast_weights = tuple(_fast_plan["weights"])
+            _fast_buy = [_fast_prev * (1.0 + float(x)) for x in _fast_offsets]
+
+            # 현재 앱의 C-ORIGINAL 기본 TP 6%. C-ALPHA는 최종 연구 기본값 5%를 표시한다.
+            _fast_tp = 0.06 if soxl_track.startswith("C-ORIGINAL") else 0.05
+            _fast_sell = [x * (1.0 + _fast_tp) for x in _fast_buy]
+
+            st.markdown("## ⚡ 오늘 SOXL 주문값 — 백테스트 없이 즉시")
+            st.caption(
+                f"상태 **{_fast_plan['state']}** · 위험점수 {_fast_plan.get('risk_score','-')}/10 · "
+                f"확정종가 ${_fast_prev:,.2f} · 추정 현재투입 {_fast_exp:.1%}"
+            )
+            _fast_rows = []
+            for _i, (_px, _w) in enumerate(zip(_fast_buy, _fast_weights), 1):
+                _fast_rows.append({
+                    "주문": f"매수 {_i}", "방식": "LOC",
+                    "가격": f"${_px:,.2f}", "자산비중": f"{float(_w):.1%}",
+                    "금액": f"${float(investment)*float(_w):,.0f}",
+                })
+            for _i, (_px, _w) in enumerate(zip(_fast_sell, _fast_weights), 1):
+                _fast_rows.append({
+                    "주문": f"매도 {_i}", "방식": "LOC",
+                    "가격": f"${_px:,.2f}", "자산비중": f"{float(_w):.1%}",
+                    "금액": "보유 LOT 기준",
+                })
+            st.dataframe(pd.DataFrame(_fast_rows), use_container_width=True, hide_index=True)
+            st.success("✅ 오늘 주문가격은 위에서 바로 확인할 수 있습니다. 아래 백테스트는 과거 성과를 다시 검증할 때만 실행하세요.")
+        except Exception as _fast_e:
+            st.warning(f"오늘 SOXL 주문값 즉시 계산 실패: {_fast_e}")
+
         st.info(
             "🧪 SOXL DUAL 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
-    st.subheader("🏆 전략 자동 비교")
+    st.subheader("🏆 과거 백테스트 / 전략 자동 비교 (오늘 주문 확인에는 불필요)")
     if market.startswith("🇺🇸") and us_product == "SOXL":
         if soxl_track.startswith("C-ORIGINAL"):
             st.caption("C-ORIGINAL은 최적화 없이 고정 로직 1개만 즉시 계산합니다. 실제 주문 재현 → 8월 블라인드 → 장기 CAGR/MDD 순으로 평가합니다.")
