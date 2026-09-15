@@ -1691,6 +1691,41 @@ try:
             _fast_sell = [x * (1.0 + _fast_tp) for x in _fast_buy]
 
             st.markdown("## ⚡ 오늘 SOXL 주문값 — 백테스트 없이 즉시")
+
+            # 미국 정규장 마감 후 최신 일봉이 실제로 반영됐는지 자동 확인.
+            # 단순 시계가 아니라 SOXL 데이터의 마지막 거래일과 미국 동부 현재 날짜/시간을 비교한다.
+            try:
+                from zoneinfo import ZoneInfo
+                _utc_now = datetime.now(timezone.utc)
+                _ny_now = _utc_now.astimezone(ZoneInfo("America/New_York"))
+                _kr_now = _utc_now.astimezone(ZoneInfo("Asia/Seoul"))
+                _last_bar_date = pd.Timestamp(_soxl_fast.index[-1]).date()
+
+                # 평일 ET 16:00 이후에는 '오늘' 일봉이 있어야 확정,
+                # 장 마감 전에는 직전 거래일 일봉을 정상 데이터로 취급한다.
+                _after_close = (_ny_now.weekday() < 5 and _ny_now.time() >= datetime.strptime("16:00", "%H:%M").time())
+                _expected_today = _ny_now.date()
+
+                if _after_close and _last_bar_date >= _expected_today:
+                    st.success(
+                        f"✅ 오늘 데이터 확정됨 · SOXL 최신 일봉 {_last_bar_date} · "
+                        f"한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M}"
+                    )
+                elif _after_close:
+                    st.warning(
+                        f"⏳ 아직 오늘 일봉 업데이트 전 · 현재 최신 {_last_bar_date} · "
+                        f"미국장 마감 후 데이터 반영을 기다리는 중입니다. "
+                        f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
+                    )
+                else:
+                    st.info(
+                        f"🟢 장 마감 전 · 최신 확정 일봉 {_last_bar_date} 기준 주문값 · "
+                        f"미국장 마감 후 다시 확인하면 다음 거래일 주문값이 갱신됩니다. "
+                        f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
+                    )
+            except Exception as _status_e:
+                st.caption(f"데이터 확정상태 확인 불가: {_status_e}")
+
             st.caption(
                 f"상태 **{_fast_plan['state']}** · 위험점수 {_fast_plan.get('risk_score','-')}/10 · "
                 f"확정종가 ${_fast_prev:,.2f} · 추정 현재투입 {_fast_exp:.1%}"
