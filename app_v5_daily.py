@@ -3394,6 +3394,18 @@ try:
         # 오늘 주문판: 아래 가격은 표시용 임시값이 아니라 get_soxl_loc_plan()의
         # 실제 C-ORIGINAL/C-ALPHA offsets/weights에서 직접 계산한다.
         st.markdown("## 🎯 오늘 SOXL 실제 주문가격")
+        # 한국시간과 미국 동부시간을 함께 표시해 주문 시점을 바로 확인할 수 있게 한다.
+        try:
+            from zoneinfo import ZoneInfo
+            _now_utc = datetime.now(timezone.utc)
+            _now_kr = _now_utc.astimezone(ZoneInfo("Asia/Seoul"))
+            _now_ny = _now_utc.astimezone(ZoneInfo("America/New_York"))
+            st.caption(
+                f"🕒 현재시간 · 한국 {_now_kr:%Y-%m-%d %H:%M:%S} KST · "
+                f"미국 동부 {_now_ny:%Y-%m-%d %H:%M:%S} ET"
+            )
+        except Exception:
+            st.caption(f"🕒 현재 UTC {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}")
         st.caption(
             f"전략 계산값 직접 연결 · 상태: **{soxl_plan['state']}** · "
             f"C위험점수 {soxl_plan.get('risk_score', '-')}/10 · "
