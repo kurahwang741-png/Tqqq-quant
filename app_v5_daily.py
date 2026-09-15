@@ -15,12 +15,12 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="TQQQ / SOXL / 코코레 QUANT V32 DUAL",
+    page_title="TQQQ / SOXL / 코코레 QUANT RECON64",
     page_icon="📈",
     layout="centered",
 )
 
-st.title("📈 TQQQ / SOXL / 코코레 QUANT V32 DUAL")
+st.title("📈 TQQQ / SOXL / 코코레 QUANT RECON64")
 st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
@@ -78,19 +78,11 @@ if market.startswith("🇺🇸") and us_product == "SOXL":
         help="ORIGINAL은 실제 주문 템플릿 4+4/5+5/6+6/7+7 재현이 1차 목표입니다. ALPHA는 ORIGINAL을 복사해 장기 CAGR을 높이는 별도 실험입니다.",
     )
     if soxl_track.startswith("C-ORIGINAL"):
-        soxl_macro_mode = "OFF · 기존 기준선"
         st.info("🔎 C-ORIGINAL: 3~7월 실제 주문 재현이 1차 목표 · 8월은 블라인드 검증용으로 고정 · CAGR은 2차 평가")
     else:
         st.warning("🧪 C-ALPHA: 원본을 훼손하지 않는 별도 연구 트랙 · 2016~2025 장기 CAGR 평가 · 8월/9월은 튜닝 금지")
-        soxl_macro_mode = st.radio(
-            "🌡️ ALPHA 거시필터",
-            ["OFF · 기존 기준선", "VIX · 공포/반등", "VIX+금리 · 공포/금리 동시"],
-            horizontal=True,
-            help="C-ORIGINAL에는 영향이 없습니다. ALPHA에서만 전일까지 확정된 VIX와 미국 10년물 금리를 사용합니다.",
-        )
 else:
     soxl_track = "C-ORIGINAL · 원본 주문 역추적"
-    soxl_macro_mode = "OFF · 기존 기준선"
 
 if market.startswith("🇺🇸"):
     currency = "$"
@@ -733,7 +725,7 @@ def load_autosaved_trades():
 
 
 
-def _soxl_c_features(soxl_series, qqq_series, smh_series, vix_series=None, tnx_series=None):
+def _soxl_c_features(soxl_series, qqq_series, smh_series):
     """C타입 시장/종목 상태 계산. 호출 시점까지의 확정 일봉만 사용합니다."""
     d = pd.concat(
         [
@@ -742,16 +734,11 @@ def _soxl_c_features(soxl_series, qqq_series, smh_series, vix_series=None, tnx_s
             pd.Series(smh_series, name="SMH").astype(float),
         ],
         axis=1,
-    )
-    if vix_series is not None:
-        d["VIX"] = pd.Series(vix_series).astype(float).reindex(d.index)
-    if tnx_series is not None:
-        d["TNX"] = pd.Series(tnx_series).astype(float).reindex(d.index)
-    d = d.dropna(subset=["SOXL", "QQQ", "SMH"])
+    ).dropna()
     if d.empty:
         return None
 
-    for p in (5, 10, 20):
+    for p in (5, 10, 20, 50, 200):
         d[f"S_MA{p}"] = d["SOXL"].rolling(p, min_periods=max(3, p // 2)).mean()
         d[f"Q_MA{p}"] = d["QQQ"].rolling(p, min_periods=max(3, p // 2)).mean()
 
@@ -764,18 +751,14 @@ def _soxl_c_features(soxl_series, qqq_series, smh_series, vix_series=None, tnx_s
     d["SMH_R5"] = d["SMH"].pct_change(5)
     d["QQQ_R5"] = d["QQQ"].pct_change(5)
     d["RS5"] = d["SMH_R5"] - d["QQQ_R5"]
+    d["Q_DD252"] = d["QQQ"] / d["QQQ"].rolling(252, min_periods=50).max() - 1
+    d["S_R3"] = d["SOXL"].pct_change(3)
+    d["S_R5"] = d["SOXL"].pct_change(5)
     d["S_VOL20"] = d["SOXL"].pct_change().rolling(20, min_periods=10).std()
-    if "VIX" in d.columns:
-        d["VIX_MA10"] = d["VIX"].rolling(10, min_periods=5).mean()
-        d["VIX_D3"] = d["VIX"].diff(3)
-        d["VIX_R5"] = d["VIX"].pct_change(5)
-    if "TNX" in d.columns:
-        d["TNX_MA20"] = d["TNX"].rolling(20, min_periods=10).mean()
-        d["TNX_D5"] = d["TNX"].diff(5)
     return d
 
 
-def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None, vix_series=None, tnx_series=None):
+def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series=None, smh_series=None):
     """V32-C 계획.
 
     C타입 = SOXL 이평/RSI + LOT + QQQ 이평 구조 + SMH/QQQ 상대강도.
@@ -805,7 +788,7 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
             "prev_close": prev,
         }
 
-    feat = _soxl_c_features(ser, qqq_series, smh_series, vix_series, tnx_series)
+    feat = _soxl_c_features(ser, qqq_series, smh_series)
     if feat is None or feat.empty:
         prev = float(ser.iloc[-1])
         return {
@@ -871,30 +854,6 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
         rebound = (np.isfinite(d3) and d3 > 0.025 and np.isfinite(rsi_d3) and rsi_d3 > 1.5
                    and np.isfinite(q_slope) and q_slope >= -0.006 and np.isfinite(rs5v) and rs5v > -0.015)
         strong = (risk <= 3 and np.isfinite(q_slope) and q_slope >= 0 and np.isfinite(rs5v) and rs5v >= 0)
-        # 거시필터는 '진입 금지'보다 공격/반등 신호의 질을 조절하는 방식으로 사용합니다.
-        # VIX 급등 후 꺾임은 반등 가점, VIX 재급등/고금리 상승은 공격 억제. 모두 전일 확정값입니다.
-        macro_mode = globals().get("soxl_macro_mode", "OFF · 기존 기준선")
-        vix = float(r.get("VIX", np.nan)) if np.isfinite(r.get("VIX", np.nan)) else np.nan
-        vix_d3 = float(r.get("VIX_D3", np.nan)) if np.isfinite(r.get("VIX_D3", np.nan)) else np.nan
-        vix_r5 = float(r.get("VIX_R5", np.nan)) if np.isfinite(r.get("VIX_R5", np.nan)) else np.nan
-        tnx = float(r.get("TNX", np.nan)) if np.isfinite(r.get("TNX", np.nan)) else np.nan
-        tnx_d5 = float(r.get("TNX_D5", np.nan)) if np.isfinite(r.get("TNX_D5", np.nan)) else np.nan
-        if macro_mode.startswith("VIX") and np.isfinite(vix):
-            fear_reversal = (vix >= 22 and np.isfinite(vix_d3) and vix_d3 <= -1.0)
-            fear_rising = ((vix >= 30 and np.isfinite(vix_d3) and vix_d3 > 0) or
-                           (np.isfinite(vix_r5) and vix_r5 > 0.20))
-            rebound = rebound and (fear_reversal or not fear_rising)
-            strong = strong and not fear_rising
-            if fear_reversal and exp < 0.55 and np.isfinite(d3) and d3 > 0:
-                rebound = True
-        if macro_mode.startswith("VIX+금리") and np.isfinite(tnx):
-            rate_shock = (tnx >= 4.25 and np.isfinite(tnx_d5) and tnx_d5 >= 0.15)
-            rate_relief = (np.isfinite(tnx_d5) and tnx_d5 <= -0.12)
-            strong = strong and not rate_shock
-            if rate_shock and risk >= 5:
-                risk += 1
-            if rate_relief and rebound:
-                risk = max(0, risk - 1)
         if strong and exp < 0.55:
             state, offsets, weights = "ALPHA-강공격 9+9", (0.055, 0.000), (0.09, 0.09)
         elif rebound and exp < 0.55:
@@ -926,6 +885,21 @@ def get_soxl_loc_plan(close_series, exposure_now=0.0, base_unit=0.06, qqq_series
     }
 
 
+# ============================================================
+# RECON64 — 캡처 기반 복원 상수
+# 1) 기준선: QQQ < MA200 AND DD252 <= -10%, 최대보유 60일
+# 2) 위험구간: FAST/BEAR에서는 기존 LOT까지 현금화
+# 3) 반등: SOXL 3일 +6%, 5일 +20%, QQQ 5일 > 0
+# 4) 반등 확인 후 3거래일, 기존 주문비중 2.5배(주문당 최대 30%)
+# 5) 2026은 최적화에서 제외(기존 블라인드 검증 유지)
+RECON_BEAR_DD = -0.10
+RECON_FAST_QQQ_R5 = -0.05
+RECON_REBOUND_S3 = 0.06
+RECON_REBOUND_S5 = 0.20
+RECON_BOOST_DAYS = 3
+RECON_BOOST_MULT = 2.5
+RECON_ORDER_CAP = 0.30
+
 def simulate_soxl_reverse(
     df,
     initial_cash,
@@ -949,6 +923,9 @@ def simulate_soxl_reverse(
     lots = []
     trades = []
     equity_rows = []
+    # C-ALPHA 최신 연구 상태 (C-ORIGINAL은 그대로 보존)
+    alpha_bear = False
+    alpha_boost_left = 0
 
     if "QQQ" not in df.columns or "SMH" not in df.columns:
         raise ValueError("V32-C SOXL 백테스트에는 QQQ와 SMH 일봉이 필요합니다.")
@@ -956,15 +933,36 @@ def simulate_soxl_reverse(
     close = df["TRADE"].astype(float).copy()
     qqq = df["QQQ"].astype(float).copy()
     smh = df["SMH"].astype(float).copy()
-    vix = df["VIX"].astype(float).copy() if "VIX" in df.columns else None
-    tnx = df["TNX"].astype(float).copy() if "TNX" in df.columns else None
-    feat = _soxl_c_features(close, qqq, smh, vix, tnx)
+    feat = _soxl_c_features(close, qqq, smh)
     feat = feat.reindex(df.index)
 
     for i, dt in enumerate(df.index):
         px = float(close.iloc[i])
         if not np.isfinite(px) or px <= 0:
             continue
+
+        # 모든 위험/반등 판정은 전 거래일 확정 일봉만 사용
+        alpha_fast = False
+        alpha_rebound = False
+        if soxl_track.startswith("C-ALPHA") and i > 0:
+            pr = feat.iloc[i - 1]
+            q5v = float(pr.get("QQQ_R5", np.nan))
+            q50 = float(pr.get("Q_MA50", np.nan))
+            q200 = float(pr.get("Q_MA200", np.nan))
+            qddv = float(pr.get("Q_DD252", np.nan))
+            s3v = float(pr.get("S_R3", np.nan))
+            s5v = float(pr.get("S_R5", np.nan))
+            qprev = float(pr.get("QQQ", np.nan))
+            alpha_fast = (np.isfinite(qprev) and np.isfinite(q50) and np.isfinite(q5v)
+                          and qprev < q50 and q5v <= RECON_FAST_QQQ_R5)
+            if (np.isfinite(qprev) and np.isfinite(q200) and np.isfinite(qddv)
+                    and qprev < q200 and qddv <= RECON_BEAR_DD):
+                alpha_bear = True
+            if (alpha_bear and np.isfinite(s3v) and np.isfinite(s5v) and np.isfinite(q5v)
+                    and s3v >= RECON_REBOUND_S3 and s5v >= RECON_REBOUND_S5 and q5v > 0):
+                alpha_bear = False
+                alpha_rebound = True
+                alpha_boost_left = RECON_BOOST_DAYS
 
         # 1) 기존 블록 청산
         remaining = []
@@ -984,8 +982,10 @@ def simulate_soxl_reverse(
                     tp_eff = min(tp_eff, 0.045)
             target = lot["price"] * (1 + tp_eff)
             hit_tp = px >= target
-            forced = max_hold_days is not None and age >= int(max_hold_days)
-            if hit_tp or forced:
+            effective_hold = 60 if soxl_track.startswith("C-ALPHA") else max_hold_days
+            forced = effective_hold is not None and age >= int(effective_hold)
+            alpha_cash = soxl_track.startswith("C-ALPHA") and alpha_fast
+            if hit_tp or forced or alpha_cash:
                 sell_px = px * (1 - slippage_pct)
                 proceeds = lot["qty"] * sell_px * (1 - fee_pct - fx_cost_pct)
                 cash += proceeds
@@ -999,7 +999,7 @@ def simulate_soxl_reverse(
                     "실현손익": pnl,
                     "보유일수": age,
                     "매수횟수": 1,
-                    "청산사유": "익절" if hit_tp else "기간청산",
+                    "청산사유": ("ALPHA위험회피" if alpha_cash else ("익절" if hit_tp else "기간청산")),
                     "진입상태": lot.get("state", ""),
                 })
             else:
@@ -1020,13 +1020,27 @@ def simulate_soxl_reverse(
                 base_unit=base_unit,
                 qqq_series=qqq.iloc[:i],
                 smh_series=smh.iloc[:i],
-                vix_series=(vix.iloc[:i] if vix is not None else None),
-                tnx_series=(tnx.iloc[:i] if tnx is not None else None),
             )
             prev = float(plan["prev_close"])
             state = plan["state"]
             offsets = plan["offsets"]
             weights = plan["weights"]
+
+            # 최신 C-ALPHA: FAST RISK/BEAR 현금화 + 반등 3일 2.5배 BOOST
+            if soxl_track.startswith("C-ALPHA"):
+                if alpha_fast:
+                    weights = (0.0, 0.0)
+                    state = "ALPHA-FAST-CASH"
+                elif alpha_bear:
+                    # RECON64 1단계 BEAR: 신규 주문만 50% 축소.
+                    # 기존 LOT은 즉시 전량청산하지 않고 TP/최대보유 규칙을 유지한다.
+                    weights = (float(weights[0]) * 0.50, float(weights[1]) * 0.50)
+                    state = "ALPHA-BEAR-50%"
+                elif alpha_boost_left > 0:
+                    offsets = (max(float(offsets[0]), 0.04), max(float(offsets[1]), 0.00))
+                    weights = (min(float(weights[0]) * RECON_BOOST_MULT, RECON_ORDER_CAP),
+                               min(float(weights[1]) * RECON_BOOST_MULT, RECON_ORDER_CAP))
+                    state = "ALPHA-반등BOOST"
 
             for off, weight in zip(offsets, weights):
                 limit_px = prev * (1 + float(off))
@@ -1051,6 +1065,9 @@ def simulate_soxl_reverse(
                     "risk_score": int(plan.get("risk_score", -1)),
                 })
                 invested_now += qty * px
+
+        if soxl_track.startswith("C-ALPHA") and alpha_boost_left > 0:
+            alpha_boost_left -= 1
 
         shares = sum(lot["qty"] for lot in lots)
         invested_value = shares * px * (1 - slippage_pct) * (1 - fee_pct - fx_cost_pct)
@@ -1350,16 +1367,16 @@ try:
     # 데이터 / 비교할 운용 방식
     # ------------------------------------------------------------
     if market.startswith("🇺🇸"):
-        symbols = [us_product, "QQQ"] if us_product == "TQQQ" else ["SOXL", "QQQ", "SMH", "^VIX", "^TNX"]
+        symbols = [us_product, "QQQ"] if us_product == "TQQQ" else ["SOXL", "QQQ", "SMH"]
         close = download_close(symbols).dropna()
 
         # SOXL 연구용 원천 일봉을 한 번 저장해두면 이후에는 ChatGPT 쪽에서
         # Streamlit 재실행 없이 같은 데이터로 C-ORIGINAL / C-ALPHA를 반복 검증할 수 있습니다.
         if us_product == "SOXL":
-            export_df = close[["SOXL", "QQQ", "SMH", "^VIX", "^TNX"]].copy()
+            export_df = close[["SOXL", "QQQ", "SMH"]].copy()
             export_df.index.name = "Date"
             export_csv = export_df.reset_index().to_csv(index=False).encode("utf-8-sig")
-            with st.expander("📦 SOXL·QQQ·SMH·VIX·TNX 연구 데이터 저장", expanded=False):
+            with st.expander("📦 SOXL·QQQ·SMH 연구 데이터 저장", expanded=False):
                 st.caption(
                     "이 CSV를 한 번 저장해두면 이후 백테스트는 같은 가격데이터로 바로 반복할 수 있습니다. "
                     "원본 일봉만 담고 전략 결과나 8월 주문 정답은 포함하지 않습니다."
@@ -1367,7 +1384,7 @@ try:
                 st.download_button(
                     "⬇️ SOXL_QQQ_SMH 일봉 CSV 받기",
                     data=export_csv,
-                    file_name="SOXL_QQQ_SMH_VIX_TNX_daily.csv",
+                    file_name="SOXL_QQQ_SMH_daily.csv",
                     mime="text/csv",
                     use_container_width=True,
                     key="download_soxl_research_csv",
@@ -1450,8 +1467,10 @@ try:
             effective_max_holds = [180]
             deployment_ratios = [1.00]
         else:
+            # RECON64: 캡처에서 확정된 기준선 최대보유 60일을 잠급니다.
+            # TP와 총 운용률은 원본 앱 방식대로 CAGR 1위를 자동 선택합니다.
             effective_take_profits = [0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.12]
-            effective_max_holds = [45, 60, 90, 120, 180]
+            effective_max_holds = [60]
             deployment_ratios = [0.70, 0.80, 0.90, 1.00]
 
     current_params = (
@@ -1587,8 +1606,8 @@ try:
     st.divider()
     if market.startswith("🇺🇸") and us_product == "SOXL":
         st.info(
-            "🧪 SOXL DUAL 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도 + 선택형 VIX/10년물 필터로 "
-            "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. C-ALPHA에서는 거시필터를 OFF/VIX/VIX+금리로 비교할 수 있습니다. "
+            "🧪 SOXL DUAL 백테스트: SOXL 이평/RSI + 실제 LOT + QQQ 이평 구조 + SMH/QQQ 5일 상대강도로 "
+            "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
     st.subheader("🏆 전략 자동 비교")
@@ -1635,8 +1654,6 @@ try:
             if market.startswith("🇺🇸") and us_product == "SOXL":
                 df["QQQ"] = close["QQQ"]
                 df["SMH"] = close["SMH"]
-                df["VIX"] = close["^VIX"]
-                df["TNX"] = close["^TNX"]
             df = df.dropna()
             df = apply_backtest_period(
                 df,
@@ -3304,16 +3321,12 @@ try:
         base_unit_live = float(live_best_step) if 0.02 <= float(live_best_step) <= 0.10 else 0.05
         qqq_live = close["QQQ"].dropna() if "QQQ" in close.columns else None
         smh_live = close["SMH"].dropna() if "SMH" in close.columns else None
-        vix_live = close["^VIX"].dropna() if "^VIX" in close.columns else None
-        tnx_live = close["^TNX"].dropna() if "^TNX" in close.columns else None
         soxl_plan = get_soxl_loc_plan(
             trade_series,
             exposure_now=exposure_now_live,
             base_unit=base_unit_live,
             qqq_series=qqq_live,
             smh_series=smh_live,
-            vix_series=vix_live,
-            tnx_series=tnx_live,
         )
         prev_close_live = float(soxl_plan.get("prev_close", trade_series.iloc[-1]))
         soxl_offsets = soxl_plan["offsets"]
