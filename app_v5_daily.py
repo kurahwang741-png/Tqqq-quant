@@ -24,6 +24,7 @@ st.title("📈 TQQQ / SOXL / 코코레 QUANT V32 DUAL")
 st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
 
 AUTO_LOG_PATH = Path("quant_trade_log_autosave.csv")
+POSITION_STATE_PATH = Path("quant_position_state.json")
 BACKTEST_CHECKPOINT_DIR = Path(".quant_backtest_checkpoints")
 BACKTEST_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 BACKTEST_CHECKPOINT_EVERY = 20
@@ -773,6 +774,53 @@ def trade_log_checksum(records):
     raw = json.dumps(records or [], ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:12]
 
+
+def load_position_state():
+    try:
+        if POSITION_STATE_PATH.exists() and POSITION_STATE_PATH.stat().st_size:
+            data = json.loads(POSITION_STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def save_position_state(symbol, qty, avg_price, lots=None):
+    data = load_position_state()
+    old = data.get(str(symbol), {}) if isinstance(data, dict) else {}
+    data[str(symbol)] = {
+        "qty": float(qty or 0),
+        "avg_price": float(avg_price or 0),
+        "lots": list(lots if lots is not None else old.get("lots", [])),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp = POSITION_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(POSITION_STATE_PATH)
+    return True
+
+def add_position_lot(symbol, price, qty, label=""):
+    data = load_position_state()
+    pos = data.get(symbol, {})
+    lots = list(pos.get("lots", []))
+    lots.append({"price": float(price), "qty": float(qty), "label": str(label),
+                 "filled_at": datetime.now(timezone.utc).isoformat()})
+    total_qty = sum(float(x.get("qty", 0)) for x in lots)
+    total_cost = sum(float(x.get("price", 0))*float(x.get("qty", 0)) for x in lots)
+    avg = total_cost/total_qty if total_qty > 0 else 0.0
+    save_position_state(symbol, total_qty, avg, lots)
+    return total_qty, avg
+
+def close_position_lot(symbol, lot_index):
+    data = load_position_state()
+    pos = data.get(symbol, {})
+    lots = list(pos.get("lots", []))
+    if 0 <= int(lot_index) < len(lots):
+        lots.pop(int(lot_index))
+    total_qty = sum(float(x.get("qty", 0)) for x in lots)
+    total_cost = sum(float(x.get("price", 0))*float(x.get("qty", 0)) for x in lots)
+    avg = total_cost/total_qty if total_qty > 0 else 0.0
+    save_position_state(symbol, total_qty, avg, lots)
+    return total_qty, avg
 
 def autosave_live_trades(records):
     """앱 재실행 시 복구할 수 있도록 매매기록을 즉시 저장합니다."""
@@ -1802,17 +1850,23 @@ try:
             st.markdown("### 💼 현재 SOXL 보유상태")
             st.caption("과거 매매일지는 없어도 됩니다. 지금 보유 중인 수량과 평균매수가만 입력하면 오늘 추가매수 가능 비중을 계산합니다.")
 
+            _saved_soxl = load_position_state().get("SOXL", {})
+            if "soxl_manual_qty" not in st.session_state:
+                st.session_state["soxl_manual_qty"] = float(_saved_soxl.get("qty", 0.0) or 0.0)
+            if "soxl_manual_avg" not in st.session_state:
+                st.session_state["soxl_manual_avg"] = float(_saved_soxl.get("avg_price", 0.0) or 0.0)
+
+            def _save_soxl_position_now():
+                # 수동 수정은 현재 총수량/평단을 교정하는 기능. 기존 LOT는 그대로 보존한다.
+                save_position_state("SOXL", st.session_state.get("soxl_manual_qty", 0.0),
+                                    st.session_state.get("soxl_manual_avg", 0.0))
+
             _hold1, _hold2 = st.columns(2)
-            _fast_qty = _hold1.number_input(
-                "SOXL 보유수량(주)",
-                min_value=0.0, value=float(st.session_state.get("soxl_manual_qty", 0.0)),
-                step=1.0, key="soxl_manual_qty"
-            )
-            _fast_avg = _hold2.number_input(
-                "SOXL 평균매수가($)",
-                min_value=0.0, value=float(st.session_state.get("soxl_manual_avg", 0.0)),
-                step=0.01, key="soxl_manual_avg"
-            )
+            _fast_qty = _hold1.number_input("SOXL 보유수량(주)", min_value=0.0, step=1.0,
+                                             key="soxl_manual_qty", on_change=_save_soxl_position_now)
+            _fast_avg = _hold2.number_input("SOXL 평균매수가($)", min_value=0.0, step=0.01,
+                                             key="soxl_manual_avg", on_change=_save_soxl_position_now)
+            st.caption("💾 보유현황 자동저장 ON · 변경 즉시 저장되고 다음 접속 때 자동 복원됩니다.")
 
             _fast_open_cost = float(_fast_qty) * float(_fast_avg)
             _fast_exp = min(1.0, max(0.0, _fast_open_cost / float(investment))) if float(investment) > 0 else 0.0
@@ -1909,8 +1963,46 @@ try:
                 })
 
             st.dataframe(pd.DataFrame(_fast_rows), use_container_width=True, hide_index=True)
-            if float(_fast_qty) > 0:
-                st.caption("※ 기존 보유분의 개별 LOT 매수가를 입력하지 않았으므로 기존 물량 매도가는 평균매수가 기준 참고값입니다. 새로 체결되는 매수는 아래 매매기록에 저장하면 이후 LOT별 관리가 가능합니다.")
+
+            st.markdown("### ✅ LOC 체결 반영")
+            st.caption("증권사 체결내역을 확인한 뒤 해당 버튼만 누르세요. 앱은 체결 여부를 추정하지 않습니다.")
+            _fill_cols = st.columns(max(1, len(_fast_buy)))
+            _fill_remaining = _fast_cash
+            for _j, (_px, _w) in enumerate(zip(_fast_buy, _fast_weights)):
+                _amt = min(float(investment)*float(_w), _fill_remaining)
+                _qty = int(_amt // float(_px)) if float(_px) > 0 else 0
+                _fill_remaining -= _amt
+                if _fill_cols[_j].button(
+                    f"매수 {_j+1} 체결됨\n{_qty}주 @ ${_px:,.2f}",
+                    key=f"soxl_buy_fill_{pd.Timestamp(_soxl_fast.index[-1]).date()}_{_j}",
+                    use_container_width=True,
+                    disabled=(_qty <= 0),
+                ):
+                    _new_qty, _new_avg = add_position_lot("SOXL", _px, _qty, f"매수 {_j+1}")
+                    st.session_state["soxl_manual_qty"] = float(_new_qty)
+                    st.session_state["soxl_manual_avg"] = float(_new_avg)
+                    st.success(f"매수 {_j+1} 체결 저장: {_qty}주 @ ${_px:,.2f} · 새 평단 ${_new_avg:,.2f}")
+                    st.rerun()
+
+            # 앱에서 체결 확인한 LOT는 개별 목표가로 정확히 관리한다.
+            _position_now = load_position_state().get("SOXL", {})
+            _lots_now = list(_position_now.get("lots", []))
+            if _lots_now:
+                st.markdown("### 📚 보유 LOT별 매도")
+                for _li, _lot in enumerate(_lots_now):
+                    _lp = float(_lot.get("price", 0))
+                    _lq = float(_lot.get("qty", 0))
+                    _target = _lp * (1.0 + _fast_tp)
+                    _c1, _c2 = st.columns([2, 1])
+                    _c1.write(f"LOT {_li+1} · {_lq:g}주 @ ${_lp:,.2f} → LOC 매도 **${_target:,.2f}**")
+                    if _c2.button("매도 체결됨", key=f"soxl_sell_fill_{_li}_{_lp}_{_lq}", use_container_width=True):
+                        _new_qty, _new_avg = close_position_lot("SOXL", _li)
+                        st.session_state["soxl_manual_qty"] = float(_new_qty)
+                        st.session_state["soxl_manual_avg"] = float(_new_avg)
+                        st.success(f"LOT {_li+1} 매도 체결 저장")
+                        st.rerun()
+            elif float(_fast_qty) > 0:
+                st.caption("※ 앱 사용 전부터 보유하던 물량은 LOT 정보가 없어서 평균매수가 기준으로만 표시됩니다. 이후 앱에서 '체결됨'을 누른 매수부터 LOT별로 자동 관리됩니다.")
             st.success("✅ 오늘 주문가격은 위에서 바로 확인할 수 있습니다. 아래 백테스트는 과거 성과를 다시 검증할 때만 실행하세요.")
         except Exception as _fast_e:
             st.warning(f"오늘 SOXL 주문값 즉시 계산 실패: {_fast_e}")
