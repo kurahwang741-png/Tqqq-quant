@@ -24,7 +24,7 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V5.6 · 2026 봉인 + 생존필터 수정 + 손실원인 추적")
+    st.caption("V5.7 · 2026 재봉인 + 반등확인 단계진입 탐색")
     st.info("🛡️ 2026은 끝까지 봉인합니다. 2016~2025만 이용해 위험 OFF 필터를 고른 뒤, 선택이 끝난 다음 2026에서 딱 한 번 검증합니다. 기준 전략은 V3-12형 + 20일 -10% 엔벨로프 + MA10 + 최소변화폭 15%입니다.")
 
     @st.cache_data(ttl=900)
@@ -62,27 +62,24 @@ with tab_kosdaq:
         return d
 
     def target_v5(r,p,exposure):
-        score=0.0; dd=float(r.get("DD60",np.nan)); rsi=float(r.get("RSI14",np.nan)); dist=float(r.get("DIST10",np.nan))
+        score=0.0
+        dd=float(r.get("DD60",np.nan)); rsi=float(r.get("RSI14",np.nan)); dist=float(r.get("DIST10",np.nan))
         if np.isfinite(dd): score += int(dd<=-.10)+int(dd<=-.18)+int(dd<=-.28)
         if np.isfinite(rsi): score += int(rsi<=45)+int(rsi<=35)
         if np.isfinite(dist) and dist<=-.03: score += 1.0
-        ndx=float(r.get("NDX_R1",np.nan)); sox=float(r.get("SOX_R1",np.nan)); vix=float(r.get("VIX",np.nan)); vr=float(r.get("VIX_R1",np.nan))
+        sox=float(r.get("SOX_R1",np.nan)); ndx=float(r.get("NDX_R1",np.nan))
         if np.isfinite(ndx): score += .5 if ndx>=.012 else (-.5 if ndx<=-.02 else 0)
         if np.isfinite(sox): score += 1.25 if sox>=.02 else (-.75 if sox<=-.03 else 0)
-        if np.isfinite(vix) and np.isfinite(vr):
-            if vix>=35 and vr>0: score-=.75
-            if vix>=25 and vr<=-.05: score+=1.0
-        rebound=float(r.get("RSI_D3",-99))>=2.0 and float(r.get("DIST10_D3",-99))>=.015 and np.isfinite(sox) and sox>0
-        if rebound: score+=2.5
+        votes=sum([float(r.get("RSI_D3",-99))>=2,float(r.get("DIST10_D3",-99))>=.015,
+                   np.isfinite(sox) and sox>0,bool(r.get("ENV_REENTRY",False)),
+                   np.isfinite(r.get("MA5",np.nan)) and float(r.get("KOKORE",0))>=float(r["MA5"])])
+        need=int(p.get("rebound_min",3))
+        if votes>=need: score+=2.5
         if bool(r.get("ENV_BELOW",False)): score+=p["env_w"]
         if bool(r.get("ENV_REENTRY",False)): score+=p["reentry_w"]
-        levels=p["levels"]
-        if score<1.5: target=0.0
-        elif score<2.5: target=levels[0]
-        elif score<3.5: target=levels[1]
-        elif score<4.5: target=levels[2]
-        else: target=levels[3]
-        if exposure>=.70 and not rebound: target=min(target,.70)
+        L=p["levels"]
+        target=0.0 if score<1.5 else L[0] if score<2.5 else L[1] if score<3.5 else L[2] if score<4.5 else L[3]
+        target=min(target,p["entry_cap"] if votes<need else p["confirm_cap"] if votes<min(5,need+1) else p["strong_cap"])
         return min(float(target),.90)
 
     def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180,trade_start=None):
@@ -198,25 +195,13 @@ with tab_kosdaq:
 
     def candidates_v5():
         out=[]
-        # 2026을 보지 않고 고르는 생존 필터.
-        # 기준 전략은 완전히 고정하고 위험 OFF 조건과 OFF시 최대투입만 비교.
-        base=dict(
-            levels=(.12,.30,.50,.75), env_lower=-.10,
-            env_w=1.0, reentry_w=1.5, exit_mode="MA10",
-            rebalance_gap=.15
-        )
-        out.append(dict(base_name="기준(필터없음)",risk_mode="NONE",risk_cap=1.0,**base))
-        modes=[
-            ("본주<MA120","BASE_MA120"),
-            ("본주<MA200","BASE_MA200"),
-            ("코코레<MA120","KOKORE_MA120"),
-            ("SOX<MA120","SOX_MA120"),
-            ("VIX≥30","VIX30"),
-            ("본주<MA120 또는 VIX≥30","BASE120_OR_VIX30"),
-        ]
-        for label,mode in modes:
-            for cap in (.20,.40):
-                out.append(dict(base_name=label,risk_mode=mode,risk_cap=cap,**base))
+        base=dict(levels=(.12,.30,.50,.75),env_lower=-.10,env_w=1.0,reentry_w=1.5,exit_mode="MA10",
+                  rebalance_gap=.15,risk_mode="BASE_MA200",risk_cap=.40)
+        for e in (.12,.20,.30):
+            for v in (2,3,4):
+                for c in (.30,.50):
+                    out.append(dict(base_name=f"반등형 E{e:.0%}-V{v}-C{c:.0%}",
+                                    entry_cap=e,rebound_min=v,confirm_cap=c,strong_cap=.75,**base))
         return out
 
     a,b,c=st.columns(3)
@@ -225,14 +210,14 @@ with tab_kosdaq:
     hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("🛡️ V5.5 생존필터 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
+    if st.button("🧬 V5.7 반등형 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
         try:
-            with st.spinner("13개만 계산 중 · 2026은 보지 않고 2016~2025 생존성만 비교합니다..."):
+            with st.spinner("18개 반등형 후보 계산 중 · 2026은 보지 않고 2016~2025만 비교합니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
                 for j,p in enumerate(candidates_v5(),1):
                     r=bt_v5(train,p,float(initial),max_hold=int(hold_days)); eff=r["cagr"]/max(abs(r["mdd"]),1e-9); score=r["cagr"]-.50*abs(r["mdd"])
-                    rows.append({"후보":j,"생존필터":p["base_name"],"OFF최대투입":p.get("risk_cap",1.0),"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"최소변화폭":p["rebalance_gap"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"총매수":r["buys"],"총매도":r["sells"],"연매수":r["buys_per_year"],"연매도":r["sells_per_year"],"연왕복":r["cycles_per_year"],"평균보유일":r["avg_hold"],"최대보유일":r["max_hold_actual"],"최종자산":r["final"]}); sims.append((p,r))
+                    rows.append({"후보":j,"초기상한":p.get("entry_cap",1.0),"반등표수":p.get("rebound_min",0),"확인후상한":p.get("confirm_cap",1.0),"강반등상한":p.get("strong_cap",.9),"생존필터":p["base_name"],"OFF최대투입":p.get("risk_cap",1.0),"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"최소변화폭":p["rebalance_gap"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"총매수":r["buys"],"총매도":r["sells"],"연매수":r["buys_per_year"],"연매도":r["sells_per_year"],"연왕복":r["cycles_per_year"],"평균보유일":r["avg_hold"],"최대보유일":r["max_hold_actual"],"최종자산":r["final"]}); sims.append((p,r))
                 rank=pd.DataFrame(rows).sort_values(["점수","CAGR"],ascending=False).reset_index(drop=True); best_id=int(rank.iloc[0]["후보"])-1
                 st.session_state["k5_rank"]=rank; st.session_state["k5_best_p"],st.session_state["k5_best_r"]=sims[best_id]
                 if blind:
@@ -241,7 +226,7 @@ with tab_kosdaq:
         except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
     if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("🛡️ V5.6 2016~2025 생존필터 결과")
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🧬 V5.7 2016~2025 반등형 탐색 결과")
         show=rank.head(10).copy()
         for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
         show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
