@@ -24,8 +24,8 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V2 · 코코레 + NASDAQ + SOX + VIX 신호를 이용해 본주(229200) 투입비중을 자동 탐색")
-    st.info("🧪 V1 최고 조합(D)을 기준선으로 두고, 낙폭·RSI·이격도·SOX·VIX·보유비중을 조합해 CAGR 개선을 탐색합니다. SOXL 탭은 독립적으로 유지됩니다.")
+    st.caption("V3 · V2의 59번/63번 차이를 집중 탐색 · 코코레 + NASDAQ + SOX + VIX → 본주(229200)")
+    st.info("🔬 V2 분석: 59번과 63번은 낙폭·RSI·반등조건이 같고 투입 단계만 달랐습니다. V3는 그 사이 비중과 반등 BOOST를 세밀하게 탐색합니다. SOXL 탭은 그대로 유지됩니다.")
 
     @st.cache_data(ttl=900)
     def download_kosdaq_research_data():
@@ -121,44 +121,70 @@ with tab_kosdaq:
                                 s1=1.5,s2=2.5,s3=3.5,s4=4.5,levels=levels,cap=cap))
         return out
 
+    def candidate_params_v3():
+        """V2 59/63의 공통조건을 잠그고 투입비중/반등강도/위험감축만 세밀 탐색."""
+        out=[]
+        level_sets=[
+            (.10,.25,.45,.70),   # V2-59
+            (.11,.27,.48,.72),
+            (.12,.30,.50,.75),
+            (.13,.32,.54,.78),
+            (.14,.34,.57,.82),
+            (.15,.35,.60,.85),   # V2-63
+        ]
+        for levels in level_sets:
+            for reb_w in [1.5,2.0,2.5,3.0]:
+                for sox_pos in [0.75,1.0,1.25]:
+                    for vix_pos in [0.75,1.0,1.25]:
+                        p=dict(dd1=-.10,dd2=-.18,dd3=-.28,dd_w=1.0,
+                               rsi1=45,rsi2=35,rsi_w=1.0,dist=-.03,
+                               ndx_up=.012,ndx_dn=-.02,us_pos=.5,us_neg=.5,
+                               sox_up=.02,sox_dn=-.03,sox_pos=sox_pos,sox_neg=.75,
+                               vix_hi=35.,vix_mid=25.,vix_fall=-.05,vix_neg=.75,vix_pos=vix_pos,
+                               rsi_reb=2.0,dist_reb=.015,reb_w=reb_w,
+                               s1=1.5,s2=2.5,s3=3.5,s4=4.5,levels=levels,cap=.90)
+                        out.append(p)
+        return out
+
     k1,k2,k3=st.columns(3)
     k_initial=k1.number_input("초기 투자금(원)",min_value=1_000_000,value=10_000_000,step=1_000_000,key="k2_initial")
     k_start=k2.number_input("시작연도",min_value=2016,max_value=date.today().year,value=2016,step=1,key="k2_start")
     k_hold=k3.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k2_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k2_blind",help="2016~2025 데이터로만 1위 조건을 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("🚀 V2 자동 탐색 시작",type="primary",use_container_width=True,key="run_kosdaq_v2"):
+    if st.button("🚀 V3 집중 탐색 시작",type="primary",use_container_width=True,key="run_kosdaq_v3"):
         try:
-            with st.spinner("72개 조합 탐색 중 · 코코레/미국장 신호와 본주 비중을 비교합니다..."):
+            with st.spinner("216개 V3 조합 탐색 중 · 59형↔63형 투입비중과 반등 BOOST를 집중 비교합니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(k_start)}-01-01")].copy()
                 train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
-                for j,p in enumerate(candidate_params(),1):
-                    r=bt_v2(train,p,float(k_initial),max_hold=int(k_hold)); score=r["cagr"]-0.20*abs(r["mdd"])
-                    rows.append({"후보":j,"CAGR":r["cagr"],"MDD":r["mdd"],"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"최종자산":r["final"]}); sims.append((p,r))
+                for j,p in enumerate(candidate_params_v3(),1):
+                    r=bt_v2(train,p,float(k_initial),max_hold=int(k_hold)); score=r["cagr"]-0.20*abs(r["mdd"]); eff=r["cagr"]/max(abs(r["mdd"]),1e-9)
+                    rows.append({"후보":j,"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"최종자산":r["final"]}); sims.append((p,r))
                 rank=pd.DataFrame(rows).sort_values(["CAGR","점수"],ascending=False).reset_index(drop=True)
                 best_id=int(rank.iloc[0]["후보"])-1; best_p,best_r=sims[best_id]
-                st.session_state["k2_rank"]=rank; st.session_state["k2_best_p"]=best_p; st.session_state["k2_best_r"]=best_r
+                st.session_state["k3_rank"]=rank; st.session_state["k3_best_p"]=best_p; st.session_state["k3_best_r"]=best_r
                 if blind:
                     test=kd.loc[kd.index>=pd.Timestamp("2026-01-01")].copy()
-                    st.session_state["k2_test"]=bt_v2(test,best_p,float(k_initial),max_hold=int(k_hold)) if len(test)>5 else None
-        except Exception as e: st.error(f"V2 탐색 실패: {e}")
+                    st.session_state["k3_test"]=bt_v2(test,best_p,float(k_initial),max_hold=int(k_hold)) if len(test)>5 else None
+        except Exception as e: st.error(f"V3 탐색 실패: {e}")
 
-    if st.session_state.get("k2_rank") is not None:
-        rank=st.session_state["k2_rank"].copy(); st.subheader("🏆 V2 탐색 결과")
+    if st.session_state.get("k3_rank") is not None:
+        rank=st.session_state["k3_rank"].copy(); st.subheader("🏆 V3 집중 탐색 결과")
         show=rank.head(10).copy()
         for c in ["CAGR","MDD","평균투입","최대투입"]: show[c]=show[c].map(lambda x:f"{x:.2%}")
+        show["효율"]=show["효율"].map(lambda x:f"{x:.3f}")
         show["최종자산"]=show["최종자산"].map(lambda x:f"₩{x:,.0f}"); show["점수"]=show["점수"].map(lambda x:f"{x:.4f}")
         st.dataframe(show,use_container_width=True,hide_index=True)
-        br=st.session_state["k2_best_r"]; p=st.session_state["k2_best_p"]
+        br=st.session_state["k3_best_r"]; p=st.session_state["k3_best_p"]
         c1,c2,c3,c4=st.columns(4); c1.metric("1위 CAGR",f"{br['cagr']:.2%}"); c2.metric("MDD",f"{br['mdd']:.2%}"); c3.metric("평균투입",f"{br['avg_exp']:.1%}"); c4.metric("최대투입",f"{br['max_exp']:.1%}")
-        st.line_chart((br["equity"]["Equity"]/br["equity"]["Equity"].iloc[0]*100).rename("V2 1위"))
-        if blind and st.session_state.get("k2_test") is not None:
-            tr=st.session_state["k2_test"]; st.subheader("🧪 2026 블라인드 결과")
+        st.line_chart((br["equity"]["Equity"]/br["equity"]["Equity"].iloc[0]*100).rename("V3 1위"))
+        if blind and st.session_state.get("k3_test") is not None:
+            tr=st.session_state["k3_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
         with st.expander("1위 파라미터 보기"):
             st.json({k:(list(v) if isinstance(v,tuple) else v) for k,v in p.items()})
-        st.caption("1위는 우선 CAGR 순으로 표시합니다. 2026 블라인드가 켜져 있으면 2026 데이터는 전략 선택에 사용하지 않습니다.")
+        st.caption("V3는 V2 59/63의 공통조건을 잠그고 투입단계·반등 BOOST·SOX/VIX 가중치만 탐색합니다. 1위는 CAGR 순이며 효율=CAGR/|MDD|도 함께 표시합니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
