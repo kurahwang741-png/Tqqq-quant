@@ -5,6 +5,7 @@ import numpy as np
 from datetime import date, datetime, timezone
 import time
 import json
+from datetime import datetime, time
 import hashlib
 import gzip
 import pickle
@@ -605,6 +606,32 @@ with tab_simple:
         latest_dt=sf.dropna(subset=["MA5","RSI14"]).index[-1]
         sig_target,sig_reason=_simple3_target(latest)
 
+        # ── 신호 기준일 / 오늘·다음 거래일 주문 상태 ───────────────
+        _signal_date = pd.Timestamp(sd.index[-1]).date()
+        _now = datetime.now()
+        _today = _now.date()
+        _market_closed = _now.time() >= time(15, 35)
+
+        # 데이터가 오늘 날짜까지 들어왔고 15:35 이후일 때만 '오늘 종가 확정'으로 표시
+        _is_today_confirmed = (_signal_date == _today and _market_closed)
+
+        st.markdown("### 🕒 주문 신호 상태")
+        if _is_today_confirmed:
+            st.success(
+                f"✅ 오늘 종가 신호 확정 · 신호 기준일: {_signal_date:%Y-%m-%d}\n\n"
+                "→ 이 신호는 **다음 거래일 시초가 주문**에 사용합니다."
+            )
+        else:
+            st.info(
+                f"⏳ 최신 확정 신호 기준일: {_signal_date:%Y-%m-%d}\n\n"
+                "→ 장 마감 후(15:35 이후) 최신 종가가 반영되면 **다음 거래일 주문**이 확정됩니다."
+            )
+
+        st.caption(
+            "원칙: D일 종가로 KOKORE 5일선·엔벨로프·RSI를 확정 → D+1 거래일 BASE 시초가에 실행. "
+            "시초가에 매수한 날 장중 신호로 바로 매도하지 않으며, 그날 종가에서 매도신호가 확정되면 다음 거래일 시초가에 매도합니다."
+        )
+
         st.markdown("### 📥 시가 vs 종가 체결 검증용 OHLC")
         st.caption("이 파일 하나만 다시 올려주면 다음 거래일 시가 체결과 종가 체결을 같은 신호로 직접 비교할 수 있습니다.")
         _ohlc_csv=sd.reset_index().rename(columns={"index":"Date"}).to_csv(index=False).encode("utf-8-sig")
@@ -626,7 +653,7 @@ with tab_simple:
 
         # 저장된 보유현황을 앱 진입 즉시 복구
         _state=_s3_load_state()
-        st.markdown("### 💰 오늘 주문 / 보유현황")
+        st.markdown("### 💰 다음 시초가 주문 / 보유현황")
         _c1,_c2,_c3=st.columns(3)
         _capital=_c1.number_input("운용자금(원)",min_value=100000.0,
                                   value=float(_state.get("capital",10000000.0)),
@@ -666,6 +693,8 @@ with tab_simple:
             _action="매도"
         else:
             st.markdown("### ⚪ 다음 거래일 **주문 없음 · 현재 비중 유지**")
+            if "유지" in str(sig_reason) or "대기" in str(sig_reason):
+                st.caption("현재는 매수 대기 상태입니다. 오늘 확정 신호가 진입조건을 충족하지 않았으므로 다음 시초가 신규매수는 없습니다.")
             _action="유지"
 
         _b1,_b2=st.columns(2)
