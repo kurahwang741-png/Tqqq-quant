@@ -24,7 +24,7 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V6.0 · DIST5 비중조절 3트랙 + 2026 재봉인")
+    st.caption("V6.1 · DIST5 매도억제/반등대기 + 2026 재봉인")
     st.info("🛡️ 2026은 끝까지 봉인합니다. 2016~2025만 이용해 위험 OFF 필터를 고른 뒤, 선택이 끝난 다음 2026에서 딱 한 번 검증합니다. 기준 전략은 V3-12형 + 20일 -10% 엔벨로프 + MA10 + 최소변화폭 15%입니다.")
 
     @st.cache_data(ttl=900)
@@ -104,26 +104,7 @@ with tab_kosdaq:
         else:
             target=min(target,max(exposure,entry_cap))
 
-        # DIST5는 진입 허가조건이 아니라 "얼마나 세게 들어갈지"만 조절한다.
-        dist5_mode=p.get("dist5_mode","NONE")
-        d5=float(r.get("DIST5",np.nan))
-        boost=0.0
-        if np.isfinite(d5):
-            if dist5_mode=="FIXED":
-                # 5일선 아래 -3/-5/-7%에서 단계적으로 비중 가산
-                boost=.05 if d5<=-.03 else 0.0
-                if d5<=-.05: boost=.10
-                if d5<=-.07: boost=.15
-            elif dist5_mode=="Q60":
-                q15=float(r.get("DIST5_Q15",np.nan)); q30=float(r.get("DIST5_Q30",np.nan))
-                # 최근 60일 기준 상대적으로 드문 하방 이격일수록 비중 가산
-                if np.isfinite(q30) and d5<=q30: boost=.05
-                if np.isfinite(q15) and d5<=q15: boost=.10
-            # 5일선 위 과열에서는 신규 확대만 억제
-            if d5>=.06 and target>exposure:
-                target=max(exposure,target-.10)
-        if target>exposure and boost>0:
-            target=min(target+boost,float(p.get("max_cap",.65)))
+        # V6.1: DIST5는 매수 증액이 아니라 bt_v5의 매도 억제에 사용한다.
         return min(float(target),float(p.get("max_cap",.65)))
 
     def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180,trade_start=None):
@@ -144,6 +125,21 @@ with tab_kosdaq:
 
             # 반드시 먼저 기본 목표비중을 계산한다.
             target=target_v5(prev,p,exp0,position_age)
+
+            # V6.1 DIST5 매도보호: 5일선 아래로 크게 이격된 상태에서는
+            # 목표가 0%로 급락해도 즉시 전량매도하지 않고 최소비중을 남겨 회귀를 기다린다.
+            dist5_mode=p.get("dist5_mode","NONE")
+            d5=float(prev.get("DIST5",np.nan))
+            protect=False
+            protect_floor=float(p.get("dist5_floor",.20))
+            if exp0 >= .01 and target < exp0 and np.isfinite(d5):
+                if dist5_mode=="SELL_FIXED":
+                    protect = d5 <= float(p.get("dist5_sell_cut",-0.05))
+                elif dist5_mode=="SELL_Q60":
+                    q15=float(prev.get("DIST5_Q15",np.nan))
+                    protect = np.isfinite(q15) and d5 <= q15
+                if protect:
+                    target=max(target,min(exp0,protect_floor))
 
             # 전 거래일 확정 데이터로 위험 OFF 판정 (look-ahead 방지)
             risk_mode=p.get("risk_mode","NONE")
@@ -249,16 +245,22 @@ with tab_kosdaq:
         base=dict(levels=(.12,.30,.50,.65),env_lower=-.10,env_w=1.0,reentry_w=1.5,
                   exit_mode="MA10",rebalance_gap=.15,risk_mode="BASE_MA200",
                   risk_cap=.40,max_cap=.65)
-        # 동일한 진입/확대 조건에서 5일선 이격 사용법만 공정 비교
-        for mode,label in [("NONE","기존"),("FIXED","DIST5고정"),("Q60","DIST5분위수")]:
-            for e in (.20,.30):
-                for wait in (1,2,3):
-                    for aux in (1,2):
-                        for cap in (.50,.60):
-                            out.append(dict(
-                                base_name=f"{label} E{e:.0%}-W{wait}-SOX+A{aux}-X{cap:.0%}",
-                                dist5_mode=mode,entry_cap=e,wait_days=wait,
-                                aux_need=aux,expand_cap=cap,**base))
+        # 기준형 24개
+        for e in (.20,.30):
+            for wait in (1,2,3):
+                for aux in (1,2):
+                    for cap in (.50,.60):
+                        out.append(dict(base_name=f"기준 E{e:.0%}-W{wait}-SOX+A{aux}-X{cap:.0%}",
+                            dist5_mode="NONE",entry_cap=e,wait_days=wait,aux_need=aux,expand_cap=cap,**base))
+        # 5일선 하방이격 상태에서 전량매도를 막고 최소비중 유지
+        for mode,label in [("SELL_FIXED","D5보호고정"),("SELL_Q60","D5보호분위수")]:
+            cuts=(-.04,-.05,-.06) if mode=="SELL_FIXED" else (-.05,)
+            for cut in cuts:
+                for floor in (.12,.20,.30):
+                    for e in (.20,.30):
+                        out.append(dict(base_name=f"{label} E{e:.0%}-F{floor:.0%}"+(f"-D{cut:.0%}" if mode=="SELL_FIXED" else "-Q15"),
+                            dist5_mode=mode,dist5_sell_cut=cut,dist5_floor=floor,
+                            entry_cap=e,wait_days=2,aux_need=1,expand_cap=.50,**base))
         return out
 
     a,b,c=st.columns(3)
@@ -267,9 +269,9 @@ with tab_kosdaq:
     hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("📏 V6.0 DIST5 3트랙 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
+    if st.button("🛡️ V6.1 DIST5 매도보호 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
         try:
-            with st.spinner("72개 후보 계산 중 · 기존 vs DIST5고정 vs DIST5 60일 분위수 · 2026은 보지 않고 2016~2025만 비교합니다..."):
+            with st.spinner("DIST5 매도보호 후보 계산 중 · 기준 vs 고정이격 vs 60일 분위수 · 2026은 보지 않고 2016~2025만 비교합니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
                 for j,p in enumerate(candidates_v5(),1):
@@ -297,7 +299,7 @@ with tab_kosdaq:
         except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
     if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("📏 V6.0 2016~2025 DIST5 비교 결과")
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🛡️ V6.1 2016~2025 DIST5 매도보호 비교 결과")
         show=rank.head(10).copy()
         for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
         show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
