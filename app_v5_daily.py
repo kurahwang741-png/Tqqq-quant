@@ -15,12 +15,12 @@ from io import StringIO
 from pathlib import Path
 
 st.set_page_config(
-    page_title="SOXL QUANT V32 DUAL",
+    page_title="SOXL QUANT · KOSDAQ 3지표",
     page_icon="📈",
     layout="centered",
 )
 
-tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본주"] )
+tab_soxl, tab_kosdaq, tab_simple = st.tabs(["📈 SOXL 퀀트", "🇰🇷 기존 코코레 → 본주", "🎯 본주 3지표 실전"] )
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
@@ -445,6 +445,213 @@ with tab_kosdaq:
             st.warning(f"연도별 표 계산 실패: {e}")
 
         st.caption("중요: 필터 선택과 순위는 2016~2025 데이터로만 결정합니다. 2026 수치는 순위 계산에 절대 들어가지 않고, 선택 완료 후 블라인드 검증으로만 표시됩니다.")
+
+
+with tab_simple:
+    st.title("🎯 KODEX 코스닥150 본주 · 3지표 실전")
+    st.caption("5일선 + 엔벨로프 + RSI14 · 최대투입 60% · 장기추세/미국장 필터 없음")
+    st.info("확정 로직: KOKORE(233740)로 신호를 만들고 BASE(229200)를 매매합니다. "
+            "전 거래일 확정값만 사용합니다. 현재 백테스트 체결은 다음 거래일 종가이며, 시가 체결과 비교 검증할 OHLC 다운로드를 추가했습니다.")
+
+    @st.cache_data(ttl=900)
+    def _simple3_data():
+        symbols=["233740.KS","229200.KS"]
+        raw=yf.download(symbols,period="max",interval="1d",auto_adjust=True,
+                        progress=False,group_by="column")
+        if raw is None or raw.empty:
+            raise ValueError("코코레/본주 데이터를 받지 못했습니다.")
+
+        def _field(sym, field):
+            if not isinstance(raw.columns,pd.MultiIndex):
+                raise ValueError("OHLC 데이터를 찾지 못했습니다.")
+            lv0=raw.columns.get_level_values(0)
+            if field in lv0:
+                return raw[field][sym].dropna()
+            # yfinance 컬럼 레벨이 반대인 경우
+            try:
+                return raw.xs(field,axis=1,level=-1)[sym].dropna()
+            except Exception:
+                raise ValueError(f"{sym} {field} 데이터를 찾지 못했습니다.")
+
+        z=pd.concat([
+            _field("233740.KS","Open").rename("KOKORE_Open"),
+            _field("233740.KS","High").rename("KOKORE_High"),
+            _field("233740.KS","Low").rename("KOKORE_Low"),
+            _field("233740.KS","Close").rename("KOKORE"),
+            _field("229200.KS","Open").rename("BASE_Open"),
+            _field("229200.KS","High").rename("BASE_High"),
+            _field("229200.KS","Low").rename("BASE_Low"),
+            _field("229200.KS","Close").rename("BASE"),
+        ],axis=1).dropna()
+        z.index=pd.to_datetime(z.index).tz_localize(None)
+        return z
+
+    def _simple3_features(df):
+        z=df.copy()
+        k=z["KOKORE"].astype(float)
+        z["MA5"]=k.rolling(5,min_periods=5).mean()
+        z["DIST5"]=k/z["MA5"]-1
+        delta=k.diff()
+        gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
+        loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
+        z["RSI14"]=100-100/(1+gain/loss.replace(0,np.nan))
+        return z
+
+    def _simple3_target(r):
+        k=float(r.get("KOKORE",np.nan))
+        ma5=float(r.get("MA5",np.nan))
+        d5=float(r.get("DIST5",np.nan))
+        rsi=float(r.get("RSI14",np.nan))
+        if not all(np.isfinite(x) for x in (k,ma5,d5,rsi)):
+            return 0.0, "데이터 준비중"
+
+        # 평균회귀 완료: 5일선 +2%에서 전량 청산
+        if k >= ma5*1.02:
+            return 0.0, "5일선 +2% 회귀 → 청산"
+
+        # RSI 55 이하에서만 엔벨로프 깊이에 따라 분할 진입
+        if rsi <= 55:
+            if d5 <= -0.085:
+                return 0.60, "엔벨로프 -8.5% 이하 → 3차/최대 60%"
+            if d5 <= -0.065:
+                return 0.425, "엔벨로프 -6.5% 이하 → 2차 42.5%"
+            if d5 <= -0.045:
+                return 0.25, "엔벨로프 -4.5% 이하 → 1차 25%"
+
+        return np.nan, "유지"
+
+    def _simple3_bt(df,initial_cash=10_000_000.0,fee=.00015,start="2016-01-01",end=None):
+        d=_simple3_features(df).dropna(subset=["BASE","MA5","RSI14"]).copy()
+        if end is not None:
+            d=d.loc[:pd.Timestamp(end)]
+        cash=float(initial_cash); shares=0.0
+        rows=[]; trades=[]
+        for i in range(1,len(d)):
+            dt=d.index[i]
+            if pd.Timestamp(dt)<pd.Timestamp(start): continue
+            px=float(d["BASE"].iloc[i])
+            prev=d.iloc[i-1]
+            eq0=cash+shares*px
+            exp0=shares*px/eq0 if eq0>0 else 0.0
+            tgt,why=_simple3_target(prev)
+            if not np.isfinite(tgt):
+                tgt=exp0
+            desired=eq0*tgt
+            diff=desired-shares*px
+            # 아주 작은 재조정은 무시
+            if abs(diff) >= max(eq0*.01,1.0):
+                if diff>0:
+                    spend=min(diff,cash/(1+fee))
+                    if spend>0:
+                        q=spend/px
+                        cash-=spend*(1+fee); shares+=q
+                        trades.append({"Date":dt,"구분":"매수","BASE가격":px,
+                                       "거래비중":spend/eq0,"목표비중":tgt,"사유":why})
+                else:
+                    q=min(shares,(-diff)/px)
+                    if q>0:
+                        proceeds=q*px
+                        cash+=proceeds*(1-fee); shares-=q
+                        trades.append({"Date":dt,"구분":"매도","BASE가격":px,
+                                       "거래비중":proceeds/eq0,"목표비중":tgt,"사유":why})
+            eq=cash+shares*px
+            exp=shares*px/eq if eq>0 else 0.0
+            rows.append({"Date":dt,"Equity":eq,"Exposure":exp})
+        eq=pd.DataFrame(rows).set_index("Date") if rows else pd.DataFrame()
+        tr=pd.DataFrame(trades)
+        if eq.empty:
+            return {"cagr":np.nan,"mdd":np.nan,"avg_exp":np.nan,"max_exp":np.nan,
+                    "equity":eq,"trades":tr}
+        years=(eq.index[-1]-eq.index[0]).days/365.25
+        cagr=(eq["Equity"].iloc[-1]/eq["Equity"].iloc[0])**(1/years)-1 if years>0 else np.nan
+        dd=eq["Equity"]/eq["Equity"].cummax()-1
+        return {"cagr":float(cagr),"mdd":float(dd.min()),
+                "avg_exp":float(eq["Exposure"].mean()),"max_exp":float(eq["Exposure"].max()),
+                "equity":eq,"trades":tr}
+
+    try:
+        sd=_simple3_data()
+        sf=_simple3_features(sd)
+        latest=sf.dropna(subset=["MA5","RSI14"]).iloc[-1]
+        latest_dt=sf.dropna(subset=["MA5","RSI14"]).index[-1]
+        sig_target,sig_reason=_simple3_target(latest)
+
+        st.markdown("### 📥 시가 vs 종가 체결 검증용 OHLC")
+        st.caption("이 파일 하나만 다시 올려주면 다음 거래일 시가 체결과 종가 체결을 같은 신호로 직접 비교할 수 있습니다.")
+        _ohlc_csv=sd.reset_index().rename(columns={"index":"Date"}).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 KOKORE + BASE OHLC 데이터 다운로드",
+            data=_ohlc_csv,
+            file_name="kosdaq_simple3_ohlc.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_simple3_ohlc"
+        )
+
+        st.markdown("### 📍 최신 확정 신호")
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("확정일",latest_dt.strftime("%Y-%m-%d"))
+        c2.metric("KOKORE",f"{latest['KOKORE']:,.0f}원")
+        c3.metric("5일선 이격",f"{latest['DIST5']:.2%}")
+        c4.metric("RSI14",f"{latest['RSI14']:.1f}")
+
+        current_pct=st.number_input("현재 본주 투입비중 (%)",min_value=0.0,max_value=100.0,
+                                    value=0.0,step=1.0,key="simple3_current_pct")/100.0
+        if np.isfinite(sig_target):
+            final_target=float(sig_target)
+        else:
+            final_target=current_pct
+
+        diff_pct=final_target-current_pct
+        a,b,c=st.columns(3)
+        a.metric("현재 목표비중",f"{final_target:.1%}")
+        b.metric("조정 필요",f"{diff_pct:+.1%}")
+        c.metric("최근 BASE 종가",f"{latest['BASE']:,.0f}원")
+        st.success(f"신호: {sig_reason}")
+
+        if diff_pct>0.005:
+            st.markdown(f"**다음 거래일 행동:** 본주 비중을 **{final_target:.1%}까지 매수 확대**")
+        elif diff_pct<-0.005:
+            st.markdown(f"**다음 거래일 행동:** 본주 비중을 **{final_target:.1%}까지 축소/매도**")
+        else:
+            st.markdown("**다음 거래일 행동:** 추가 주문 없이 현재 비중 유지")
+
+        st.caption("이 전략의 신호는 KOKORE 종가로 확정되고 BASE를 다음 거래일에 매매하도록 검증했습니다. "
+                   "따라서 근거 없이 LOC 한계가격을 만들어내지 않고, 확정 신호와 목표비중을 표시합니다.")
+
+        with st.expander("📐 확정 매매 규칙",expanded=True):
+            st.markdown("""
+- **1차:** RSI14 ≤ 55 이면서 KOKORE가 5일선 대비 **-4.5% 이하** → 본주 **25%**
+- **2차:** 같은 조건에서 **-6.5% 이하** → 본주 **42.5%**
+- **3차:** 같은 조건에서 **-8.5% 이하** → 본주 **60%**
+- **청산:** KOKORE가 **5일선 +2% 이상** 회귀 → 본주 **0%**
+- 그 외에는 **현재 비중 유지**
+- **사용하지 않음:** MA200, SOX, NDX, VIX
+""")
+
+        st.markdown("### 🧪 동일 로직 재검증")
+        x1,x2=st.columns(2)
+        start_year=x1.selectbox("시작연도",[2016,2017,2018,2019,2020,2021,2022,2023],index=0,key="s3_start")
+        capital=x2.number_input("초기자금",min_value=100_000,value=10_000_000,step=1_000_000,key="s3_cap")
+        if st.button("▶️ 3지표 백테스트",use_container_width=True,key="run_simple3"):
+            rr=_simple3_bt(sd,initial_cash=capital,start=f"{start_year}-01-01")
+            m1,m2,m3,m4=st.columns(4)
+            m1.metric("CAGR",f"{rr['cagr']:.2%}")
+            m2.metric("MDD",f"{rr['mdd']:.2%}")
+            m3.metric("평균투입",f"{rr['avg_exp']:.2%}")
+            m4.metric("최대투입",f"{rr['max_exp']:.2%}")
+            st.line_chart(rr["equity"]["Equity"])
+            if not rr["trades"].empty:
+                td=rr["trades"].copy()
+                td["Date"]=pd.to_datetime(td["Date"]).dt.strftime("%Y-%m-%d")
+                td["BASE가격"]=td["BASE가격"].map(lambda x:f"{x:,.0f}")
+                td["거래비중"]=td["거래비중"].map(lambda x:f"{x:.1%}")
+                td["목표비중"]=td["목표비중"].map(lambda x:f"{x:.1%}")
+                st.dataframe(td.tail(50),use_container_width=True,hide_index=True)
+
+    except Exception as e:
+        st.error(f"3지표 전략 데이터 처리 오류: {e}")
+
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
