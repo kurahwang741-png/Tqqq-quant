@@ -20,12 +20,12 @@ st.set_page_config(
     layout="centered",
 )
 
-tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V2"] )
+tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V3"] )
 
 with tab_kosdaq:
-    st.title("🇰🇷 국장 QUANT V2")
-    st.caption("장대양봉 × 거래대금 × 눌림 후 반등확인 · 2016~2023 개발구간 / 2024~2026 블라인드 봉인")
-    st.info("V2는 V1의 단순 눌림매수를 버리고, 눌림 뒤 실제 반등이 확인된 경우만 진입합니다. 세 반등 신호를 같은 표본에서 비교합니다.")
+    st.title("🇰🇷 국장 QUANT V3")
+    st.caption("장대양봉 × 절대거래대금 × 20일평균 대비 거래대금 폭증 × 눌림 후 반등 · 2016~2023 개발 / 2024~2026 블라인드")
+    st.info("V3는 V2 반등확인 구조에 장대양봉 당일 거래대금이 직전 20일 평균 대비 몇 배 폭증했는지를 추가합니다. 2×/3×/5×/8×를 독립 비교합니다.")
 
     @st.cache_data(ttl=86400, show_spinner=False)
     def krx_listing_v1():
@@ -56,6 +56,7 @@ with tab_kosdaq:
         d=x.copy().sort_index()
         d["R1"]=d["Close"].pct_change()
         d["MA5"]=d["Close"].rolling(5).mean()
+        d["AMT20_PREV"]=d["Amount"].shift(1).rolling(20).mean()
         events=np.flatnonzero((d["R1"].to_numpy() >= rise_cut) & (d["Amount"].to_numpy() >= amount_cut))
         out=[]
         for i in events:
@@ -90,7 +91,9 @@ with tab_kosdaq:
             entry=signal+1
             entry_px=float(d["Open"].iloc[entry])
             if not np.isfinite(entry_px) or entry_px<=0: continue
-            rec={"Code":code,"Name":name,"Market":market,"EventDate":d.index[i],"SignalDate":d.index[signal],"EntryDate":d.index[entry],"Rise":float(d["R1"].iloc[i]),"Amount":float(d["Amount"].iloc[i]),"Pullback":pull_dd,"Rebound":rebound_mode}
+            prev20=float(d["AMT20_PREV"].iloc[i]) if np.isfinite(d["AMT20_PREV"].iloc[i]) else np.nan
+            amt_ratio=float(d["Amount"].iloc[i]/prev20) if np.isfinite(prev20) and prev20>0 else np.nan
+            rec={"Code":code,"Name":name,"Market":market,"EventDate":d.index[i],"SignalDate":d.index[signal],"EntryDate":d.index[entry],"Rise":float(d["R1"].iloc[i]),"Amount":float(d["Amount"].iloc[i]),"AmtRatio20":amt_ratio,"Pullback":pull_dd,"Rebound":rebound_mode}
             for h in (1,3,5,10,20):
                 k=entry+h
                 rec[f"R{h}"]=float(d["Close"].iloc[k]/entry_px-1.0) if k<len(d) else np.nan
@@ -103,14 +106,14 @@ with tab_kosdaq:
     random_seed=c3.number_input("표본 Seed",0,9999,42,1)
     st.caption("⚠️ 현재 V1 다운로드는 현재 상장종목 기반입니다. 전략 확정 전 상장폐지 이력까지 합친 survivorship-bias 보정판으로 재검증해야 합니다.")
 
-    if st.button("🔥 국장 V2 반등신호 비교 돌리기", type="primary", use_container_width=True):
+    if st.button("🔥 국장 V3 거래대금 폭증 비교 돌리기", type="primary", use_container_width=True):
         try:
             listing=krx_listing_v1()
             n=min(int(max_names),len(listing))
             sample=listing.sample(n=n, random_state=int(random_seed)) if n<len(listing) else listing
-            rise_cuts=[.15,.20,.25]; amount_cuts=[30e9,50e9,100e9,200e9,300e9]
+            rise_cuts=[.15,.20,.25]; amount_cuts=[100e9,200e9,300e9]; ratio_cuts=[2.0,3.0,5.0,8.0]
             rebound_modes=["전일고가돌파","5일선재돌파","양봉+거래량"]
-            buckets={(m,r,a):[] for m in rebound_modes for r in rise_cuts for a in amount_cuts}
+            buckets={(m,r,a,v):[] for m in rebound_modes for r in rise_cuts for a in amount_cuts for v in ratio_cuts}
             bar=st.progress(0.0, text="종목 데이터 수집 시작")
             status=st.empty()
             for ix,row in enumerate(sample.itertuples(index=False),1):
@@ -119,26 +122,31 @@ with tab_kosdaq:
                     if not x.empty:
                         # 가장 느슨한 조건의 이벤트를 한 번 만든 뒤 각 조합별로 필터
                         for m in rebound_modes:
-                            base=scan_one_v1(x,row.Code,row.Name,row.Market,.15,30e9,m)
+                            base=scan_one_v1(x,row.Code,row.Name,row.Market,.15,100e9,m)
                             for rec in base:
+                                if not np.isfinite(rec.get("AmtRatio20",np.nan)): continue
                                 for r in rise_cuts:
                                     if rec["Rise"]+1e-12 < r: continue
                                     for a0 in amount_cuts:
-                                        if rec["Amount"] >= a0: buckets[(m,r,a0)].append(rec)
+                                        if rec["Amount"] < a0: continue
+                                        for v0 in ratio_cuts:
+                                            if rec["AmtRatio20"] >= v0: buckets[(m,r,a0,v0)].append(rec)
                 except Exception:
                     pass
                 if ix==1 or ix%10==0 or ix==n:
                     bar.progress(ix/n,text=f"{ix:,}/{n:,} 종목 분석 · {row.Code} {row.Name}")
                     status.caption("첫 실행은 데이터 다운로드 때문에 오래 걸릴 수 있고, 이후에는 캐시되어 빨라집니다.")
             rows=[]
-            for (m,r,a0),recs in buckets.items():
+            for (m,r,a0,v0),recs in buckets.items():
                 q=pd.DataFrame(recs)
-                z={"반등신호":m,"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","신호수":len(q)}
+                z={"반등신호":m,"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","20일대비":f"{v0:g}배↑","신호수":len(q)}
                 for h in (1,3,5,10,20):
                     col=f"R{h}"
                     z[f"{h}일 승률"]=(q[col].gt(0).mean()*100) if len(q) else np.nan
                     z[f"{h}일 평균"]=(q[col].mean()*100) if len(q) else np.nan
                     z[f"{h}일 중앙값"]=(q[col].median()*100) if len(q) else np.nan
+                z["5일 평균-중앙값"]=(z.get("5일 평균",np.nan)-z.get("5일 중앙값",np.nan))
+                z["표본주의"]="⚠️" if len(q)<50 else ""
                 rows.append(z)
             result=pd.DataFrame(rows)
             st.session_state["kr_v1_result"]=result
@@ -153,9 +161,17 @@ with tab_kosdaq:
         result=st.session_state["kr_v1_result"]
         show=result.copy()
         pct_cols=[c for c in show.columns if "승률" in c or "평균" in c or "중앙값" in c]
-        st.subheader("📊 V2 반등확인 개발구간 결과")
+        st.subheader("🏆 V3 요약 · 5일 중앙값 상위")
+        valid=show[show["신호수"]>=50].copy()
+        if len(valid):
+            top=valid.sort_values(["5일 중앙값","5일 평균"],ascending=False).head(12)
+            top_pct=[c for c in top.columns if "승률" in c or "평균" in c or "중앙값" in c]
+            st.dataframe(top.style.format({c:"{:.2f}%" for c in top_pct},na_rep="-"),use_container_width=True,hide_index=True)
+        else:
+            st.warning("신호 50개 이상 조합이 없습니다. 전체 표를 확인하세요.")
+        st.subheader("📊 V3 전체 개발구간 결과")
         st.dataframe(show.style.format({c:"{:.2f}%" for c in pct_cols},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("V1과 비교해 승률·평균·중앙값이 개선되는 반등신호가 있는지 봅니다. 아직 익절·손절·테마는 넣지 않습니다.")
+        st.caption("핵심 관찰값은 5일 중앙값입니다. 신호 50개 미만은 ⚠️로 표시합니다. 2024~2026은 여전히 사용하지 않습니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
