@@ -81,7 +81,7 @@ with tab_kosdaq:
         return min(float(target),.90)
 
     def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180):
-        d=features_v5(df,p["env_lower"]).dropna(subset=["BASE"]).copy(); cash=float(initial_cash); shares=0.0; entry=None; peak_base=None; rows=[]; sells=0
+        d=features_v5(df,p["env_lower"]).dropna(subset=["BASE"]).copy(); cash=float(initial_cash); shares=0.0; entry=None; peak_base=None; rows=[]; sells=0; buys=0; hold_days_list=[]; completed_cycles=0
         for i in range(1,len(d)):
             dt=d.index[i]; px=float(d["BASE"].iloc[i]); prev=d.iloc[i-1]
             eq0=cash+shares*px; exp0=shares*px/eq0 if eq0>0 else 0.0; target=target_v5(prev,p,exp0)
@@ -100,17 +100,33 @@ with tab_kosdaq:
             if forced: diff=-shares*px
             if diff>max(eq0*.01,1):
                 spend=min(diff,cash); qty=(spend*(1-fee))/px
-                if qty>0: shares+=qty; cash-=spend; entry=dt if entry is None else entry; peak_base=px if peak_base is None else max(peak_base,px)
+                if qty>0:
+                    was_flat = shares <= 0
+                    shares+=qty; cash-=spend; buys+=1
+                    entry=dt if entry is None else entry
+                    peak_base=px if peak_base is None else max(peak_base,px)
             elif diff<-max(eq0*.01,1):
                 qty=min(shares,(-diff)/px)
                 if qty>0: cash+=qty*px*(1-fee); shares-=qty; sells+=1
-                if shares*px<eq0*.01: entry=None; peak_base=None
+                if shares*px<eq0*.01:
+                    if entry is not None:
+                        hold_days_list.append((pd.Timestamp(dt)-pd.Timestamp(entry)).days)
+                        completed_cycles += 1
+                    entry=None; peak_base=None
             eq=cash+shares*px; rows.append((dt,eq,shares*px/eq if eq>0 else 0,target))
         eq=pd.DataFrame(rows,columns=["Date","Equity","Exposure","Target"]).set_index("Date")
         if eq.empty: raise ValueError("백테스트 구간이 너무 짧습니다.")
         years=max((eq.index[-1]-eq.index[0]).days/365.25,1/365.25); final=float(eq["Equity"].iloc[-1]); cagr=(final/initial_cash)**(1/years)-1
         mdd=float((eq["Equity"]/eq["Equity"].cummax()-1).min())
-        return dict(cagr=cagr,mdd=mdd,final=final,avg_exp=float(eq["Exposure"].mean()),max_exp=float(eq["Exposure"].max()),sells=sells,equity=eq)
+        avg_hold=float(np.mean(hold_days_list)) if hold_days_list else np.nan
+        max_hold_actual=float(np.max(hold_days_list)) if hold_days_list else 0.0
+        if entry is not None:
+            ongoing=(pd.Timestamp(eq.index[-1])-pd.Timestamp(entry)).days
+            max_hold_actual=max(max_hold_actual,float(ongoing))
+        return dict(cagr=cagr,mdd=mdd,final=final,avg_exp=float(eq["Exposure"].mean()),max_exp=float(eq["Exposure"].max()),
+                    buys=buys,sells=sells,cycles=completed_cycles,years=years,
+                    buys_per_year=buys/years,sells_per_year=sells/years,cycles_per_year=completed_cycles/years,
+                    avg_hold=avg_hold,max_hold_actual=max_hold_actual,equity=eq)
 
     def candidates_v5():
         out=[]
@@ -134,7 +150,7 @@ with tab_kosdaq:
                 rows=[]; sims=[]
                 for j,p in enumerate(candidates_v5(),1):
                     r=bt_v5(train,p,float(initial),max_hold=int(hold_days)); eff=r["cagr"]/max(abs(r["mdd"]),1e-9); score=r["cagr"]-.20*abs(r["mdd"])
-                    rows.append({"후보":j,"베이스":p["base_name"],"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"매도횟수":r["sells"],"최종자산":r["final"]}); sims.append((p,r))
+                    rows.append({"후보":j,"베이스":p["base_name"],"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"총매수":r["buys"],"총매도":r["sells"],"연매수":r["buys_per_year"],"연매도":r["sells_per_year"],"연왕복":r["cycles_per_year"],"평균보유일":r["avg_hold"],"최대보유일":r["max_hold_actual"],"최종자산":r["final"]}); sims.append((p,r))
                 rank=pd.DataFrame(rows).sort_values(["CAGR","점수"],ascending=False).reset_index(drop=True); best_id=int(rank.iloc[0]["후보"])-1
                 st.session_state["k5_rank"]=rank; st.session_state["k5_best_p"],st.session_state["k5_best_r"]=sims[best_id]
                 if blind:
@@ -148,11 +164,13 @@ with tab_kosdaq:
         show["효율"]=show["효율"].map(lambda x:f"{x:.3f}"); show["점수"]=show["점수"].map(lambda x:f"{x:.4f}"); show["최종자산"]=show["최종자산"].map(lambda x:f"₩{x:,.0f}")
         st.dataframe(show,use_container_width=True,hide_index=True)
         br=st.session_state["k5_best_r"]; bp=st.session_state["k5_best_p"]
-        m1,m2,m3,m4=st.columns(4); m1.metric("1위 CAGR",f"{br['cagr']:.2%}"); m2.metric("MDD",f"{br['mdd']:.2%}"); m3.metric("평균투입",f"{br['avg_exp']:.1%}"); m4.metric("매도횟수",f"{br['sells']}회")
+        m1,m2,m3,m4=st.columns(4); m1.metric("1위 CAGR",f"{br['cagr']:.2%}"); m2.metric("MDD",f"{br['mdd']:.2%}"); m3.metric("연평균 매수",f"{br['buys_per_year']:.1f}회"); m4.metric("연평균 매도",f"{br['sells_per_year']:.1f}회")
+        h1,h2,h3=st.columns(3); h1.metric("연평균 왕복",f"{br['cycles_per_year']:.1f}회"); h2.metric("평균 보유일",("-" if not np.isfinite(br['avg_hold']) else f"{br['avg_hold']:.1f}일")); h3.metric("최대 보유일",f"{br['max_hold_actual']:.0f}일")
         st.line_chart((br["equity"]["Equity"]/br["equity"]["Equity"].iloc[0]*100).rename("V5 1위"))
         if blind and st.session_state.get("k5_test") is not None:
             tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
+            q4,q5,q6=st.columns(3); q4.metric("2026 연환산 매수",f"{tr['buys_per_year']:.1f}회"); q5.metric("2026 연환산 매도",f"{tr['sells_per_year']:.1f}회"); q6.metric("2026 최대 보유",f"{tr['max_hold_actual']:.0f}일")
         st.caption("엔벨로프가 실제로 도움이 되는지와, 상승 추세에서 매도를 늦추는 방식이 CAGR을 개선하는지를 동시에 확인합니다. 결과가 나쁘면 해당 조건은 다음 버전에서 제거합니다.")
 
 with tab_soxl:
