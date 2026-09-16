@@ -20,12 +20,12 @@ st.set_page_config(
     layout="centered",
 )
 
-tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V1"] )
+tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V2"] )
 
 with tab_kosdaq:
-    st.title("🇰🇷 국장 QUANT V1")
-    st.caption("장대양봉 × 거래대금 × 2~5일 눌림 · 2016~2023 개발구간 / 2024~2026 블라인드 봉인")
-    st.info("V1은 테마·RSI·이평선을 일부러 제외합니다. 먼저 가격/거래대금 자체에 엣지가 있는지 확인합니다.")
+    st.title("🇰🇷 국장 QUANT V2")
+    st.caption("장대양봉 × 거래대금 × 눌림 후 반등확인 · 2016~2023 개발구간 / 2024~2026 블라인드 봉인")
+    st.info("V2는 V1의 단순 눌림매수를 버리고, 눌림 뒤 실제 반등이 확인된 경우만 진입합니다. 세 반등 신호를 같은 표본에서 비교합니다.")
 
     @st.cache_data(ttl=86400, show_spinner=False)
     def krx_listing_v1():
@@ -51,29 +51,50 @@ with tab_kosdaq:
             x["Amount"] = x["Close"].astype(float) * x["Volume"].astype(float)
         return x
 
-    def scan_one_v1(x, code, name, market, rise_cut, amount_cut):
+    def scan_one_v1(x, code, name, market, rise_cut, amount_cut, rebound_mode="양봉+거래량"):
         if x is None or len(x)<30: return []
         d=x.copy().sort_index()
         d["R1"]=d["Close"].pct_change()
+        d["MA5"]=d["Close"].rolling(5).mean()
         events=np.flatnonzero((d["R1"].to_numpy() >= rise_cut) & (d["Amount"].to_numpy() >= amount_cut))
         out=[]
         for i in events:
-            if i+3>=len(d): continue
-            event_close=float(d["Close"].iloc[i]); event_high=float(d["High"].iloc[i])
-            # 장대양봉 뒤 2~5거래일 중, 그때까지의 고점 대비 -5~-20%인 첫 눌림
+            if i+4>=len(d): continue
+            # 장대양봉 뒤 2~5거래일 중 -5~-20% 눌림을 먼저 확인하고, 같은 기간 안의 첫 반등 신호를 찾는다.
+            pull_idx=None; pull_dd=np.nan
             for j in range(i+2, min(i+6,len(d)-1)):
                 peak=float(d["High"].iloc[i:j+1].max())
-                close_j=float(d["Close"].iloc[j])
-                dd=close_j/peak-1.0
+                dd=float(d["Close"].iloc[j]/peak-1.0)
                 if -0.20 <= dd <= -0.05:
-                    entry=j+1
-                    entry_px=float(d["Open"].iloc[entry])
-                    if not np.isfinite(entry_px) or entry_px<=0: break
-                    rec={"Code":code,"Name":name,"Market":market,"EventDate":d.index[i],"SignalDate":d.index[j],"EntryDate":d.index[entry],"Rise":float(d["R1"].iloc[i]),"Amount":float(d["Amount"].iloc[i]),"Pullback":dd}
-                    for h in (1,3,5,10,20):
-                        k=entry+h
-                        rec[f"R{h}"]=float(d["Close"].iloc[k]/entry_px-1.0) if k<len(d) else np.nan
-                    out.append(rec); break
+                    pull_idx=j; pull_dd=dd; break
+            if pull_idx is None: continue
+            # 미래정보 방지: 신호일 종가까지 확정된 데이터만 사용, 진입은 다음 거래일 시초가.
+            signal=None
+            for j in range(pull_idx, min(i+8,len(d)-1)):
+                if j < 1: continue
+                if rebound_mode=="전일고가돌파":
+                    cond=(float(d["High"].iloc[j]) > float(d["High"].iloc[j-1]) and
+                          float(d["Low"].iloc[j]) >= float(d["Low"].iloc[j-1]))
+                elif rebound_mode=="5일선재돌파":
+                    ma=float(d["MA5"].iloc[j]) if np.isfinite(d["MA5"].iloc[j]) else np.nan
+                    pma=float(d["MA5"].iloc[j-1]) if np.isfinite(d["MA5"].iloc[j-1]) else np.nan
+                    cond=(np.isfinite(ma) and np.isfinite(pma) and
+                          float(d["Close"].iloc[j]) > ma and float(d["Close"].iloc[j-1]) <= pma)
+                else: # 양봉 전환 + 전일 대비 거래량 증가
+                    cond=(float(d["Close"].iloc[j]) > float(d["Open"].iloc[j]) and
+                          float(d["Close"].iloc[j-1]) <= float(d["Open"].iloc[j-1]) and
+                          float(d["Volume"].iloc[j]) > float(d["Volume"].iloc[j-1]))
+                if cond:
+                    signal=j; break
+            if signal is None or signal+1>=len(d): continue
+            entry=signal+1
+            entry_px=float(d["Open"].iloc[entry])
+            if not np.isfinite(entry_px) or entry_px<=0: continue
+            rec={"Code":code,"Name":name,"Market":market,"EventDate":d.index[i],"SignalDate":d.index[signal],"EntryDate":d.index[entry],"Rise":float(d["R1"].iloc[i]),"Amount":float(d["Amount"].iloc[i]),"Pullback":pull_dd,"Rebound":rebound_mode}
+            for h in (1,3,5,10,20):
+                k=entry+h
+                rec[f"R{h}"]=float(d["Close"].iloc[k]/entry_px-1.0) if k<len(d) else np.nan
+            out.append(rec)
         return out
 
     c1,c2,c3=st.columns(3)
@@ -82,13 +103,14 @@ with tab_kosdaq:
     random_seed=c3.number_input("표본 Seed",0,9999,42,1)
     st.caption("⚠️ 현재 V1 다운로드는 현재 상장종목 기반입니다. 전략 확정 전 상장폐지 이력까지 합친 survivorship-bias 보정판으로 재검증해야 합니다.")
 
-    if st.button("🔥 국장 V1 15개 조합 돌리기", type="primary", use_container_width=True):
+    if st.button("🔥 국장 V2 반등신호 비교 돌리기", type="primary", use_container_width=True):
         try:
             listing=krx_listing_v1()
             n=min(int(max_names),len(listing))
             sample=listing.sample(n=n, random_state=int(random_seed)) if n<len(listing) else listing
             rise_cuts=[.15,.20,.25]; amount_cuts=[30e9,50e9,100e9,200e9,300e9]
-            buckets={(r,a):[] for r in rise_cuts for a in amount_cuts}
+            rebound_modes=["전일고가돌파","5일선재돌파","양봉+거래량"]
+            buckets={(m,r,a):[] for m in rebound_modes for r in rise_cuts for a in amount_cuts}
             bar=st.progress(0.0, text="종목 데이터 수집 시작")
             status=st.empty()
             for ix,row in enumerate(sample.itertuples(index=False),1):
@@ -96,21 +118,22 @@ with tab_kosdaq:
                     x=krx_one_v1(row.Code, f"{int(start_year)-1}-11-01", "2024-01-01")
                     if not x.empty:
                         # 가장 느슨한 조건의 이벤트를 한 번 만든 뒤 각 조합별로 필터
-                        base=scan_one_v1(x,row.Code,row.Name,row.Market,.15,30e9)
-                        for rec in base:
-                            for r in rise_cuts:
-                                if rec["Rise"]+1e-12 < r: continue
-                                for a0 in amount_cuts:
-                                    if rec["Amount"] >= a0: buckets[(r,a0)].append(rec)
+                        for m in rebound_modes:
+                            base=scan_one_v1(x,row.Code,row.Name,row.Market,.15,30e9,m)
+                            for rec in base:
+                                for r in rise_cuts:
+                                    if rec["Rise"]+1e-12 < r: continue
+                                    for a0 in amount_cuts:
+                                        if rec["Amount"] >= a0: buckets[(m,r,a0)].append(rec)
                 except Exception:
                     pass
                 if ix==1 or ix%10==0 or ix==n:
                     bar.progress(ix/n,text=f"{ix:,}/{n:,} 종목 분석 · {row.Code} {row.Name}")
                     status.caption("첫 실행은 데이터 다운로드 때문에 오래 걸릴 수 있고, 이후에는 캐시되어 빨라집니다.")
             rows=[]
-            for (r,a0),recs in buckets.items():
+            for (m,r,a0),recs in buckets.items():
                 q=pd.DataFrame(recs)
-                z={"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","신호수":len(q)}
+                z={"반등신호":m,"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","신호수":len(q)}
                 for h in (1,3,5,10,20):
                     col=f"R{h}"
                     z[f"{h}일 승률"]=(q[col].gt(0).mean()*100) if len(q) else np.nan
@@ -130,9 +153,9 @@ with tab_kosdaq:
         result=st.session_state["kr_v1_result"]
         show=result.copy()
         pct_cols=[c for c in show.columns if "승률" in c or "평균" in c or "중앙값" in c]
-        st.subheader("📊 V1 개발구간 결과")
+        st.subheader("📊 V2 반등확인 개발구간 결과")
         st.dataframe(show.style.format({c:"{:.2f}%" for c in pct_cols},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("이 표로 먼저 거래대금/장대양봉 영역의 엣지를 확인합니다. 아직 익절·손절·테마 조건은 넣지 않습니다.")
+        st.caption("V1과 비교해 승률·평균·중앙값이 개선되는 반등신호가 있는지 봅니다. 아직 익절·손절·테마는 넣지 않습니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
