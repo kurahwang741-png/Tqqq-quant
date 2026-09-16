@@ -24,7 +24,7 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V5.5 · 2026 봉인 + 과거구간 생존필터 탐색")
+    st.caption("V5.6 · 2026 봉인 + 생존필터 수정 + 손실원인 추적")
     st.info("🛡️ 2026은 끝까지 봉인합니다. 2016~2025만 이용해 위험 OFF 필터를 고른 뒤, 선택이 끝난 다음 2026에서 딱 한 번 검증합니다. 기준 전략은 V3-12형 + 20일 -10% 엔벨로프 + MA10 + 최소변화폭 15%입니다.")
 
     @st.cache_data(ttl=900)
@@ -49,6 +49,11 @@ with tab_kosdaq:
         delta=k.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
         d["RSI14"]=100-100/(1+gain/loss.replace(0,np.nan))
         for n in (5,8,10,12,20,60): d[f"MA{n}"]=k.rolling(n,min_periods=max(3,n//2)).mean()
+        # 생존필터용 장기 추세선
+        d["BASE_MA120"]=d["BASE"].astype(float).rolling(120,min_periods=60).mean()
+        d["BASE_MA200"]=d["BASE"].astype(float).rolling(200,min_periods=100).mean()
+        d["KOKORE_MA120"]=k.rolling(120,min_periods=60).mean()
+        d["SOX_MA120"]=d["SOX"].astype(float).rolling(120,min_periods=60).mean()
         d["DIST10"]=k/d["MA10"]-1; d["DIST20"]=k/d["MA20"]-1
         d["DD60"]=k/k.rolling(60,min_periods=20).max()-1
         d["RSI_D3"]=d["RSI14"].diff(3); d["DIST10_D3"]=d["DIST10"].diff(3)
@@ -80,75 +85,116 @@ with tab_kosdaq:
         if exposure>=.70 and not rebound: target=min(target,.70)
         return min(float(target),.90)
 
-    def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180):
-        d=features_v5(df,p["env_lower"]).dropna(subset=["BASE"]).copy(); cash=float(initial_cash); shares=0.0; entry=None; peak_base=None; rows=[]; sells=0; buys=0; hold_days_list=[]; completed_cycles=0
+    def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180,trade_start=None):
+        d=features_v5(df,p["env_lower"]).dropna(subset=["BASE"]).copy()
+        cash=float(initial_cash); shares=0.0; entry=None; peak_base=None
+        rows=[]; trades=[]; sells=0; buys=0; hold_days_list=[]; completed_cycles=0
+        trade_start_ts=pd.Timestamp(trade_start) if trade_start is not None else None
+
         for i in range(1,len(d)):
-            dt=d.index[i]; px=float(d["BASE"].iloc[i]); prev=d.iloc[i-1]
-            
-            # V5.5 survival filter: parameter is selected ONLY on <=2025 data.
+            dt=d.index[i]
+            if trade_start_ts is not None and pd.Timestamp(dt) < trade_start_ts:
+                continue
+
+            px=float(d["BASE"].iloc[i]); prev=d.iloc[i-1]
+            eq0=cash+shares*px
+            exp0=shares*px/eq0 if eq0>0 else 0.0
+
+            # 반드시 먼저 기본 목표비중을 계산한다.
+            target=target_v5(prev,p,exp0)
+
+            # 전 거래일 확정 데이터로 위험 OFF 판정 (look-ahead 방지)
             risk_mode=p.get("risk_mode","NONE")
             risk_cap=float(p.get("risk_cap",1.0))
             risk_off=False
             if risk_mode=="BASE_MA120":
-                risk_off = px < float(r.get("BASE_MA120",px))
+                v=prev.get("BASE_MA120",np.nan)
+                risk_off=np.isfinite(v) and float(prev["BASE"]) < float(v)
             elif risk_mode=="BASE_MA200":
-                risk_off = px < float(r.get("BASE_MA200",px))
+                v=prev.get("BASE_MA200",np.nan)
+                risk_off=np.isfinite(v) and float(prev["BASE"]) < float(v)
             elif risk_mode=="KOKORE_MA120":
-                risk_off = float(r.get("KOKORE",0)) < float(r.get("KOKORE_MA120",r.get("KOKORE",0)))
+                v=prev.get("KOKORE_MA120",np.nan)
+                risk_off=np.isfinite(v) and float(prev["KOKORE"]) < float(v)
             elif risk_mode=="SOX_MA120":
-                # build on the fly from precomputed rolling SOX_MA120 if present
-                risk_off = float(r.get("SOX",0)) < float(r.get("SOX_MA120",r.get("SOX",0)))
+                v=prev.get("SOX_MA120",np.nan)
+                risk_off=np.isfinite(v) and float(prev["SOX"]) < float(v)
             elif risk_mode=="VIX30":
-                risk_off = float(r.get("VIX",0)) >= 30.0
+                risk_off=np.isfinite(prev.get("VIX",np.nan)) and float(prev["VIX"]) >= 30.0
             elif risk_mode=="BASE120_OR_VIX30":
-                risk_off = (px < float(r.get("BASE_MA120",px))) or (float(r.get("VIX",0)) >= 30.0)
+                ma=prev.get("BASE_MA120",np.nan); vx=prev.get("VIX",np.nan)
+                risk_off=(np.isfinite(ma) and float(prev["BASE"]) < float(ma)) or (np.isfinite(vx) and float(vx)>=30.0)
+
+            raw_target=float(target)
             if risk_off:
                 target=min(target,risk_cap)
 
-            eq0=cash+shares*px; exp0=shares*px/eq0 if eq0>0 else 0.0; target=target_v5(prev,p,exp0)
             if shares>0: peak_base=max(float(peak_base or px),px)
             else: peak_base=None
+
             forced=entry is not None and max_hold and (pd.Timestamp(dt)-pd.Timestamp(entry)).days>=int(max_hold)
             desired=eq0*target; diff=desired-shares*px
-            # 매도 지연 규칙: 미래정보 없이 전 거래일 확정 신호만 사용
+
             if diff<0 and shares>0 and not forced:
-                mode=p["exit_mode"]
-                hold=False
-                if mode=="MA5": hold=np.isfinite(prev.get("MA5",np.nan)) and float(prev["KOKORE"])>=float(prev["MA5"])
-                elif mode=="MA10": hold=np.isfinite(prev.get("MA10",np.nan)) and float(prev["KOKORE"])>=float(prev["MA10"])
-                elif mode=="TRAIL6": hold=peak_base is not None and px>=float(peak_base)*.94
+                mode=p["exit_mode"]; hold=False
+                if mode=="MA5":
+                    hold=np.isfinite(prev.get("MA5",np.nan)) and float(prev["KOKORE"])>=float(prev["MA5"])
+                elif mode=="MA10":
+                    hold=np.isfinite(prev.get("MA10",np.nan)) and float(prev["KOKORE"])>=float(prev["MA10"])
+                elif mode=="TRAIL6":
+                    hold=peak_base is not None and px>=float(peak_base)*.94
                 if hold: diff=0.0
             if forced: diff=-shares*px
+
             rebalance_gap=float(p.get("rebalance_gap",.01))
+            action="대기"; traded_pct=0.0
             if diff>max(eq0*rebalance_gap,1):
                 spend=min(diff,cash); qty=(spend*(1-fee))/px
                 if qty>0:
-                    was_flat = shares <= 0
+                    before=shares
                     shares+=qty; cash-=spend; buys+=1
                     entry=dt if entry is None else entry
                     peak_base=px if peak_base is None else max(peak_base,px)
+                    action="매수"; traded_pct=spend/eq0 if eq0>0 else 0
             elif diff<-max(eq0*rebalance_gap,1):
                 qty=min(shares,(-diff)/px)
-                if qty>0: cash+=qty*px*(1-fee); shares-=qty; sells+=1
+                if qty>0:
+                    cash+=qty*px*(1-fee); shares-=qty; sells+=1
+                    action="매도"; traded_pct=qty*px/eq0 if eq0>0 else 0
                 if shares*px<eq0*.01:
                     if entry is not None:
                         hold_days_list.append((pd.Timestamp(dt)-pd.Timestamp(entry)).days)
-                        completed_cycles += 1
+                        completed_cycles+=1
                     entry=None; peak_base=None
-            eq=cash+shares*px; rows.append((dt,eq,shares*px/eq if eq>0 else 0,target))
+
+            eq=cash+shares*px
+            exposure=shares*px/eq if eq>0 else 0
+            rows.append((dt,eq,exposure,target))
+            if action!="대기":
+                trades.append({
+                    "Date":dt,"구분":action,"BASE가격":px,"거래비중":traded_pct,
+                    "거래후투입":exposure,"원목표":raw_target,"필터후목표":target,
+                    "RiskOFF":risk_off,"RiskMode":risk_mode,
+                    "KOKORE":float(prev.get("KOKORE",np.nan)),
+                    "RSI14":float(prev.get("RSI14",np.nan)),
+                    "DIST20":float(prev.get("DIST20",np.nan)),
+                })
+
         eq=pd.DataFrame(rows,columns=["Date","Equity","Exposure","Target"]).set_index("Date")
         if eq.empty: raise ValueError("백테스트 구간이 너무 짧습니다.")
-        years=max((eq.index[-1]-eq.index[0]).days/365.25,1/365.25); final=float(eq["Equity"].iloc[-1]); cagr=(final/initial_cash)**(1/years)-1
+        years=max((eq.index[-1]-eq.index[0]).days/365.25,1/365.25)
+        final=float(eq["Equity"].iloc[-1]); cagr=(final/initial_cash)**(1/years)-1
         mdd=float((eq["Equity"]/eq["Equity"].cummax()-1).min())
         avg_hold=float(np.mean(hold_days_list)) if hold_days_list else np.nan
         max_hold_actual=float(np.max(hold_days_list)) if hold_days_list else 0.0
         if entry is not None:
             ongoing=(pd.Timestamp(eq.index[-1])-pd.Timestamp(entry)).days
             max_hold_actual=max(max_hold_actual,float(ongoing))
+        trade_df=pd.DataFrame(trades)
         return dict(cagr=cagr,mdd=mdd,final=final,avg_exp=float(eq["Exposure"].mean()),max_exp=float(eq["Exposure"].max()),
                     buys=buys,sells=sells,cycles=completed_cycles,years=years,
                     buys_per_year=buys/years,sells_per_year=sells/years,cycles_per_year=completed_cycles/years,
-                    avg_hold=avg_hold,max_hold_actual=max_hold_actual,equity=eq)
+                    avg_hold=avg_hold,max_hold_actual=max_hold_actual,equity=eq,trades=trade_df)
 
     def candidates_v5():
         out=[]
@@ -190,11 +236,12 @@ with tab_kosdaq:
                 rank=pd.DataFrame(rows).sort_values(["점수","CAGR"],ascending=False).reset_index(drop=True); best_id=int(rank.iloc[0]["후보"])-1
                 st.session_state["k5_rank"]=rank; st.session_state["k5_best_p"],st.session_state["k5_best_r"]=sims[best_id]
                 if blind:
-                    test=kd.loc[kd.index>=pd.Timestamp("2026-01-01")].copy(); st.session_state["k5_test"]=bt_v5(test,sims[best_id][0],float(initial),max_hold=int(hold_days)) if len(test)>5 else None
+                    test=kd.copy()
+                    st.session_state["k5_test"]=bt_v5(test,sims[best_id][0],float(initial),max_hold=int(hold_days),trade_start="2026-01-01") if len(test.loc[test.index>=pd.Timestamp("2026-01-01")])>5 else None
         except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
     if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("🛡️ V5.5 2016~2025 생존필터 결과")
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🛡️ V5.6 2016~2025 생존필터 결과")
         show=rank.head(10).copy()
         for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
         show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
@@ -209,6 +256,19 @@ with tab_kosdaq:
             tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
             q4,q5,q6=st.columns(3); q4.metric("2026 연환산 매수",f"{tr['buys_per_year']:.1f}회"); q5.metric("2026 연환산 매도",f"{tr['sells_per_year']:.1f}회"); q6.metric("2026 최대 보유",f"{tr['max_hold_actual']:.0f}일")
+            st.markdown("#### 🔎 2026 손실 원인 추적")
+            td=tr.get("trades",pd.DataFrame()).copy()
+            if not td.empty:
+                td["Date"]=pd.to_datetime(td["Date"]).dt.strftime("%Y-%m-%d")
+                for cc in ["거래비중","거래후투입","원목표","필터후목표"]:
+                    td[cc]=td[cc].map(lambda x:f"{x:.1%}")
+                td["BASE가격"]=td["BASE가격"].map(lambda x:f"{x:,.0f}")
+                td["RSI14"]=td["RSI14"].map(lambda x:f"{x:.1f}")
+                td["DIST20"]=td["DIST20"].map(lambda x:f"{x:.1%}")
+                st.dataframe(td,use_container_width=True,hide_index=True)
+                st.caption("매수·매도 날짜, 거래 후 총투입률, 생존필터 작동 여부를 직접 확인할 수 있습니다.")
+            else:
+                st.info("2026 구간에 실제 리밸런싱 거래가 없습니다.")
         st.subheader("📅 선택된 필터의 과거 연도별 성과")
         # Rebuild the two locked strategies on the same training window.
         try:
