@@ -24,7 +24,7 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V6.1 · DIST5 매도억제/반등대기 + 2026 재봉인")
+    st.caption("V6.3 · 원본데이터 다운로드 + 2026 손실매수 해부")
     st.info("🛡️ 2026은 끝까지 봉인합니다. 2016~2025만 이용해 위험 OFF 필터를 고른 뒤, 선택이 끝난 다음 2026에서 딱 한 번 검증합니다. 기준 전략은 V3-12형 + 20일 -10% 엔벨로프 + MA10 + 최소변화폭 15%입니다.")
 
     @st.cache_data(ttl=900)
@@ -43,6 +43,12 @@ with tab_kosdaq:
         us.columns=["USDate","NDX","SOX","VIX"]; us["USDate"]=pd.to_datetime(us["USDate"]).dt.tz_localize(None).dt.normalize()
         us["NDX_R1"]=us["NDX"].pct_change(); us["SOX_R1"]=us["SOX"].pct_change(); us["VIX_R1"]=us["VIX"].pct_change()
         return pd.merge_asof(kr.sort_values("Date"),us.sort_values("USDate"),left_on="Date",right_on="USDate",direction="backward",allow_exact_matches=False).set_index("Date").dropna(subset=["KOKORE","BASE"])
+
+    def _research_csv_bytes_v63(df):
+        """현재 백테스트에 실제 투입된 병합 시계열을 CSV bytes로 변환."""
+        z=df.copy()
+        z.index.name="Date"
+        return z.reset_index().to_csv(index=False).encode("utf-8-sig")
 
     def features_v5(df, env_lower):
         d=df.copy(); k=d["KOKORE"].astype(float)
@@ -221,7 +227,12 @@ with tab_kosdaq:
                     "RiskOFF":risk_off,"RiskMode":risk_mode,
                     "KOKORE":float(prev.get("KOKORE",np.nan)),
                     "RSI14":float(prev.get("RSI14",np.nan)),
+                    "DIST5":float(prev.get("DIST5",np.nan)),
+                    "DIST10":float(prev.get("DIST10",np.nan)),
                     "DIST20":float(prev.get("DIST20",np.nan)),
+                    "DD60":float(prev.get("DD60",np.nan)),
+                    "SOX_R1":float(prev.get("SOX_R1",np.nan)),
+                    "NDX_R1":float(prev.get("NDX_R1",np.nan)),
                 })
 
         eq=pd.DataFrame(rows,columns=["Date","Equity","Exposure","Target"]).set_index("Date")
@@ -262,6 +273,21 @@ with tab_kosdaq:
                             dist5_mode=mode,dist5_sell_cut=cut,dist5_floor=floor,
                             entry_cap=e,wait_days=2,aux_need=1,expand_cap=.50,**base))
         return out
+
+    st.markdown("### 📥 직접 백테스트용 원본데이터")
+    st.caption("이 CSV를 ChatGPT에 한 번 올리면 이후 백테스트와 손실매수 분석을 여기서 직접 진행할 수 있습니다.")
+    try:
+        _research_bytes=_research_csv_bytes_v63(kd)
+        st.download_button(
+            "📥 백테스트 원본데이터 CSV 다운로드",
+            data=_research_bytes,
+            file_name="kosdaq_backtest_research_data.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_kosdaq_backtest_research_csv_v63",
+        )
+    except Exception as _e:
+        st.warning(f"원본데이터 다운로드 준비 실패: {_e}")
 
     a,b,c=st.columns(3)
     initial=a.number_input("초기 투자금(원)",min_value=1_000_000,value=10_000_000,step=1_000_000,key="k5_initial")
@@ -324,7 +350,63 @@ with tab_kosdaq:
                 td["RSI14"]=td["RSI14"].map(lambda x:f"{x:.1f}")
                 td["DIST20"]=td["DIST20"].map(lambda x:f"{x:.1%}")
                 st.dataframe(td,use_container_width=True,hide_index=True)
-                st.caption("매수·매도 날짜, 거래 후 총투입률, 생존필터 작동 여부를 직접 확인할 수 있습니다.")
+
+                # 매수 시점 이후 5/10/20 거래일의 최대상승(MFE), 최대하락(MAE), 종가수익률 분석
+                raw_td=tr.get("trades",pd.DataFrame()).copy()
+                feat=features_v5(kd,bp["env_lower"]).dropna(subset=["BASE"]).copy()
+                diag=[]
+                for _,rr in raw_td[raw_td["구분"]=="매수"].iterrows():
+                    dt0=pd.Timestamp(rr["Date"])
+                    if dt0 not in feat.index: continue
+                    loc=feat.index.get_loc(dt0)
+                    if not isinstance(loc,(int,np.integer)): continue
+                    entry_px=float(rr["BASE가격"])
+                    rec={"Date":dt0.strftime("%Y-%m-%d"),"매수가":entry_px,
+                         "RSI14":rr.get("RSI14",np.nan),"DIST5":rr.get("DIST5",np.nan),
+                         "DIST10":rr.get("DIST10",np.nan),"DIST20":rr.get("DIST20",np.nan),
+                         "DD60":rr.get("DD60",np.nan),"SOX1D":rr.get("SOX_R1",np.nan),
+                         "NDX1D":rr.get("NDX_R1",np.nan)}
+                    for h in (5,10,20):
+                        future=feat["BASE"].iloc[loc+1:min(loc+h+1,len(feat))]
+                        if len(future):
+                            rets=future/entry_px-1
+                            rec[f"{h}일MFE"]=float(rets.max())
+                            rec[f"{h}일MAE"]=float(rets.min())
+                            rec[f"{h}일후"]=float(rets.iloc[-1])
+                    diag.append(rec)
+                diag=pd.DataFrame(diag)
+                if not diag.empty:
+                    st.markdown("##### 🧬 2026 매수별 사후 해부")
+                    fmt=diag.copy()
+                    fmt["매수가"]=fmt["매수가"].map(lambda x:f"{x:,.0f}")
+                    fmt["RSI14"]=fmt["RSI14"].map(lambda x:f"{x:.1f}" if np.isfinite(x) else "-")
+                    for cc in ["DIST5","DIST10","DIST20","DD60","SOX1D","NDX1D",
+                               "5일MFE","5일MAE","5일후","10일MFE","10일MAE","10일후",
+                               "20일MFE","20일MAE","20일후"]:
+                        if cc in fmt.columns:
+                            fmt[cc]=fmt[cc].map(lambda x:f"{x:.1%}" if pd.notna(x) and np.isfinite(x) else "-")
+                    st.dataframe(fmt,use_container_width=True,hide_index=True)
+
+                    # 과열 진입과 일반 진입을 자동 비교하되, 규칙으로 아직 고정하지 않는다.
+                    hot=(pd.to_numeric(diag["RSI14"],errors="coerce")>=70) | (pd.to_numeric(diag["DIST20"],errors="coerce")>=.20)
+                    st.markdown("##### 🧪 과열 진입 vs 일반 진입")
+                    comp=[]
+                    for name,mask in [("과열진입",hot),("일반진입",~hot)]:
+                        z=diag.loc[mask]
+                        if len(z):
+                            comp.append({"구분":name,"매수수":len(z),
+                                "10일평균수익":z.get("10일후",pd.Series(dtype=float)).mean(),
+                                "10일평균MAE":z.get("10일MAE",pd.Series(dtype=float)).mean(),
+                                "20일평균수익":z.get("20일후",pd.Series(dtype=float)).mean(),
+                                "20일평균MFE":z.get("20일MFE",pd.Series(dtype=float)).mean()})
+                    comp=pd.DataFrame(comp)
+                    if not comp.empty:
+                        for cc in ["10일평균수익","10일평균MAE","20일평균수익","20일평균MFE"]:
+                            comp[cc]=comp[cc].map(lambda x:f"{x:.1%}" if pd.notna(x) else "-")
+                        st.dataframe(comp,use_container_width=True,hide_index=True)
+                    st.caption("아직 RSI/DIST20을 매수금지 조건으로 쓰지 않습니다. 먼저 손실 매수의 반복 특징을 확인하는 진단 단계입니다.")
+
+                st.caption("매수·매도 날짜, 거래 후 총투입률과 함께 매수 당시 특징 및 이후 5·10·20거래일 성과를 확인합니다.")
             else:
                 st.info("2026 구간에 실제 리밸런싱 거래가 없습니다.")
         st.subheader("📅 선택된 필터의 과거 연도별 성과")
