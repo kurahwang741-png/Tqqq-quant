@@ -24,8 +24,8 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V5.1 FAST · V5 우승 구조 고정 + 리밸런싱 최소 변화폭 최적화")
-    st.info("⚡ V5에서 좋았던 20일 -8% 엔벨로프 + MA10 매도를 고정하고, 최소 리밸런싱 변화폭 5% / 7.5% / 10% / 12.5% / 15%만 비교합니다. V3-4형과 V3-12형을 함께 봅니다.")
+    st.caption("V5.2 FAST · 15% 리밸런싱 고정 + 엔벨로프/MA 정밀 탐색")
+    st.info("⚡ V5.1 최고 구조인 V3-12형 + 최소 리밸런싱 15%를 고정하고, 20일 엔벨로프 -6~-10%와 MA8/MA10/MA12만 15개 비교합니다.")
 
     @st.cache_data(ttl=900)
     def download_kosdaq_research_data():
@@ -48,7 +48,7 @@ with tab_kosdaq:
         d=df.copy(); k=d["KOKORE"].astype(float)
         delta=k.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
         d["RSI14"]=100-100/(1+gain/loss.replace(0,np.nan))
-        for n in (5,10,20,60): d[f"MA{n}"]=k.rolling(n,min_periods=max(3,n//2)).mean()
+        for n in (5,8,10,12,20,60): d[f"MA{n}"]=k.rolling(n,min_periods=max(3,n//2)).mean()
         d["DIST10"]=k/d["MA10"]-1; d["DIST20"]=k/d["MA20"]-1
         d["DD60"]=k/k.rolling(60,min_periods=20).max()-1
         d["RSI_D3"]=d["RSI14"].diff(3); d["DIST10_D3"]=d["DIST10"].diff(3)
@@ -131,14 +131,14 @@ with tab_kosdaq:
 
     def candidates_v5():
         out=[]
-        # V5.1 FAST: V5의 핵심 승자 구조(-8% 엔벨로프 + MA10)를 고정.
-        # V3-4형 / V3-12형 × 최소 리밸런싱 변화폭 5종 = 10개.
-        for base_name,levels in [("V3-4형",(.10,.25,.45,.70)),("V3-12형",(.12,.30,.50,.75))]:
-            for rebalance_gap in (.05,.075,.10,.125,.15):
+        # V5.2 FAST: V5.1 최고 구조 고정.
+        # 엔벨로프 5종 × 매도 MA 3종 = 15개.
+        for env_lower in (-.06,-.07,-.08,-.09,-.10):
+            for exit_mode in ("MA8","MA10","MA12"):
                 out.append(dict(
-                    base_name=base_name, levels=levels,
-                    env_lower=-.08, env_w=1.0, reentry_w=1.5,
-                    exit_mode="MA10", rebalance_gap=rebalance_gap
+                    base_name="V3-12형", levels=(.12,.30,.50,.75),
+                    env_lower=env_lower, env_w=1.0, reentry_w=1.5,
+                    exit_mode=exit_mode, rebalance_gap=.15
                 ))
         return out
 
@@ -148,9 +148,9 @@ with tab_kosdaq:
     hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("⚡ V5.1 거래횟수 FAST 탐색",type="primary",use_container_width=True,key="run_k5"):
+    if st.button("⚡ V5.2 엔벨로프 정밀 탐색",type="primary",use_container_width=True,key="run_k5"):
         try:
-            with st.spinner("10개만 탐색 중 · 성과를 최대한 유지하면서 거래횟수를 줄이는 구간을 찾습니다..."):
+            with st.spinner("15개만 탐색 중 · 엔벨로프 -8% 주변과 MA10 주변을 정밀 비교합니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
                 for j,p in enumerate(candidates_v5(),1):
@@ -163,7 +163,7 @@ with tab_kosdaq:
         except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
     if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("🏆 V5.1 거래횟수 FAST 결과")
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🏆 V5.2 엔벨로프 정밀 결과")
         show=rank.head(10).copy()
         for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
         show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
@@ -177,7 +177,7 @@ with tab_kosdaq:
             tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
             q4,q5,q6=st.columns(3); q4.metric("2026 연환산 매수",f"{tr['buys_per_year']:.1f}회"); q5.metric("2026 연환산 매도",f"{tr['sells_per_year']:.1f}회"); q6.metric("2026 최대 보유",f"{tr['max_hold_actual']:.0f}일")
-        st.caption("V5 기준선은 #19 CAGR 6.48% / MDD -28.77% / 연매수 약 46.6회 / 연매도 약 42.5회였습니다. V5.1은 이 성과를 최대한 유지하면서 작은 비중 조정을 생략해 거래횟수를 줄이는 실험입니다.")
+        st.caption("V5.1 기준선은 CAGR 6.70% / MDD -27.64%, 최소 리밸런싱 15%입니다. V5.2는 거래 간격을 그대로 잠그고 엔벨로프와 매도 이평선만 정밀 탐색합니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
