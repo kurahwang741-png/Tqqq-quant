@@ -24,175 +24,136 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V4 FAST · V3 저위험 구조 + 급락 후 반등 BOOST · 코코레 + NASDAQ + SOX + VIX → 본주(229200)")
-    st.info("⚡ V4 FAST: V3 저위험 4/8/12형을 베이스로 잠그고, 급락 후 RSI·이격·SOX·VIX가 함께 회복될 때만 남는 현금을 BOOST합니다. 24개만 비교합니다.")
+    st.caption("V5 FAST · V3 저위험 베이스 + 코코레 엔벨로프 + 매도 방식 비교")
+    st.info("⚡ 24개 핵심 조합만 비교합니다. 엔벨로프는 코코레 20일선 기준 하단 이격과 하단 재진입을 신호로 쓰고, 매도는 기본/5일선/10일선/6% 트레일링을 비교합니다.")
 
     @st.cache_data(ttl=900)
     def download_kosdaq_research_data():
-        symbols = ["233740.KS", "229200.KS", "^NDX", "^SOX", "^VIX"]
-        raw = yf.download(symbols, period="max", interval="1d", auto_adjust=True,
-                          progress=False, group_by="column")
-        if raw is None or raw.empty:
-            raise ValueError("코스닥/미국장 데이터를 받지 못했습니다.")
+        symbols=["233740.KS","229200.KS","^NDX","^SOX","^VIX"]
+        raw=yf.download(symbols,period="max",interval="1d",auto_adjust=True,progress=False,group_by="column")
+        if raw is None or raw.empty: raise ValueError("코스닥/미국장 데이터를 받지 못했습니다.")
         def close_of(sym):
-            if isinstance(raw.columns, pd.MultiIndex):
-                if "Close" in raw.columns.get_level_values(0):
-                    return raw["Close"][sym].dropna()
-                return raw.xs("Close", axis=1, level=-1)[sym].dropna()
+            if isinstance(raw.columns,pd.MultiIndex):
+                if "Close" in raw.columns.get_level_values(0): return raw["Close"][sym].dropna()
+                return raw.xs("Close",axis=1,level=-1)[sym].dropna()
             raise ValueError("종가 데이터를 찾지 못했습니다.")
-        kr = pd.concat([close_of("233740.KS").rename("KOKORE"), close_of("229200.KS").rename("BASE")], axis=1).dropna().reset_index()
-        kr.columns = ["Date", "KOKORE", "BASE"]
-        kr["Date"] = pd.to_datetime(kr["Date"]).dt.tz_localize(None).dt.normalize()
-        us = pd.concat([close_of("^NDX").rename("NDX"), close_of("^SOX").rename("SOX"), close_of("^VIX").rename("VIX")], axis=1).dropna().reset_index()
-        us.columns = ["USDate", "NDX", "SOX", "VIX"]
-        us["USDate"] = pd.to_datetime(us["USDate"]).dt.tz_localize(None).dt.normalize()
-        us["NDX_R1"] = us["NDX"].pct_change(); us["SOX_R1"] = us["SOX"].pct_change(); us["VIX_R1"] = us["VIX"].pct_change()
-        us["NDX_R3"] = us["NDX"].pct_change(3); us["SOX_R3"] = us["SOX"].pct_change(3)
-        return pd.merge_asof(kr.sort_values("Date"), us.sort_values("USDate"), left_on="Date", right_on="USDate",
-                             direction="backward", allow_exact_matches=False).set_index("Date").dropna(subset=["KOKORE","BASE"])
+        kr=pd.concat([close_of("233740.KS").rename("KOKORE"),close_of("229200.KS").rename("BASE")],axis=1).dropna().reset_index()
+        kr.columns=["Date","KOKORE","BASE"]; kr["Date"]=pd.to_datetime(kr["Date"]).dt.tz_localize(None).dt.normalize()
+        us=pd.concat([close_of("^NDX").rename("NDX"),close_of("^SOX").rename("SOX"),close_of("^VIX").rename("VIX")],axis=1).dropna().reset_index()
+        us.columns=["USDate","NDX","SOX","VIX"]; us["USDate"]=pd.to_datetime(us["USDate"]).dt.tz_localize(None).dt.normalize()
+        us["NDX_R1"]=us["NDX"].pct_change(); us["SOX_R1"]=us["SOX"].pct_change(); us["VIX_R1"]=us["VIX"].pct_change()
+        return pd.merge_asof(kr.sort_values("Date"),us.sort_values("USDate"),left_on="Date",right_on="USDate",direction="backward",allow_exact_matches=False).set_index("Date").dropna(subset=["KOKORE","BASE"])
 
-    def kosdaq_features_v2(df):
+    def features_v5(df, env_lower):
         d=df.copy(); k=d["KOKORE"].astype(float)
         delta=k.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
         d["RSI14"]=100-100/(1+gain/loss.replace(0,np.nan))
         for n in (5,10,20,60): d[f"MA{n}"]=k.rolling(n,min_periods=max(3,n//2)).mean()
-        d["DIST5"]=k/d["MA5"]-1; d["DIST10"]=k/d["MA10"]-1; d["DIST20"]=k/d["MA20"]-1
-        d["DD60"]=k/k.rolling(60,min_periods=20).max()-1; d["DD120"]=k/k.rolling(120,min_periods=40).max()-1
-        d["K_R1"]=k.pct_change(); d["K_R3"]=k.pct_change(3); d["K_R5"]=k.pct_change(5)
+        d["DIST10"]=k/d["MA10"]-1; d["DIST20"]=k/d["MA20"]-1
+        d["DD60"]=k/k.rolling(60,min_periods=20).max()-1
         d["RSI_D3"]=d["RSI14"].diff(3); d["DIST10_D3"]=d["DIST10"].diff(3)
+        d["ENV_BELOW"]=d["DIST20"]<=float(env_lower)
+        d["ENV_REENTRY"]=(d["DIST20"].shift(1)<=float(env_lower)) & (d["DIST20"]>float(env_lower))
         return d
 
-    def target_v2(r, p, exposure):
-        score=0.0
-        dd=float(r.get("DD60",np.nan)); rsi=float(r.get("RSI14",np.nan)); dist=float(r.get("DIST10",np.nan))
-        if np.isfinite(dd):
-            score += p["dd_w"]*(int(dd<=p["dd1"])+int(dd<=p["dd2"])+int(dd<=p["dd3"]))
-        if np.isfinite(rsi): score += p["rsi_w"]*(int(rsi<=p["rsi1"])+int(rsi<=p["rsi2"]))
-        if np.isfinite(dist) and dist<=p["dist"]: score += 1.0
+    def target_v5(r,p,exposure):
+        score=0.0; dd=float(r.get("DD60",np.nan)); rsi=float(r.get("RSI14",np.nan)); dist=float(r.get("DIST10",np.nan))
+        if np.isfinite(dd): score += int(dd<=-.10)+int(dd<=-.18)+int(dd<=-.28)
+        if np.isfinite(rsi): score += int(rsi<=45)+int(rsi<=35)
+        if np.isfinite(dist) and dist<=-.03: score += 1.0
         ndx=float(r.get("NDX_R1",np.nan)); sox=float(r.get("SOX_R1",np.nan)); vix=float(r.get("VIX",np.nan)); vr=float(r.get("VIX_R1",np.nan))
-        if np.isfinite(ndx): score += (p["us_pos"] if ndx>=p["ndx_up"] else (-p["us_neg"] if ndx<=p["ndx_dn"] else 0))
-        if np.isfinite(sox): score += (p["sox_pos"] if sox>=p["sox_up"] else (-p["sox_neg"] if sox<=p["sox_dn"] else 0))
+        if np.isfinite(ndx): score += .5 if ndx>=.012 else (-.5 if ndx<=-.02 else 0)
+        if np.isfinite(sox): score += 1.25 if sox>=.02 else (-.75 if sox<=-.03 else 0)
         if np.isfinite(vix) and np.isfinite(vr):
-            if vix>=p["vix_hi"] and vr>0: score -= p["vix_neg"]
-            if vix>=p["vix_mid"] and vr<=p["vix_fall"]: score += p["vix_pos"]
-        rebound=(float(r.get("RSI_D3",-99))>=p["rsi_reb"] and float(r.get("DIST10_D3",-99))>=p["dist_reb"] and float(r.get("SOX_R1",-99))>0)
-        if rebound: score += p["reb_w"]
+            if vix>=35 and vr>0: score-=.75
+            if vix>=25 and vr<=-.05: score+=1.0
+        rebound=float(r.get("RSI_D3",-99))>=2.0 and float(r.get("DIST10_D3",-99))>=.015 and np.isfinite(sox) and sox>0
+        if rebound: score+=2.5
+        if bool(r.get("ENV_BELOW",False)): score+=p["env_w"]
+        if bool(r.get("ENV_REENTRY",False)): score+=p["reentry_w"]
         levels=p["levels"]
-        if score < p["s1"]: target=0.0
-        elif score < p["s2"]: target=levels[0]
-        elif score < p["s3"]: target=levels[1]
-        elif score < p["s4"]: target=levels[2]
+        if score<1.5: target=0.0
+        elif score<2.5: target=levels[0]
+        elif score<3.5: target=levels[1]
+        elif score<4.5: target=levels[2]
         else: target=levels[3]
-        boost=(
-            np.isfinite(dd) and dd<=p.get("boost_dd",-9)
-            and float(r.get("RSI_D3",-99))>=2.0
-            and float(r.get("DIST10_D3",-99))>=.015
-            and np.isfinite(sox) and sox>=p.get("boost_sox",9)
-            and np.isfinite(vr) and vr<=0.0
-        )
-        if boost and target>0:
-            target=max(target,min(p.get("boost_floor",.55),target*p.get("boost_mult",1.0)))
-        if exposure>=0.70 and not rebound and not boost: target=min(target,0.70)
-        return min(float(target),float(p["cap"]))
+        if exposure>=.70 and not rebound: target=min(target,.70)
+        return min(float(target),.90)
 
-    def bt_v2(df,p,initial_cash=10_000_000.0,fee=0.00015,max_hold=180):
-        d=kosdaq_features_v2(df).dropna(subset=["BASE"]).copy(); cash=float(initial_cash); shares=0.0; entry=None; rows=[]; sells=0
+    def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180):
+        d=features_v5(df,p["env_lower"]).dropna(subset=["BASE"]).copy(); cash=float(initial_cash); shares=0.0; entry=None; peak_base=None; rows=[]; sells=0
         for i in range(1,len(d)):
-            dt=d.index[i]; px=float(d["BASE"].iloc[i]); eq0=cash+shares*px; exp0=shares*px/eq0 if eq0>0 else 0
-            target=target_v2(d.iloc[i-1],p,exp0)
-            if entry is not None and max_hold and (pd.Timestamp(dt)-pd.Timestamp(entry)).days>=int(max_hold): target=0.0
+            dt=d.index[i]; px=float(d["BASE"].iloc[i]); prev=d.iloc[i-1]
+            eq0=cash+shares*px; exp0=shares*px/eq0 if eq0>0 else 0.0; target=target_v5(prev,p,exp0)
+            if shares>0: peak_base=max(float(peak_base or px),px)
+            else: peak_base=None
+            forced=entry is not None and max_hold and (pd.Timestamp(dt)-pd.Timestamp(entry)).days>=int(max_hold)
             desired=eq0*target; diff=desired-shares*px
-            if diff>max(eq0*0.01,1):
+            # 매도 지연 규칙: 미래정보 없이 전 거래일 확정 신호만 사용
+            if diff<0 and shares>0 and not forced:
+                mode=p["exit_mode"]
+                hold=False
+                if mode=="MA5": hold=np.isfinite(prev.get("MA5",np.nan)) and float(prev["KOKORE"])>=float(prev["MA5"])
+                elif mode=="MA10": hold=np.isfinite(prev.get("MA10",np.nan)) and float(prev["KOKORE"])>=float(prev["MA10"])
+                elif mode=="TRAIL6": hold=peak_base is not None and px>=float(peak_base)*.94
+                if hold: diff=0.0
+            if forced: diff=-shares*px
+            if diff>max(eq0*.01,1):
                 spend=min(diff,cash); qty=(spend*(1-fee))/px
-                if qty>0: shares+=qty; cash-=spend; entry=dt if entry is None else entry
-            elif diff<-max(eq0*0.01,1):
+                if qty>0: shares+=qty; cash-=spend; entry=dt if entry is None else entry; peak_base=px if peak_base is None else max(peak_base,px)
+            elif diff<-max(eq0*.01,1):
                 qty=min(shares,(-diff)/px)
                 if qty>0: cash+=qty*px*(1-fee); shares-=qty; sells+=1
-                if shares*px<eq0*0.01: entry=None
+                if shares*px<eq0*.01: entry=None; peak_base=None
             eq=cash+shares*px; rows.append((dt,eq,shares*px/eq if eq>0 else 0,target))
         eq=pd.DataFrame(rows,columns=["Date","Equity","Exposure","Target"]).set_index("Date")
         if eq.empty: raise ValueError("백테스트 구간이 너무 짧습니다.")
-        years=max((eq.index[-1]-eq.index[0]).days/365.25,1/365.25); final=float(eq["Equity"].iloc[-1])
-        cagr=(final/initial_cash)**(1/years)-1; mdd=float((eq["Equity"]/eq["Equity"].cummax()-1).min())
+        years=max((eq.index[-1]-eq.index[0]).days/365.25,1/365.25); final=float(eq["Equity"].iloc[-1]); cagr=(final/initial_cash)**(1/years)-1
+        mdd=float((eq["Equity"]/eq["Equity"].cummax()-1).min())
         return dict(cagr=cagr,mdd=mdd,final=final,avg_exp=float(eq["Exposure"].mean()),max_exp=float(eq["Exposure"].max()),sells=sells,equity=eq)
 
-    def candidate_params():
+    def candidates_v5():
         out=[]
-        # 계산량을 억제하면서 V1보다 훨씬 넓은 72개 조합을 탐색
-        for ddset in [(-.06,-.12,-.20),(-.08,-.15,-.22),(-.10,-.18,-.28)]:
-            for rsis in [(50,40),(45,35),(40,30)]:
-                for levels in [(.10,.25,.45,.70),(.15,.35,.60,.85)]:
-                    for reb in [1.0,2.0]:
-                        for cap in [.85,1.00]:
-                            out.append(dict(dd1=ddset[0],dd2=ddset[1],dd3=ddset[2],dd_w=1.0,rsi1=rsis[0],rsi2=rsis[1],rsi_w=1.0,
-                                dist=-.03,ndx_up=.012,ndx_dn=-.02,us_pos=.5,us_neg=.5,sox_up=.02,sox_dn=-.03,sox_pos=1.0,sox_neg=.75,
-                                vix_hi=35.,vix_mid=25.,vix_fall=-.05,vix_neg=.75,vix_pos=1.0,rsi_reb=2.0,dist_reb=.015,reb_w=reb,
-                                s1=1.5,s2=2.5,s3=3.5,s4=4.5,levels=levels,cap=cap))
+        # 2개 베이스 × 엔벨로프 3개 × 매도 4개 = 24개
+        for base_name,levels in [("V3-4형",(.10,.25,.45,.70)),("V3-12형",(.12,.30,.50,.75))]:
+            for env_lower in (-.05,-.08,-.12):
+                for exit_mode in ("기본","MA5","MA10","TRAIL6"):
+                    out.append(dict(base_name=base_name,levels=levels,env_lower=env_lower,env_w=1.0,reentry_w=1.5,exit_mode=exit_mode))
         return out
 
-    def candidate_params_v4():
-        """V4 FAST: V3 저위험 4/8/12형 × 반등 BOOST 8종 = 24개."""
-        out=[]
-        base_levels=[
-            ("V3-4형", (.10,.25,.45,.70)),
-            ("V3-8형", (.11,.27,.48,.72)),
-            ("V3-12형",(.12,.30,.50,.75)),
-        ]
-        for base_name, levels in base_levels:
-            for boost_dd in [-.12,-.18]:
-                for boost_mult in [1.5,2.0]:
-                    for boost_sox in [.005,.015]:
-                        p=dict(dd1=-.10,dd2=-.18,dd3=-.28,dd_w=1.0,
-                               rsi1=45,rsi2=35,rsi_w=1.0,dist=-.03,
-                               ndx_up=.012,ndx_dn=-.02,us_pos=.5,us_neg=.5,
-                               sox_up=.02,sox_dn=-.03,sox_pos=1.25,sox_neg=.75,
-                               vix_hi=35.,vix_mid=25.,vix_fall=-.05,vix_neg=.75,vix_pos=1.0,
-                               rsi_reb=2.0,dist_reb=.015,reb_w=2.5,
-                               s1=1.5,s2=2.5,s3=3.5,s4=4.5,levels=levels,cap=.90,
-                               base_name=base_name,boost_dd=boost_dd,boost_mult=boost_mult,
-                               boost_sox=boost_sox,boost_floor=.55)
-                        out.append(p)
-        return out
+    a,b,c=st.columns(3)
+    initial=a.number_input("초기 투자금(원)",min_value=1_000_000,value=10_000_000,step=1_000_000,key="k5_initial")
+    start_year=b.number_input("시작연도",min_value=2016,max_value=date.today().year,value=2016,step=1,key="k5_start")
+    hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
+    blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    k1,k2,k3=st.columns(3)
-    k_initial=k1.number_input("초기 투자금(원)",min_value=1_000_000,value=10_000_000,step=1_000_000,key="k4_initial")
-    k_start=k2.number_input("시작연도",min_value=2016,max_value=date.today().year,value=2016,step=1,key="k4_start")
-    k_hold=k3.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k4_hold")
-    blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k4_blind",help="2016~2025 데이터로만 1위 조건을 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
-
-    if st.button("⚡ V4 FAST 탐색 시작",type="primary",use_container_width=True,key="run_kosdaq_v4"):
+    if st.button("⚡ V5 엔벨로프 FAST 탐색",type="primary",use_container_width=True,key="run_k5"):
         try:
-            with st.spinner("24개만 탐색 중 · 저위험 베이스에서 급락 후 반등 BOOST를 비교합니다..."):
-                kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(k_start)}-01-01")].copy()
-                train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
+            with st.spinner("24개만 탐색 중 · 엔벨로프와 매도 방식을 비교합니다..."):
+                kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
-                for j,p in enumerate(candidate_params_v4(),1):
-                    r=bt_v2(train,p,float(k_initial),max_hold=int(k_hold)); score=r["cagr"]-0.20*abs(r["mdd"]); eff=r["cagr"]/max(abs(r["mdd"]),1e-9)
-                    rows.append({"후보":j,"베이스":p.get("base_name",""),"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"최종자산":r["final"]}); sims.append((p,r))
-                rank=pd.DataFrame(rows).sort_values(["CAGR","점수"],ascending=False).reset_index(drop=True)
-                best_id=int(rank.iloc[0]["후보"])-1; best_p,best_r=sims[best_id]
-                st.session_state["k4_rank"]=rank; st.session_state["k4_best_p"]=best_p; st.session_state["k4_best_r"]=best_r
+                for j,p in enumerate(candidates_v5(),1):
+                    r=bt_v5(train,p,float(initial),max_hold=int(hold_days)); eff=r["cagr"]/max(abs(r["mdd"]),1e-9); score=r["cagr"]-.20*abs(r["mdd"])
+                    rows.append({"후보":j,"베이스":p["base_name"],"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"매도횟수":r["sells"],"최종자산":r["final"]}); sims.append((p,r))
+                rank=pd.DataFrame(rows).sort_values(["CAGR","점수"],ascending=False).reset_index(drop=True); best_id=int(rank.iloc[0]["후보"])-1
+                st.session_state["k5_rank"]=rank; st.session_state["k5_best_p"],st.session_state["k5_best_r"]=sims[best_id]
                 if blind:
-                    test=kd.loc[kd.index>=pd.Timestamp("2026-01-01")].copy()
-                    st.session_state["k4_test"]=bt_v2(test,best_p,float(k_initial),max_hold=int(k_hold)) if len(test)>5 else None
-        except Exception as e: st.error(f"V4 탐색 실패: {e}")
+                    test=kd.loc[kd.index>=pd.Timestamp("2026-01-01")].copy(); st.session_state["k5_test"]=bt_v5(test,sims[best_id][0],float(initial),max_hold=int(hold_days)) if len(test)>5 else None
+        except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
-    if st.session_state.get("k4_rank") is not None:
-        rank=st.session_state["k4_rank"].copy(); st.subheader("🏆 V4 FAST 탐색 결과")
+    if st.session_state.get("k5_rank") is not None:
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🏆 V5 엔벨로프 FAST 결과")
         show=rank.head(10).copy()
-        for c in ["CAGR","MDD","평균투입","최대투입"]: show[c]=show[c].map(lambda x:f"{x:.2%}")
-        show["효율"]=show["효율"].map(lambda x:f"{x:.3f}")
-        show["최종자산"]=show["최종자산"].map(lambda x:f"₩{x:,.0f}"); show["점수"]=show["점수"].map(lambda x:f"{x:.4f}")
+        for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
+        show["효율"]=show["효율"].map(lambda x:f"{x:.3f}"); show["점수"]=show["점수"].map(lambda x:f"{x:.4f}"); show["최종자산"]=show["최종자산"].map(lambda x:f"₩{x:,.0f}")
         st.dataframe(show,use_container_width=True,hide_index=True)
-        br=st.session_state["k4_best_r"]; p=st.session_state["k4_best_p"]
-        c1,c2,c3,c4=st.columns(4); c1.metric("1위 CAGR",f"{br['cagr']:.2%}"); c2.metric("MDD",f"{br['mdd']:.2%}"); c3.metric("평균투입",f"{br['avg_exp']:.1%}"); c4.metric("최대투입",f"{br['max_exp']:.1%}")
-        st.line_chart((br["equity"]["Equity"]/br["equity"]["Equity"].iloc[0]*100).rename("V4 1위"))
-        if blind and st.session_state.get("k4_test") is not None:
-            tr=st.session_state["k4_test"]; st.subheader("🧪 2026 블라인드 결과")
+        br=st.session_state["k5_best_r"]; bp=st.session_state["k5_best_p"]
+        m1,m2,m3,m4=st.columns(4); m1.metric("1위 CAGR",f"{br['cagr']:.2%}"); m2.metric("MDD",f"{br['mdd']:.2%}"); m3.metric("평균투입",f"{br['avg_exp']:.1%}"); m4.metric("매도횟수",f"{br['sells']}회")
+        st.line_chart((br["equity"]["Equity"]/br["equity"]["Equity"].iloc[0]*100).rename("V5 1위"))
+        if blind and st.session_state.get("k5_test") is not None:
+            tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
-        with st.expander("1위 파라미터 보기"):
-            st.json({k:(list(v) if isinstance(v,tuple) else v) for k,v in p.items()})
-        st.caption("V4 FAST는 V3 저위험 4/8/12형을 보존하고, 깊은 조정 뒤 RSI·이격·SOX·VIX가 동시에 회복될 때만 현금 BOOST를 허용합니다.")
+        st.caption("엔벨로프가 실제로 도움이 되는지와, 상승 추세에서 매도를 늦추는 방식이 CAGR을 개선하는지를 동시에 확인합니다. 결과가 나쁘면 해당 조건은 다음 버전에서 제거합니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
