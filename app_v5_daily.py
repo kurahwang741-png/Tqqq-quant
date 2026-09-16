@@ -24,8 +24,8 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V5 FAST · V3 저위험 베이스 + 코코레 엔벨로프 + 매도 방식 비교")
-    st.info("⚡ 24개 핵심 조합만 비교합니다. 엔벨로프는 코코레 20일선 기준 하단 이격과 하단 재진입을 신호로 쓰고, 매도는 기본/5일선/10일선/6% 트레일링을 비교합니다.")
+    st.caption("V5.1 FAST · V5 우승 구조 고정 + 리밸런싱 최소 변화폭 최적화")
+    st.info("⚡ V5에서 좋았던 20일 -8% 엔벨로프 + MA10 매도를 고정하고, 최소 리밸런싱 변화폭 5% / 7.5% / 10% / 12.5% / 15%만 비교합니다. V3-4형과 V3-12형을 함께 봅니다.")
 
     @st.cache_data(ttl=900)
     def download_kosdaq_research_data():
@@ -98,14 +98,15 @@ with tab_kosdaq:
                 elif mode=="TRAIL6": hold=peak_base is not None and px>=float(peak_base)*.94
                 if hold: diff=0.0
             if forced: diff=-shares*px
-            if diff>max(eq0*.01,1):
+            rebalance_gap=float(p.get("rebalance_gap",.01))
+            if diff>max(eq0*rebalance_gap,1):
                 spend=min(diff,cash); qty=(spend*(1-fee))/px
                 if qty>0:
                     was_flat = shares <= 0
                     shares+=qty; cash-=spend; buys+=1
                     entry=dt if entry is None else entry
                     peak_base=px if peak_base is None else max(peak_base,px)
-            elif diff<-max(eq0*.01,1):
+            elif diff<-max(eq0*rebalance_gap,1):
                 qty=min(shares,(-diff)/px)
                 if qty>0: cash+=qty*px*(1-fee); shares-=qty; sells+=1
                 if shares*px<eq0*.01:
@@ -130,11 +131,15 @@ with tab_kosdaq:
 
     def candidates_v5():
         out=[]
-        # 2개 베이스 × 엔벨로프 3개 × 매도 4개 = 24개
+        # V5.1 FAST: V5의 핵심 승자 구조(-8% 엔벨로프 + MA10)를 고정.
+        # V3-4형 / V3-12형 × 최소 리밸런싱 변화폭 5종 = 10개.
         for base_name,levels in [("V3-4형",(.10,.25,.45,.70)),("V3-12형",(.12,.30,.50,.75))]:
-            for env_lower in (-.05,-.08,-.12):
-                for exit_mode in ("기본","MA5","MA10","TRAIL6"):
-                    out.append(dict(base_name=base_name,levels=levels,env_lower=env_lower,env_w=1.0,reentry_w=1.5,exit_mode=exit_mode))
+            for rebalance_gap in (.05,.075,.10,.125,.15):
+                out.append(dict(
+                    base_name=base_name, levels=levels,
+                    env_lower=-.08, env_w=1.0, reentry_w=1.5,
+                    exit_mode="MA10", rebalance_gap=rebalance_gap
+                ))
         return out
 
     a,b,c=st.columns(3)
@@ -143,14 +148,14 @@ with tab_kosdaq:
     hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("⚡ V5 엔벨로프 FAST 탐색",type="primary",use_container_width=True,key="run_k5"):
+    if st.button("⚡ V5.1 거래횟수 FAST 탐색",type="primary",use_container_width=True,key="run_k5"):
         try:
-            with st.spinner("24개만 탐색 중 · 엔벨로프와 매도 방식을 비교합니다..."):
+            with st.spinner("10개만 탐색 중 · 성과를 최대한 유지하면서 거래횟수를 줄이는 구간을 찾습니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
                 for j,p in enumerate(candidates_v5(),1):
                     r=bt_v5(train,p,float(initial),max_hold=int(hold_days)); eff=r["cagr"]/max(abs(r["mdd"]),1e-9); score=r["cagr"]-.20*abs(r["mdd"])
-                    rows.append({"후보":j,"베이스":p["base_name"],"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"총매수":r["buys"],"총매도":r["sells"],"연매수":r["buys_per_year"],"연매도":r["sells_per_year"],"연왕복":r["cycles_per_year"],"평균보유일":r["avg_hold"],"최대보유일":r["max_hold_actual"],"최종자산":r["final"]}); sims.append((p,r))
+                    rows.append({"후보":j,"베이스":p["base_name"],"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"최소변화폭":p["rebalance_gap"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"총매수":r["buys"],"총매도":r["sells"],"연매수":r["buys_per_year"],"연매도":r["sells_per_year"],"연왕복":r["cycles_per_year"],"평균보유일":r["avg_hold"],"최대보유일":r["max_hold_actual"],"최종자산":r["final"]}); sims.append((p,r))
                 rank=pd.DataFrame(rows).sort_values(["CAGR","점수"],ascending=False).reset_index(drop=True); best_id=int(rank.iloc[0]["후보"])-1
                 st.session_state["k5_rank"]=rank; st.session_state["k5_best_p"],st.session_state["k5_best_r"]=sims[best_id]
                 if blind:
@@ -158,9 +163,10 @@ with tab_kosdaq:
         except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
     if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("🏆 V5 엔벨로프 FAST 결과")
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🏆 V5.1 거래횟수 FAST 결과")
         show=rank.head(10).copy()
         for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
+        show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
         show["효율"]=show["효율"].map(lambda x:f"{x:.3f}"); show["점수"]=show["점수"].map(lambda x:f"{x:.4f}"); show["최종자산"]=show["최종자산"].map(lambda x:f"₩{x:,.0f}")
         st.dataframe(show,use_container_width=True,hide_index=True)
         br=st.session_state["k5_best_r"]; bp=st.session_state["k5_best_p"]
@@ -171,7 +177,7 @@ with tab_kosdaq:
             tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
             q4,q5,q6=st.columns(3); q4.metric("2026 연환산 매수",f"{tr['buys_per_year']:.1f}회"); q5.metric("2026 연환산 매도",f"{tr['sells_per_year']:.1f}회"); q6.metric("2026 최대 보유",f"{tr['max_hold_actual']:.0f}일")
-        st.caption("엔벨로프가 실제로 도움이 되는지와, 상승 추세에서 매도를 늦추는 방식이 CAGR을 개선하는지를 동시에 확인합니다. 결과가 나쁘면 해당 조건은 다음 버전에서 제거합니다.")
+        st.caption("V5 기준선은 #19 CAGR 6.48% / MDD -28.77% / 연매수 약 46.6회 / 연매도 약 42.5회였습니다. V5.1은 이 성과를 최대한 유지하면서 작은 비중 조정을 생략해 거래횟수를 줄이는 실험입니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
