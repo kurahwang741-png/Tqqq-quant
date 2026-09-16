@@ -447,6 +447,35 @@ with tab_kosdaq:
         st.caption("중요: 필터 선택과 순위는 2016~2025 데이터로만 결정합니다. 2026 수치는 순위 계산에 절대 들어가지 않고, 선택 완료 후 블라인드 검증으로만 표시됩니다.")
 
 
+
+# ── 본주 3지표 실전 상태/매매일지 저장 ─────────────────────────────
+SIMPLE3_STATE_PATH=Path("simple3_position_state.json")
+SIMPLE3_LOG_PATH=Path("simple3_trade_log.csv")
+
+def _s3_load_state():
+    try:
+        if SIMPLE3_STATE_PATH.exists():
+            return json.loads(SIMPLE3_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"capital":10000000.0,"qty":0.0,"avg_price":0.0,"current_pct":0.0}
+
+def _s3_save_state(data):
+    tmp=SIMPLE3_STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
+    tmp.replace(SIMPLE3_STATE_PATH)
+
+def _s3_load_log():
+    try:
+        if SIMPLE3_LOG_PATH.exists() and SIMPLE3_LOG_PATH.stat().st_size:
+            return pd.read_csv(SIMPLE3_LOG_PATH)
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["기록일","구분","BASE가격","수량","거래금액","목표비중","메모"])
+
+def _s3_save_log(df):
+    df.to_csv(SIMPLE3_LOG_PATH,index=False,encoding="utf-8-sig")
+
 with tab_simple:
     st.title("🎯 KODEX 코스닥150 본주 · 3지표 실전")
     st.caption("5일선 + 엔벨로프 + RSI14 · 최대투입 60% · 장기추세/미국장 필터 없음")
@@ -595,29 +624,112 @@ with tab_simple:
         c3.metric("5일선 이격",f"{latest['DIST5']:.2%}")
         c4.metric("RSI14",f"{latest['RSI14']:.1f}")
 
-        current_pct=st.number_input("현재 본주 투입비중 (%)",min_value=0.0,max_value=100.0,
-                                    value=0.0,step=1.0,key="simple3_current_pct")/100.0
+        # 저장된 보유현황을 앱 진입 즉시 복구
+        _state=_s3_load_state()
+        st.markdown("### 💰 오늘 주문 / 보유현황")
+        _c1,_c2,_c3=st.columns(3)
+        _capital=_c1.number_input("운용자금(원)",min_value=100000.0,
+                                  value=float(_state.get("capital",10000000.0)),
+                                  step=100000.0,key="s3_live_capital")
+        _qty=_c2.number_input("현재 보유수량(주)",min_value=0.0,
+                              value=float(_state.get("qty",0.0)),step=1.0,key="s3_live_qty")
+        _avg=_c3.number_input("현재 평단가(원)",min_value=0.0,
+                              value=float(_state.get("avg_price",0.0)),step=10.0,key="s3_live_avg")
+
+        _base_close=float(latest["BASE"])
+        _holding_value=_qty*_base_close
+        _current_pct=(_holding_value/_capital) if _capital>0 else 0.0
         if np.isfinite(sig_target):
             final_target=float(sig_target)
         else:
-            final_target=current_pct
+            final_target=_current_pct
+        _target_value=_capital*final_target
+        _diff_value=_target_value-_holding_value
+        _est_qty=int(abs(_diff_value)//_base_close) if _base_close>0 else 0
 
-        diff_pct=final_target-current_pct
-        a,b,c=st.columns(3)
-        a.metric("현재 목표비중",f"{final_target:.1%}")
-        b.metric("조정 필요",f"{diff_pct:+.1%}")
-        c.metric("최근 BASE 종가",f"{latest['BASE']:,.0f}원")
-        st.success(f"신호: {sig_reason}")
+        a,b,c,d=st.columns(4)
+        a.metric("최근 BASE 종가",f"{_base_close:,.0f}원")
+        b.metric("현재 투입",f"{_current_pct:.1%}")
+        c.metric("목표 투입",f"{final_target:.1%}")
+        d.metric("예상 주문수량",f"{_est_qty:,}주")
 
-        if diff_pct>0.005:
-            st.markdown(f"**다음 거래일 행동:** 본주 비중을 **{final_target:.1%}까지 매수 확대**")
-        elif diff_pct<-0.005:
-            st.markdown(f"**다음 거래일 행동:** 본주 비중을 **{final_target:.1%}까지 축소/매도**")
+        st.success(f"확정 신호: {sig_reason}")
+        if _diff_value > _base_close*.5:
+            st.markdown(f"### 🟢 다음 거래일 시초가 **약 {_est_qty:,}주 매수**")
+            st.caption(f"최근 종가 기준 예상 주문금액 {_est_qty*_base_close:,.0f}원 · 실제 수량은 시초가에 따라 달라질 수 있습니다.")
+            _action="매수"
+        elif _diff_value < -_base_close*.5:
+            _sell_qty=min(int(_qty),_est_qty)
+            st.markdown(f"### 🔴 다음 거래일 시초가 **약 {_sell_qty:,}주 매도**")
+            st.caption("백테스트 기준은 다음 거래일 시가 체결입니다.")
+            _est_qty=_sell_qty
+            _action="매도"
         else:
-            st.markdown("**다음 거래일 행동:** 추가 주문 없이 현재 비중 유지")
+            st.markdown("### ⚪ 다음 거래일 **주문 없음 · 현재 비중 유지**")
+            _action="유지"
 
-        st.caption("이 전략의 신호는 KOKORE 종가로 확정되고 BASE를 다음 거래일에 매매하도록 검증했습니다. "
-                   "따라서 근거 없이 LOC 한계가격을 만들어내지 않고, 확정 신호와 목표비중을 표시합니다.")
+        _b1,_b2=st.columns(2)
+        if _b1.button("💾 보유현황 저장",use_container_width=True,key="s3_save_position"):
+            _s3_save_state({"capital":float(_capital),"qty":float(_qty),"avg_price":float(_avg),
+                            "current_pct":float(_current_pct)})
+            st.success("보유현황 저장 완료")
+        if _b2.button("🧹 보유현황 초기화",use_container_width=True,key="s3_reset_position"):
+            _s3_save_state({"capital":float(_capital),"qty":0.0,"avg_price":0.0,"current_pct":0.0})
+            st.rerun()
+
+        st.caption("가격은 앱 진입 시 자동 갱신됩니다. 신호는 전 거래일 KOKORE 확정값, 실전 체결 기준은 다음 거래일 BASE 시초가입니다.")
+
+        # 매매일지: 실제 체결 후 사용자가 가격/수량만 확인해서 저장
+        st.markdown("### 📝 매매일지")
+        _log=_s3_load_log()
+        with st.form("s3_trade_form",clear_on_submit=True):
+            _f1,_f2,_f3,_f4=st.columns(4)
+            _kind=_f1.selectbox("구분",["매수","매도"])
+            _fill_price=_f2.number_input("실제 체결가",min_value=0.0,value=float(round(_base_close)),step=10.0)
+            _fill_qty=_f3.number_input("체결수량",min_value=0.0,value=float(_est_qty if _action in ("매수","매도") else 0),step=1.0)
+            _target_pct=_f4.number_input("체결 후 목표비중(%)",min_value=0.0,max_value=100.0,
+                                         value=float(final_target*100),step=2.5)
+            _memo=st.text_input("메모",value=sig_reason)
+            _submitted=st.form_submit_button("✅ 체결 기록 + 보유현황 자동저장",use_container_width=True)
+        if _submitted and _fill_price>0 and _fill_qty>0:
+            _old_qty=float(_state.get("qty",0.0))
+            _old_avg=float(_state.get("avg_price",0.0))
+            if _kind=="매수":
+                _new_qty=_old_qty+float(_fill_qty)
+                _new_avg=((_old_qty*_old_avg)+(float(_fill_qty)*float(_fill_price)))/_new_qty if _new_qty>0 else 0.0
+            else:
+                _new_qty=max(0.0,_old_qty-float(_fill_qty))
+                _new_avg=_old_avg if _new_qty>0 else 0.0
+            _s3_save_state({"capital":float(_capital),"qty":_new_qty,"avg_price":_new_avg,
+                            "current_pct":float(_target_pct/100)})
+            _row=pd.DataFrame([{
+                "기록일":pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                "구분":_kind,"BASE가격":float(_fill_price),"수량":float(_fill_qty),
+                "거래금액":float(_fill_price*_fill_qty),"목표비중":float(_target_pct/100),"메모":_memo
+            }])
+            _log=pd.concat([_log,_row],ignore_index=True)
+            _s3_save_log(_log)
+            st.success("매매일지와 보유현황을 저장했습니다.")
+            st.rerun()
+
+        _log=_s3_load_log()
+        if not _log.empty:
+            _show=_log.copy()
+            if "목표비중" in _show:
+                _show["목표비중"]=_show["목표비중"].map(lambda x:f"{float(x):.1%}")
+            for _cc in ["BASE가격","거래금액"]:
+                if _cc in _show:
+                    _show[_cc]=_show[_cc].map(lambda x:f"{float(x):,.0f}")
+            st.dataframe(_show.iloc[::-1],use_container_width=True,hide_index=True)
+            _dl=_log.to_csv(index=False).encode("utf-8-sig")
+            _d1,_d2=st.columns(2)
+            _d1.download_button("📥 매매일지 CSV 백업",data=_dl,file_name="simple3_trade_log.csv",
+                                mime="text/csv",use_container_width=True,key="s3_log_download")
+            if _d2.button("🗑️ 매매일지 전체삭제",use_container_width=True,key="s3_log_clear"):
+                _s3_save_log(_log.iloc[0:0])
+                st.rerun()
+        else:
+            st.caption("아직 저장된 체결 기록이 없습니다.")
 
         with st.expander("📐 확정 매매 규칙",expanded=True):
             st.markdown("""
