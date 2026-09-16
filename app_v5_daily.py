@@ -24,7 +24,7 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V6.3 · 원본데이터 다운로드 + 2026 손실매수 해부")
+    st.caption("V6.4 · 원본데이터 다운로드 수정 + 2026 손실매수 해부")
     st.info("🛡️ 2026은 끝까지 봉인합니다. 2016~2025만 이용해 위험 OFF 필터를 고른 뒤, 선택이 끝난 다음 2026에서 딱 한 번 검증합니다. 기준 전략은 V3-12형 + 20일 -10% 엔벨로프 + MA10 + 최소변화폭 15%입니다.")
 
     @st.cache_data(ttl=900)
@@ -275,19 +275,27 @@ with tab_kosdaq:
         return out
 
     st.markdown("### 📥 직접 백테스트용 원본데이터")
-    st.caption("이 CSV를 ChatGPT에 한 번 올리면 이후 백테스트와 손실매수 분석을 여기서 직접 진행할 수 있습니다.")
-    try:
-        _research_bytes=_research_csv_bytes_v63(kd)
+    st.caption("먼저 아래 버튼으로 데이터를 준비한 뒤 CSV를 내려받아 ChatGPT에 올려주세요. 백테스트 실행은 필요 없습니다.")
+
+    if st.button("1️⃣ 원본데이터 준비",use_container_width=True,key="prepare_kosdaq_csv_v64"):
+        try:
+            with st.spinner("KOKORE · BASE · SOX · NDX · VIX 원본데이터를 불러오는 중..."):
+                _kd_download=download_kosdaq_research_data()
+                st.session_state["kosdaq_research_csv_v64"]=_research_csv_bytes_v63(_kd_download)
+                st.session_state["kosdaq_research_rows_v64"]=len(_kd_download)
+        except Exception as _e:
+            st.error(f"원본데이터 준비 실패: {_e}")
+
+    if "kosdaq_research_csv_v64" in st.session_state:
+        st.success(f"준비 완료 · {st.session_state.get('kosdaq_research_rows_v64',0):,} 거래일")
         st.download_button(
-            "📥 백테스트 원본데이터 CSV 다운로드",
-            data=_research_bytes,
+            "2️⃣ 백테스트 원본데이터 CSV 다운로드",
+            data=st.session_state["kosdaq_research_csv_v64"],
             file_name="kosdaq_backtest_research_data.csv",
             mime="text/csv",
             use_container_width=True,
-            key="download_kosdaq_backtest_research_csv_v63",
+            key="download_kosdaq_backtest_research_csv_v64",
         )
-    except Exception as _e:
-        st.warning(f"원본데이터 다운로드 준비 실패: {_e}")
 
     a,b,c=st.columns(3)
     initial=a.number_input("초기 투자금(원)",min_value=1_000_000,value=10_000_000,step=1_000_000,key="k5_initial")
@@ -295,7 +303,7 @@ with tab_kosdaq:
     hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("🛡️ V6.1 DIST5 매도보호 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
+    if st.button("🧬 V6.4 전략 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
         try:
             with st.spinner("DIST5 매도보호 후보 계산 중 · 기준 vs 고정이격 vs 60일 분위수 · 2026은 보지 않고 2016~2025만 비교합니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
