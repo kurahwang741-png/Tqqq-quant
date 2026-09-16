@@ -24,8 +24,8 @@ tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본�
 
 with tab_kosdaq:
     st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V5.3 FAST · 엔벨로프 깊은 구간 초집중 탐색")
-    st.info("⚡ V5.2 우승 조건인 V3-12형 + MA10 + 최소 리밸런싱 15%를 모두 고정하고, 20일 엔벨로프 -10%~-15% 6개만 비교합니다.")
+    st.caption("V5.4 · 공격형(-10%) vs 안정형(-15%) 연도별 해부")
+    st.info("🔬 V5.4는 조건을 더 최적화하지 않습니다. -10% 공격형과 -15% 안정형을 잠그고 2018·2020·2022 하락장, 2023~2025 상승장, 2026 블라인드를 연도별로 비교합니다.")
 
     @st.cache_data(ttl=900)
     def download_kosdaq_research_data():
@@ -131,10 +131,9 @@ with tab_kosdaq:
 
     def candidates_v5():
         out=[]
-        # V5.3 FAST: 나머지 조건은 모두 잠그고 엔벨로프 깊이만 6개 비교.
-        for env_lower in (-.10,-.11,-.12,-.13,-.14,-.15):
+        for name, env_lower in [("공격형 -10%",-.10),("안정형 -15%",-.15)]:
             out.append(dict(
-                base_name="V3-12형", levels=(.12,.30,.50,.75),
+                base_name=name, levels=(.12,.30,.50,.75),
                 env_lower=env_lower, env_w=1.0, reentry_w=1.5,
                 exit_mode="MA10", rebalance_gap=.15
             ))
@@ -146,9 +145,9 @@ with tab_kosdaq:
     hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
     blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
 
-    if st.button("⚡ V5.3 엔벨로프 깊이 탐색",type="primary",use_container_width=True,key="run_k5"):
+    if st.button("🔬 V5.4 연도별 비교 시작",type="primary",use_container_width=True,key="run_k5"):
         try:
-            with st.spinner("6개만 탐색 중 · 엔벨로프 -10%~-15%에서 꺾이는 지점을 찾습니다..."):
+            with st.spinner("두 전략만 계산 중 · 연도별 성격을 해부합니다..."):
                 kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
                 rows=[]; sims=[]
                 for j,p in enumerate(candidates_v5(),1):
@@ -161,7 +160,7 @@ with tab_kosdaq:
         except Exception as e: st.error(f"V5 탐색 실패: {e}")
 
     if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("🏆 V5.3 엔벨로프 깊이 결과")
+        rank=st.session_state["k5_rank"].copy(); st.subheader("🔬 V5.4 두 전략 전체기간 비교")
         show=rank.head(10).copy()
         for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
         show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
@@ -175,7 +174,33 @@ with tab_kosdaq:
             tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
             q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
             q4,q5,q6=st.columns(3); q4.metric("2026 연환산 매수",f"{tr['buys_per_year']:.1f}회"); q5.metric("2026 연환산 매도",f"{tr['sells_per_year']:.1f}회"); q6.metric("2026 최대 보유",f"{tr['max_hold_actual']:.0f}일")
-        st.caption("V5.2 기준선은 20일 -10% / MA10에서 CAGR 7.03% / MDD -26.92%였습니다. V5.3은 다른 조건을 모두 잠그고 엔벨로프 깊이만 더 내려가며 최적 구간을 찾습니다.")
+        st.subheader("📅 연도별 성과 비교")
+        # Rebuild the two locked strategies on the same training window.
+        try:
+            kd_all=download_kosdaq_research_data()
+            kd_all=kd_all.loc[kd_all.index>=pd.Timestamp(f"{int(k_start)}-01-01")].copy()
+            train_all=kd_all.loc[kd_all.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd_all
+            ys=[]
+            for p2 in candidates_v5():
+                rr=bt_v5(train_all,p2,float(k_initial),max_hold=int(k_hold))
+                yy=yearly_stats_v54(rr["equity"])
+                yy["전략"]=p2["base_name"]
+                ys.append(yy)
+            yd=pd.concat(ys,ignore_index=True)
+            focus=yd[yd["연도"].isin([2018,2020,2022,2023,2024,2025])].copy()
+            if not focus.empty:
+                pv=focus.pivot(index="연도",columns="전략",values="수익률").reset_index()
+                for c in pv.columns[1:]: pv[c]=pv[c].map(lambda x:f"{x:.2%}")
+                st.dataframe(pv,use_container_width=True,hide_index=True)
+            with st.expander("전체 연도 상세 보기"):
+                detail=yd.copy()
+                for c in ["수익률","연중MDD","평균투입","최대투입"]:
+                    detail[c]=detail[c].map(lambda x:f"{x:.2%}")
+                st.dataframe(detail,use_container_width=True,hide_index=True)
+        except Exception as e:
+            st.warning(f"연도별 표 계산 실패: {e}")
+
+        st.caption("잠근 기준: 공격형 -10%는 V5.3에서 CAGR 7.03% / MDD -26.92%, 안정형 -15%는 CAGR 6.58% / MDD -23.16%였습니다. 연도별 결과와 2026 블라인드를 보고 다음 개선축을 정합니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
