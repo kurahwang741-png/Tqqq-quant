@@ -22,6 +22,190 @@ st.set_page_config(
 
 tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 코코레 → 본주"] )
 
+with tab_kosdaq:
+    st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
+    st.caption("코코레(233740)를 신호 센서로 사용하고 KODEX 코스닥150(229200)을 실제 매매 대상으로 연구하는 독립 탭")
+
+    st.info("🧪 현재는 1차 연구용 백테스트 탭입니다. SOXL 탭의 보유현황·매매기록·전략에는 영향을 주지 않습니다.")
+
+    @st.cache_data(ttl=900)
+    def download_kosdaq_research_data():
+        symbols = ["233740.KS", "229200.KS", "^NDX", "^SOX", "^VIX"]
+        raw = yf.download(symbols, period="max", interval="1d", auto_adjust=True,
+                          progress=False, group_by="column")
+        if raw is None or raw.empty:
+            raise ValueError("코스닥/미국장 데이터를 받지 못했습니다.")
+
+        def close_of(sym):
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Close" in raw.columns.get_level_values(0):
+                    return raw["Close"][sym].dropna()
+                return raw.xs("Close", axis=1, level=-1)[sym].dropna()
+            raise ValueError("종가 데이터를 찾지 못했습니다.")
+
+        klev = close_of("233740.KS").rename("KOKORE")
+        base = close_of("229200.KS").rename("BASE")
+        kr = pd.concat([klev, base], axis=1).dropna().reset_index()
+        kr.columns = ["Date", "KOKORE", "BASE"]
+        kr["Date"] = pd.to_datetime(kr["Date"]).dt.tz_localize(None).dt.normalize()
+
+        us = pd.concat([
+            close_of("^NDX").rename("NDX"),
+            close_of("^SOX").rename("SOX"),
+            close_of("^VIX").rename("VIX"),
+        ], axis=1).dropna().reset_index()
+        us.columns = ["USDate", "NDX", "SOX", "VIX"]
+        us["USDate"] = pd.to_datetime(us["USDate"]).dt.tz_localize(None).dt.normalize()
+        us["NDX_R1"] = us["NDX"].pct_change()
+        us["SOX_R1"] = us["SOX"].pct_change()
+        us["VIX_R1"] = us["VIX"].pct_change()
+
+        # 한국 거래일보다 '엄격히 이전' 미국장만 붙여 미래정보 사용을 막는다.
+        merged = pd.merge_asof(
+            kr.sort_values("Date"), us.sort_values("USDate"),
+            left_on="Date", right_on="USDate", direction="backward", allow_exact_matches=False
+        ).set_index("Date")
+        return merged.dropna(subset=["KOKORE", "BASE"]).copy()
+
+    def kosdaq_features(df):
+        d = df.copy()
+        delta = d["KOKORE"].diff()
+        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        d["RSI14"] = 100 - 100/(1+rs)
+        d["MA5"] = d["KOKORE"].rolling(5).mean()
+        d["MA20"] = d["KOKORE"].rolling(20).mean()
+        d["DD60"] = d["KOKORE"] / d["KOKORE"].rolling(60, min_periods=20).max() - 1
+        d["K_R3"] = d["KOKORE"].pct_change(3)
+        return d
+
+    def kosdaq_target(row, mode):
+        score = 0
+        rsi = row.get("RSI14", np.nan)
+        dd = row.get("DD60", np.nan)
+        k = row.get("KOKORE", np.nan)
+        ma5 = row.get("MA5", np.nan)
+        ma20 = row.get("MA20", np.nan)
+
+        if np.isfinite(dd):
+            score += int(dd <= -0.08) + int(dd <= -0.15) + int(dd <= -0.22)
+        if np.isfinite(rsi):
+            score += int(rsi <= 45) + int(rsi <= 35)
+        if np.isfinite(k) and np.isfinite(ma5) and k < ma5: score += 1
+        if np.isfinite(k) and np.isfinite(ma20) and k < ma20: score += 1
+
+        # 미국장은 해당 한국 거래일 전에 이미 끝난 마지막 확정치만 사용한다.
+        if mode in ("B · +NASDAQ", "C · +NASDAQ+SOX", "D · +NASDAQ+SOX+VIX"):
+            ndx = row.get("NDX_R1", np.nan)
+            if np.isfinite(ndx):
+                if ndx <= -0.02: score -= 1      # 급락 직후 조기 물타기 억제
+                elif ndx >= 0.012: score += 1    # 반등 확인
+        if mode in ("C · +NASDAQ+SOX", "D · +NASDAQ+SOX+VIX"):
+            sox = row.get("SOX_R1", np.nan)
+            if np.isfinite(sox):
+                if sox <= -0.03: score -= 1
+                elif sox >= 0.02: score += 1
+        if mode == "D · +NASDAQ+SOX+VIX":
+            vix = row.get("VIX", np.nan)
+            vixr = row.get("VIX_R1", np.nan)
+            if np.isfinite(vix) and np.isfinite(vixr):
+                if vix >= 35 and vixr > 0: score -= 1
+                elif vix >= 25 and vixr < -0.05: score += 1
+
+        # 1차 탐색용 목표 보유비중. 과매도 점수가 높을수록 본주 비중 확대.
+        if score <= 1: return 0.00
+        if score == 2: return 0.15
+        if score == 3: return 0.30
+        if score == 4: return 0.50
+        return 0.70
+
+    def backtest_kosdaq(df, mode, initial_cash=10_000_000.0, fee=0.00015, max_hold=120):
+        d = kosdaq_features(df).dropna(subset=["BASE"]).copy()
+        cash = float(initial_cash)
+        shares = 0.0
+        entry_date = None
+        rows = []
+        trades = 0
+
+        # 신호는 전 거래일까지의 확정 데이터, 체결은 다음 한국 거래일 본주 종가로 가정.
+        for i in range(1, len(d)):
+            dt = d.index[i]
+            px = float(d["BASE"].iloc[i])
+            prev = d.iloc[i-1]
+            target = kosdaq_target(prev, mode)
+
+            if entry_date is not None and max_hold and (pd.Timestamp(dt)-pd.Timestamp(entry_date)).days >= max_hold:
+                target = 0.0
+
+            equity_before = cash + shares * px
+            current_value = shares * px
+            desired = equity_before * target
+            diff = desired - current_value
+
+            if diff > max(equity_before*0.01, 1.0):
+                spend = min(diff, cash)
+                qty = (spend * (1-fee)) / px
+                if qty > 0:
+                    shares += qty; cash -= spend
+                    if entry_date is None: entry_date = dt
+            elif diff < -max(equity_before*0.01, 1.0):
+                sell_value = min(-diff, current_value)
+                qty = min(shares, sell_value/px)
+                if qty > 0:
+                    cash += qty*px*(1-fee); shares -= qty; trades += 1
+                    if shares*px < equity_before*0.01: entry_date = None
+
+            eq = cash + shares*px
+            rows.append((dt, eq, target, shares*px/eq if eq>0 else 0))
+
+        eq = pd.DataFrame(rows, columns=["Date","Equity","Target","Exposure"]).set_index("Date")
+        if eq.empty: raise ValueError("백테스트 구간이 너무 짧습니다.")
+        years = max((eq.index[-1]-eq.index[0]).days/365.25, 1/365.25)
+        cagr = (eq["Equity"].iloc[-1]/initial_cash)**(1/years)-1
+        mdd = (eq["Equity"]/eq["Equity"].cummax()-1).min()
+        return {"전략": mode, "CAGR": cagr, "MDD": mdd,
+                "최종자산": eq["Equity"].iloc[-1], "평균투입": eq["Exposure"].mean(),
+                "최대투입": eq["Exposure"].max(), "리밸런싱매도": trades, "equity": eq}
+
+    k1, k2, k3 = st.columns(3)
+    k_initial = k1.number_input("초기 투자금(원)", min_value=1_000_000, value=10_000_000, step=1_000_000, key="k_initial")
+    k_start = k2.number_input("시작연도", min_value=2016, max_value=date.today().year, value=2016, step=1, key="k_start")
+    k_hold = k3.selectbox("최대 보유기간", [60, 90, 120, 180, 365], index=2, format_func=lambda x:f"{x}일", key="k_hold")
+
+    if st.button("🚀 코스닥 1차 비교 백테스트", type="primary", use_container_width=True, key="run_kosdaq_v1"):
+        try:
+            with st.spinner("코코레·본주·NASDAQ·SOX·VIX 데이터를 받아 비교 중..."):
+                kd = download_kosdaq_research_data()
+                kd = kd.loc[kd.index >= pd.Timestamp(f"{int(k_start)}-01-01")].copy()
+                modes = ["A · 코코레만", "B · +NASDAQ", "C · +NASDAQ+SOX", "D · +NASDAQ+SOX+VIX"]
+                results = [backtest_kosdaq(kd, m, float(k_initial), max_hold=int(k_hold)) for m in modes]
+                table = pd.DataFrame([{k:v for k,v in r.items() if k!="equity"} for r in results])
+                show = table.copy()
+                for c in ["CAGR","MDD","평균투입","최대투입"]:
+                    show[c] = show[c].map(lambda x:f"{x:.2%}")
+                show["최종자산"] = show["최종자산"].map(lambda x:f"₩{x:,.0f}")
+                st.session_state["kosdaq_v1_results"] = results
+                st.session_state["kosdaq_v1_table"] = show
+        except Exception as e:
+            st.error(f"코스닥 백테스트 실패: {e}")
+
+    if st.session_state.get("kosdaq_v1_table") is not None:
+        st.subheader("📊 1차 비교 결과")
+        st.dataframe(st.session_state["kosdaq_v1_table"], use_container_width=True, hide_index=True)
+        st.caption("A→D는 미국장 변수를 하나씩 추가한 비교입니다. 이 결과를 보고 실제 도움이 되는 변수만 남겨 다음 버전에서 임계값·비중을 탐색합니다.")
+        results = st.session_state.get("kosdaq_v1_results", [])
+        if results:
+            chart = pd.concat([r["equity"]["Equity"].rename(r["전략"]) for r in results], axis=1)
+            chart = chart / chart.iloc[0] * 100
+            st.line_chart(chart)
+
+    with st.expander("ℹ️ 이 탭의 현재 구조"):
+        st.write("신호: 코코레 RSI14 · 60일 고점 낙폭 · 5/20일선 + 전일 NASDAQ/SOX/VIX")
+        st.write("실제 매매 대상: KODEX 코스닥150(229200)")
+        st.write("미국 데이터는 한국 거래일보다 엄격히 이전에 끝난 확정 일봉만 사용합니다.")
+        st.write("현재는 연구 V1이라 실전 주문가격/자동저장은 아직 연결하지 않았습니다. 성과가 확인되면 별도 저장소와 주문판을 붙입니다.")
+
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
@@ -3966,189 +4150,4 @@ with tab_soxl:
     except Exception as e:
         st.error("데이터를 불러오거나 백테스트하는 중 오류가 발생했습니다.")
         st.exception(e)
-
-
-with tab_kosdaq:
-    st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("코코레(233740)를 신호 센서로 사용하고 KODEX 코스닥150(229200)을 실제 매매 대상으로 연구하는 독립 탭")
-
-    st.info("🧪 현재는 1차 연구용 백테스트 탭입니다. SOXL 탭의 보유현황·매매기록·전략에는 영향을 주지 않습니다.")
-
-    @st.cache_data(ttl=900)
-    def download_kosdaq_research_data():
-        symbols = ["233740.KS", "229200.KS", "^NDX", "^SOX", "^VIX"]
-        raw = yf.download(symbols, period="max", interval="1d", auto_adjust=True,
-                          progress=False, group_by="column")
-        if raw is None or raw.empty:
-            raise ValueError("코스닥/미국장 데이터를 받지 못했습니다.")
-
-        def close_of(sym):
-            if isinstance(raw.columns, pd.MultiIndex):
-                if "Close" in raw.columns.get_level_values(0):
-                    return raw["Close"][sym].dropna()
-                return raw.xs("Close", axis=1, level=-1)[sym].dropna()
-            raise ValueError("종가 데이터를 찾지 못했습니다.")
-
-        klev = close_of("233740.KS").rename("KOKORE")
-        base = close_of("229200.KS").rename("BASE")
-        kr = pd.concat([klev, base], axis=1).dropna().reset_index()
-        kr.columns = ["Date", "KOKORE", "BASE"]
-        kr["Date"] = pd.to_datetime(kr["Date"]).dt.tz_localize(None).dt.normalize()
-
-        us = pd.concat([
-            close_of("^NDX").rename("NDX"),
-            close_of("^SOX").rename("SOX"),
-            close_of("^VIX").rename("VIX"),
-        ], axis=1).dropna().reset_index()
-        us.columns = ["USDate", "NDX", "SOX", "VIX"]
-        us["USDate"] = pd.to_datetime(us["USDate"]).dt.tz_localize(None).dt.normalize()
-        us["NDX_R1"] = us["NDX"].pct_change()
-        us["SOX_R1"] = us["SOX"].pct_change()
-        us["VIX_R1"] = us["VIX"].pct_change()
-
-        # 한국 거래일보다 '엄격히 이전' 미국장만 붙여 미래정보 사용을 막는다.
-        merged = pd.merge_asof(
-            kr.sort_values("Date"), us.sort_values("USDate"),
-            left_on="Date", right_on="USDate", direction="backward", allow_exact_matches=False
-        ).set_index("Date")
-        return merged.dropna(subset=["KOKORE", "BASE"]).copy()
-
-    def kosdaq_features(df):
-        d = df.copy()
-        delta = d["KOKORE"].diff()
-        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss.replace(0, np.nan)
-        d["RSI14"] = 100 - 100/(1+rs)
-        d["MA5"] = d["KOKORE"].rolling(5).mean()
-        d["MA20"] = d["KOKORE"].rolling(20).mean()
-        d["DD60"] = d["KOKORE"] / d["KOKORE"].rolling(60, min_periods=20).max() - 1
-        d["K_R3"] = d["KOKORE"].pct_change(3)
-        return d
-
-    def kosdaq_target(row, mode):
-        score = 0
-        rsi = row.get("RSI14", np.nan)
-        dd = row.get("DD60", np.nan)
-        k = row.get("KOKORE", np.nan)
-        ma5 = row.get("MA5", np.nan)
-        ma20 = row.get("MA20", np.nan)
-
-        if np.isfinite(dd):
-            score += int(dd <= -0.08) + int(dd <= -0.15) + int(dd <= -0.22)
-        if np.isfinite(rsi):
-            score += int(rsi <= 45) + int(rsi <= 35)
-        if np.isfinite(k) and np.isfinite(ma5) and k < ma5: score += 1
-        if np.isfinite(k) and np.isfinite(ma20) and k < ma20: score += 1
-
-        # 미국장은 해당 한국 거래일 전에 이미 끝난 마지막 확정치만 사용한다.
-        if mode in ("B · +NASDAQ", "C · +NASDAQ+SOX", "D · +NASDAQ+SOX+VIX"):
-            ndx = row.get("NDX_R1", np.nan)
-            if np.isfinite(ndx):
-                if ndx <= -0.02: score -= 1      # 급락 직후 조기 물타기 억제
-                elif ndx >= 0.012: score += 1    # 반등 확인
-        if mode in ("C · +NASDAQ+SOX", "D · +NASDAQ+SOX+VIX"):
-            sox = row.get("SOX_R1", np.nan)
-            if np.isfinite(sox):
-                if sox <= -0.03: score -= 1
-                elif sox >= 0.02: score += 1
-        if mode == "D · +NASDAQ+SOX+VIX":
-            vix = row.get("VIX", np.nan)
-            vixr = row.get("VIX_R1", np.nan)
-            if np.isfinite(vix) and np.isfinite(vixr):
-                if vix >= 35 and vixr > 0: score -= 1
-                elif vix >= 25 and vixr < -0.05: score += 1
-
-        # 1차 탐색용 목표 보유비중. 과매도 점수가 높을수록 본주 비중 확대.
-        if score <= 1: return 0.00
-        if score == 2: return 0.15
-        if score == 3: return 0.30
-        if score == 4: return 0.50
-        return 0.70
-
-    def backtest_kosdaq(df, mode, initial_cash=10_000_000.0, fee=0.00015, max_hold=120):
-        d = kosdaq_features(df).dropna(subset=["BASE"]).copy()
-        cash = float(initial_cash)
-        shares = 0.0
-        entry_date = None
-        rows = []
-        trades = 0
-
-        # 신호는 전 거래일까지의 확정 데이터, 체결은 다음 한국 거래일 본주 종가로 가정.
-        for i in range(1, len(d)):
-            dt = d.index[i]
-            px = float(d["BASE"].iloc[i])
-            prev = d.iloc[i-1]
-            target = kosdaq_target(prev, mode)
-
-            if entry_date is not None and max_hold and (pd.Timestamp(dt)-pd.Timestamp(entry_date)).days >= max_hold:
-                target = 0.0
-
-            equity_before = cash + shares * px
-            current_value = shares * px
-            desired = equity_before * target
-            diff = desired - current_value
-
-            if diff > max(equity_before*0.01, 1.0):
-                spend = min(diff, cash)
-                qty = (spend * (1-fee)) / px
-                if qty > 0:
-                    shares += qty; cash -= spend
-                    if entry_date is None: entry_date = dt
-            elif diff < -max(equity_before*0.01, 1.0):
-                sell_value = min(-diff, current_value)
-                qty = min(shares, sell_value/px)
-                if qty > 0:
-                    cash += qty*px*(1-fee); shares -= qty; trades += 1
-                    if shares*px < equity_before*0.01: entry_date = None
-
-            eq = cash + shares*px
-            rows.append((dt, eq, target, shares*px/eq if eq>0 else 0))
-
-        eq = pd.DataFrame(rows, columns=["Date","Equity","Target","Exposure"]).set_index("Date")
-        if eq.empty: raise ValueError("백테스트 구간이 너무 짧습니다.")
-        years = max((eq.index[-1]-eq.index[0]).days/365.25, 1/365.25)
-        cagr = (eq["Equity"].iloc[-1]/initial_cash)**(1/years)-1
-        mdd = (eq["Equity"]/eq["Equity"].cummax()-1).min()
-        return {"전략": mode, "CAGR": cagr, "MDD": mdd,
-                "최종자산": eq["Equity"].iloc[-1], "평균투입": eq["Exposure"].mean(),
-                "최대투입": eq["Exposure"].max(), "리밸런싱매도": trades, "equity": eq}
-
-    k1, k2, k3 = st.columns(3)
-    k_initial = k1.number_input("초기 투자금(원)", min_value=1_000_000, value=10_000_000, step=1_000_000, key="k_initial")
-    k_start = k2.number_input("시작연도", min_value=2016, max_value=date.today().year, value=2016, step=1, key="k_start")
-    k_hold = k3.selectbox("최대 보유기간", [60, 90, 120, 180, 365], index=2, format_func=lambda x:f"{x}일", key="k_hold")
-
-    if st.button("🚀 코스닥 1차 비교 백테스트", type="primary", use_container_width=True, key="run_kosdaq_v1"):
-        try:
-            with st.spinner("코코레·본주·NASDAQ·SOX·VIX 데이터를 받아 비교 중..."):
-                kd = download_kosdaq_research_data()
-                kd = kd.loc[kd.index >= pd.Timestamp(f"{int(k_start)}-01-01")].copy()
-                modes = ["A · 코코레만", "B · +NASDAQ", "C · +NASDAQ+SOX", "D · +NASDAQ+SOX+VIX"]
-                results = [backtest_kosdaq(kd, m, float(k_initial), max_hold=int(k_hold)) for m in modes]
-                table = pd.DataFrame([{k:v for k,v in r.items() if k!="equity"} for r in results])
-                show = table.copy()
-                for c in ["CAGR","MDD","평균투입","최대투입"]:
-                    show[c] = show[c].map(lambda x:f"{x:.2%}")
-                show["최종자산"] = show["최종자산"].map(lambda x:f"₩{x:,.0f}")
-                st.session_state["kosdaq_v1_results"] = results
-                st.session_state["kosdaq_v1_table"] = show
-        except Exception as e:
-            st.error(f"코스닥 백테스트 실패: {e}")
-
-    if st.session_state.get("kosdaq_v1_table") is not None:
-        st.subheader("📊 1차 비교 결과")
-        st.dataframe(st.session_state["kosdaq_v1_table"], use_container_width=True, hide_index=True)
-        st.caption("A→D는 미국장 변수를 하나씩 추가한 비교입니다. 이 결과를 보고 실제 도움이 되는 변수만 남겨 다음 버전에서 임계값·비중을 탐색합니다.")
-        results = st.session_state.get("kosdaq_v1_results", [])
-        if results:
-            chart = pd.concat([r["equity"]["Equity"].rename(r["전략"]) for r in results], axis=1)
-            chart = chart / chart.iloc[0] * 100
-            st.line_chart(chart)
-
-    with st.expander("ℹ️ 이 탭의 현재 구조"):
-        st.write("신호: 코코레 RSI14 · 60일 고점 낙폭 · 5/20일선 + 전일 NASDAQ/SOX/VIX")
-        st.write("실제 매매 대상: KODEX 코스닥150(229200)")
-        st.write("미국 데이터는 한국 거래일보다 엄격히 이전에 끝난 확정 일봉만 사용합니다.")
-        st.write("현재는 연구 V1이라 실전 주문가격/자동저장은 아직 연결하지 않았습니다. 성과가 확인되면 별도 저장소와 주문판을 붙입니다.")
 
