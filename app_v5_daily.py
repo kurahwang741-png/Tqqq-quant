@@ -20,12 +20,12 @@ st.set_page_config(
     layout="centered",
 )
 
-tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V4"] )
+tab_soxl, tab_kosdaq, tab_rebound = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V5", "🪂 대장주 낙폭반등"] )
 
 with tab_kosdaq:
-    st.title("🇰🇷 국장 QUANT V4")
-    st.caption("장대양봉 × 대규모 거래대금 × 동반강세 × 눌림 후 반등 · 2016~2023 개발 / 2024~2026 블라인드")
-    st.info("V4는 V3에서 확인한 대규모 절대 거래대금을 중심으로, 장대양봉 발생일에 시장 전체에서 강한 종목이 동시에 몇 개 발생했는지(1/2+/3+/5+)를 비교합니다. 아직 테마 이름은 쓰지 않고 동반강세 자체의 효과만 검증합니다.")
+    st.title("🇰🇷 국장 QUANT V5")
+    st.caption("V4 후보의 연도별 안정성 × 대박거래 제거 스트레스 테스트 · 2016~2023 개발 / 2024~2026 블라인드")
+    st.info("V5는 V4 조건을 더 최적화하지 않습니다. 같은 후보들을 연도별로 쪼개고, 수익 상위 5개 거래를 제거해도 성과가 남는지 확인합니다. 2024~2026 블라인드는 계속 봉인합니다.")
 
     @st.cache_data(ttl=86400, show_spinner=False)
     def krx_listing_v1():
@@ -106,7 +106,7 @@ with tab_kosdaq:
     random_seed=c3.number_input("표본 Seed",0,9999,42,1)
     st.caption("⚠️ 현재 V1 다운로드는 현재 상장종목 기반입니다. 전략 확정 전 상장폐지 이력까지 합친 survivorship-bias 보정판으로 재검증해야 합니다.")
 
-    if st.button("🔥 국장 V4 동반강세 비교 돌리기", type="primary", use_container_width=True):
+    if st.button("🔥 국장 V5 안정성 스트레스 테스트 돌리기", type="primary", use_container_width=True):
         try:
             listing=krx_listing_v1()
             n=min(int(max_names),len(listing))
@@ -157,27 +157,163 @@ with tab_kosdaq:
                 z["표본주의"]="⚠️" if len(q)<50 else ""
                 rows.append(z)
             result=pd.DataFrame(rows)
-            st.session_state["kr_v4_result"]=result
-            st.session_state["kr_v4_buckets"]=buckets
-            st.success("V4 개발구간 분석 완료. 2024~2026 데이터는 사용하지 않았습니다.")
+            st.session_state["kr_v5_result"]=result
+            st.session_state["kr_v5_buckets"]=buckets
+
+            # V5: 각 조합을 연도별로 분해 + 수익 상위 5개 거래 제거 스트레스 테스트
+            yearly_rows=[]; stress_rows=[]
+            for (m,r,a0,c0),recs in buckets.items():
+                q=pd.DataFrame(recs)
+                if q.empty: continue
+                q["Year"]=pd.to_datetime(q["EntryDate"]).dt.year
+                label={"반등신호":m,"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","동반강세":"전체" if c0==1 else f"{c0}개+"}
+                for yr,g in q.groupby("Year"):
+                    if int(yr)<int(start_year) or int(yr)>2023: continue
+                    z=dict(label); z.update({"연도":int(yr),"신호수":len(g)})
+                    for h in (1,3,5,10,20):
+                        col=f"R{h}"; z[f"{h}일 승률"]=g[col].gt(0).mean()*100; z[f"{h}일 평균"]=g[col].mean()*100; z[f"{h}일 중앙값"]=g[col].median()*100
+                    yearly_rows.append(z)
+                z=dict(label); z["신호수"]=len(q)
+                for h in (5,10,20):
+                    vals=q[f"R{h}"].dropna().sort_values(ascending=False)
+                    trimmed=vals.iloc[min(5,len(vals)):]
+                    z[f"{h}일 원평균"]=vals.mean()*100 if len(vals) else np.nan
+                    z[f"{h}일 TOP5제거 평균"]=trimmed.mean()*100 if len(trimmed) else np.nan
+                    z[f"{h}일 TOP5제거 중앙값"]=trimmed.median()*100 if len(trimmed) else np.nan
+                    z[f"{h}일 TOP5제거 승률"]=trimmed.gt(0).mean()*100 if len(trimmed) else np.nan
+                stress_rows.append(z)
+            st.session_state["kr_v5_yearly"]=pd.DataFrame(yearly_rows)
+            st.session_state["kr_v5_stress"]=pd.DataFrame(stress_rows)
+            st.success("V5 개발구간 분석 완료. 연도별 안정성과 TOP5 제거 스트레스 테스트까지 계산했습니다. 2024~2026 데이터는 사용하지 않았습니다.")
         except ModuleNotFoundError:
             st.error("FinanceDataReader가 없습니다. requirements.txt에 FinanceDataReader 를 추가한 뒤 재부팅하세요.")
         except Exception as e:
             st.exception(e)
 
-    if "kr_v4_result" in st.session_state:
-        result=st.session_state["kr_v4_result"]
-        show=result.copy(); pct_cols=[c for c in show.columns if "승률" in c or "평균" in c or "중앙값" in c]
-        st.subheader("🏆 V4 요약 · 5일 중앙값 상위")
-        valid=show[show["신호수"]>=50].copy()
+    if "kr_v5_result" in st.session_state:
+        result=st.session_state["kr_v5_result"]
+        pct_cols=[c for c in result.columns if "승률" in c or "평균" in c or "중앙값" in c]
+        st.subheader("🏆 V5 후보 요약 · 표본 50개 이상")
+        valid=result[result["신호수"]>=50].copy()
         if len(valid):
             top=valid.sort_values(["5일 중앙값","5일 평균"],ascending=False).head(12)
             top_pct=[c for c in top.columns if "승률" in c or "평균" in c or "중앙값" in c]
             st.dataframe(top.style.format({c:"{:.2f}%" for c in top_pct},na_rep="-"),use_container_width=True,hide_index=True)
-        else: st.warning("신호 50개 이상 조합이 없습니다. 전체 표를 확인하세요.")
-        st.subheader("📊 V4 전체 개발구간 결과")
-        st.dataframe(show.style.format({c:"{:.2f}%" for c in pct_cols},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("'전체'는 동반강세 필터 없음입니다. 2개+/3개+/5개+와 비교해 동시 강세가 실제로 성과를 개선하는지 확인합니다. 2024~2026은 계속 봉인합니다.")
+
+        st.subheader("🧪 대박거래 TOP5 제거 스트레스 테스트")
+        stress=st.session_state.get("kr_v5_stress",pd.DataFrame()).copy()
+        if len(stress):
+            stress=stress[stress["신호수"]>=50].copy()
+            stress["20일 방어율"]=np.where(stress["20일 원평균"].abs()>1e-12, stress["20일 TOP5제거 평균"]/stress["20일 원평균"]*100, np.nan)
+            stress=stress.sort_values(["20일 TOP5제거 평균","10일 TOP5제거 평균"],ascending=False)
+            pc=[c for c in stress.columns if "평균" in c or "중앙값" in c or "승률" in c or "방어율" in c]
+            st.dataframe(stress.head(20).style.format({c:"{:.2f}%" for c in pc},na_rep="-"),use_container_width=True,hide_index=True)
+            st.caption("TOP5 제거 = 각 보유기간 수익률이 가장 높았던 5개 거래를 제거. 몇 개 대박 거래가 평균을 끌어올렸는지 확인합니다.")
+
+        st.subheader("📅 연도별 안정성")
+        yearly=st.session_state.get("kr_v5_yearly",pd.DataFrame()).copy()
+        if len(yearly):
+            # 전체기간 표본 50개 이상 조합만 연도표에 남김
+            keys=valid[["반등신호","장대양봉","거래대금","동반강세"]].drop_duplicates() if len(valid) else pd.DataFrame()
+            if len(keys): yearly=yearly.merge(keys,on=["반등신호","장대양봉","거래대금","동반강세"],how="inner")
+            pc=[c for c in yearly.columns if "승률" in c or "평균" in c or "중앙값" in c]
+            st.dataframe(yearly.style.format({c:"{:.2f}%" for c in pc},na_rep="-"),use_container_width=True,hide_index=True)
+            st.caption("특정 한두 해에만 수익이 몰리는지 확인하세요. 연도별 신호수가 너무 적은 행은 해석에 주의해야 합니다.")
+
+        st.subheader("📊 V5 전체 개발구간 결과")
+        st.dataframe(result.style.format({c:"{:.2f}%" for c in pct_cols},na_rep="-"),use_container_width=True,hide_index=True)
+        st.caption("2024~2026은 계속 봉인합니다. V5에서는 새 매매조건을 추가하지 않고 V4 후보의 견고성만 검증합니다.")
+
+
+with tab_rebound:
+    st.title("🪂 대장주 낙폭반등 V1")
+    st.caption("과거 대장주 → 큰 낙폭 → 지지 형성 → 하락추세 전환을 수치화해 탐색")
+    st.info("단순 낙폭과대 매수가 아니라, 과거 강한 상승·거래대금이 확인된 종목만 대상으로 지지 확인형과 추세전환 확인형을 비교합니다.")
+
+    c1,c2,c3,c4=st.columns(4)
+    rb_names=c1.number_input("분석 종목수",100,4000,500,100,key="rb_names")
+    rb_peak_days=c2.selectbox("대장 판별 기간",[20,40,60],index=2,key="rb_peak")
+    rb_rise=c3.selectbox("과거 상승률",[30,50,70,100],index=1,key="rb_rise")/100
+    rb_amt=c4.selectbox("대장 거래대금",[500,1000,2000,3000],index=2,key="rb_amt")*1e8
+    st.caption("V1 개발구간은 2016~2023만 사용합니다. 추세선은 사람이 그리지 않고 최근 스윙고점/저점 구조로 수치화합니다.")
+
+    def leader_rebound_scan(d, code, name, market, peak_days, leader_rise, leader_amt):
+        if d is None or len(d)<160: return []
+        x=d.copy().sort_index()
+        x["HH"]=x["High"].shift(1).rolling(peak_days).max()
+        x["LL20"]=x["Low"].rolling(20).min()
+        x["MA20"]=x["Close"].rolling(20).mean()
+        x["VOL20"]=x["Volume"].shift(1).rolling(20).mean()
+        out=[]; last_entry=-999
+        for i in range(max(peak_days,60),len(x)-21):
+            # 최근 peak_days 안에서 저점 대비 충분히 상승했고 큰 거래대금이 터진 '과거 대장'
+            a=max(0,i-peak_days)
+            seg=x.iloc[a:i+1]
+            low=float(seg["Low"].min()); high=float(seg["High"].max())
+            if low<=0 or high/low-1 < leader_rise: continue
+            peak_pos=int(np.argmax(seg["High"].to_numpy()))+a
+            if peak_pos>=i: continue
+            peak=float(x["High"].iloc[peak_pos])
+            if float(x["Amount"].iloc[a:peak_pos+1].max()) < leader_amt: continue
+            dd=float(x["Close"].iloc[i]/peak-1)
+            if not (-0.60 <= dd <= -0.25): continue
+            # 지지: 최근 5일 저가가 20일 최저가 부근이고, 당일 종가가 저점에서 3% 이상 회복
+            support=float(x["Low"].iloc[max(0,i-19):i+1].min())
+            if float(x["Low"].iloc[i]) > support*1.05: continue
+            recovery=float(x["Close"].iloc[i]/max(float(x["Low"].iloc[i]),1e-9)-1)
+            if recovery < .03: continue
+            # 최근 하락 구간의 단기 저항: 직전 10일 고가. 돌파형은 종가가 전일 기준 저항을 넘고 거래량 확인
+            resistance=float(x["High"].iloc[max(peak_pos+1,i-10):i].max()) if i>max(peak_pos+1,i-10) else np.nan
+            vol_ok=np.isfinite(x["VOL20"].iloc[i]) and float(x["Volume"].iloc[i]) >= float(x["VOL20"].iloc[i])
+            modes=["지지확인"]
+            if np.isfinite(resistance) and float(x["Close"].iloc[i])>resistance and vol_ok:
+                modes.append("지지+추세전환")
+            for mode in modes:
+                if i-last_entry<5 and mode=="지지확인": continue
+                entry=i+1; ep=float(x["Open"].iloc[entry])
+                if ep<=0: continue
+                rec={"Code":code,"Name":name,"Market":market,"Mode":mode,"PeakDate":x.index[peak_pos],"SignalDate":x.index[i],"EntryDate":x.index[entry],"Peak":peak,"Drawdown":dd,"Support":support,"Entry":ep}
+                # 첫 저항은 과거 고점과 진입 전 최근 20일 고가 중 가까운 위쪽 가격
+                candidates=[v for v in [peak,float(x["High"].iloc[max(peak_pos+1,i-20):i+1].max())] if v>ep]
+                rec["Resistance"]=min(candidates) if candidates else peak
+                rec["UpsideToResistance"]=rec["Resistance"]/ep-1
+                rec["RiskToSupport"]=support/ep-1
+                for h in (1,3,5,10,20):
+                    k=entry+h; rec[f"R{h}"]=float(x["Close"].iloc[k]/ep-1) if k<len(x) else np.nan
+                out.append(rec)
+            last_entry=i
+        return out
+
+    if st.button("🪂 낙폭반등 V1 백테스트",type="primary",use_container_width=True,key="rb_run"):
+        try:
+            listing=krx_listing_v1(); n=min(int(rb_names),len(listing)); sample=listing.sample(n=n,random_state=42) if n<len(listing) else listing
+            recs=[]; bar=st.progress(0.0)
+            for ix,row in enumerate(sample.itertuples(index=False),1):
+                try:
+                    d=krx_one_v1(row.Code,"2015-01-01","2024-01-01")
+                    recs.extend(leader_rebound_scan(d,row.Code,row.Name,row.Market,int(rb_peak_days),float(rb_rise),float(rb_amt)))
+                except Exception: pass
+                if ix==1 or ix%10==0 or ix==n: bar.progress(ix/n,text=f"{ix:,}/{n:,} · {row.Name}")
+            q=pd.DataFrame(recs); st.session_state["leader_rb_v1"]=q
+            st.success(f"완료 · 신호 {len(q):,}개")
+        except Exception as e: st.exception(e)
+
+    q=st.session_state.get("leader_rb_v1",pd.DataFrame())
+    if len(q):
+        rows=[]
+        for mode,g in q.groupby("Mode"):
+            z={"진입방식":mode,"신호수":len(g),"평균낙폭":g["Drawdown"].mean()*100,"저항까지여유":g["UpsideToResistance"].median()*100}
+            for h in (1,3,5,10,20):
+                z[f"{h}일 승률"]=g[f"R{h}"].gt(0).mean()*100; z[f"{h}일 평균"]=g[f"R{h}"].mean()*100; z[f"{h}일 중앙값"]=g[f"R{h}"].median()*100
+            rows.append(z)
+        summary=pd.DataFrame(rows); pc=[c for c in summary if "률" in c or "평균" in c or "중앙값" in c or "여유" in c or "낙폭" in c]
+        st.subheader("📊 지지만 확인 vs 추세전환까지 확인")
+        st.dataframe(summary.style.format({c:"{:.2f}%" for c in pc},na_rep="-"),use_container_width=True,hide_index=True)
+        st.subheader("🔎 실제 포착 종목")
+        show=q.sort_values("EntryDate",ascending=False)[["Name","Code","PeakDate","SignalDate","EntryDate","Mode","Drawdown","Support","Entry","Resistance","UpsideToResistance","R5","R10","R20"]].head(200).copy()
+        for c in ["Drawdown","UpsideToResistance","R5","R10","R20"]: show[c]=show[c]*100
+        st.dataframe(show.style.format({"Drawdown":"{:.1f}%","UpsideToResistance":"{:.1f}%","R5":"{:.1f}%","R10":"{:.1f}%","R20":"{:.1f}%","Support":"{:,.0f}","Entry":"{:,.0f}","Resistance":"{:,.0f}"},na_rep="-"),use_container_width=True,hide_index=True)
+        st.caption("첫 목표는 수익률 최적화가 아니라 대한광통신처럼 '과거 대장 → 큰 조정 → 지지/전환 → 반등' 사례가 실제 포착되는지 확인하는 것입니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
