@@ -1,0 +1,53 @@
+name: Build KR Leader V2.3 Dataset
+
+on:
+
+  workflow_dispatch:
+
+permissions:
+
+  contents: write
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 330
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+
+        with:
+
+          python-version: '3.11'
+
+          cache: 'pip'
+
+      - name: Install dependencies
+
+        run: pip install pandas numpy finance-datareader
+
+      - name: Build full-market dataset
+
+        run: python build_kr_leader_v23.py
+
+      - name: Commit dataset
+
+        run: |
+
+          git config user.name "github-actions[bot]"
+
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add kr_leader_v23_signals.pkl.gz kr_leader_v23_meta.json kr_leader_v23_build_checkpoint.pkl.gz
+
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Build KR leader V2.3 dataset"
+
+          git push
