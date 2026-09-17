@@ -235,38 +235,35 @@ with tab_rebound:
     rb_peak_days=c2.selectbox("대장 판별 기간",[40,60,90],index=1,key="rb2_peak")
     rb_min_score=c3.selectbox("최소 Leader Score",[4,5,6,7],index=1,key="rb2_score")
     rb_min_space=c4.selectbox("저항까지 최소 공간",[10,15,20,25],index=1,key="rb2_space")/100
-    rb_batch=st.select_slider("⚡ 일괄 다운로드 묶음", options=[25,50,75,100], value=50, key="rb2_batch", help="종목별 500번 호출하지 않고 Yahoo Finance에서 여러 종목을 한 번에 받습니다. 기본 50을 권장합니다.")
-    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다. V2 FAST는 종목별 호출 대신 묶음 다운로드 후 메모리에서 계산합니다.")
+    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다.")
 
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def krx_bulk_yf_v2(items, start="2015-01-01", end="2024-01-01"):
-        # items: ((Code, Market), ...) — 한 묶음을 단 한 번의 Yahoo 호출로 받는다.
-        ticker_map={}
-        for code,market in items:
-            code=str(code).zfill(6)
-            ticker_map[code + (".KS" if str(market)=="KOSPI" else ".KQ")]=code
-        tickers=list(ticker_map)
-        raw=yf.download(tickers, start=start, end=end, group_by="ticker", auto_adjust=False,
-                        actions=False, threads=True, progress=False, timeout=20)
-        out={}
-        if raw is None or raw.empty:
-            return out
-        for ticker,code in ticker_map.items():
-            try:
-                if isinstance(raw.columns,pd.MultiIndex):
-                    d=raw[ticker].copy()
-                else:
-                    d=raw.copy()
-                d=d.rename(columns={"Adj Close":"AdjClose"})
-                need=[c for c in ["Open","High","Low","Close","Volume"] if c in d.columns]
-                d=d[need].dropna(subset=["Open","High","Low","Close"],how="any")
-                if d.empty or "Volume" not in d: continue
-                d.index=pd.to_datetime(d.index).tz_localize(None)
-                d["Amount"]=d["Close"].astype(float)*d["Volume"].astype(float)
-                out[code]=d
-            except Exception:
-                pass
-        return out
+    # V2 LOCAL: 과거 시세는 한 번만 받아 종목별 gzip-pickle로 저장한다.
+    # 같은 Streamlit 인스턴스에서는 이후 백테스트가 인터넷을 다시 호출하지 않는다.
+    RB_CACHE_DIR=Path(".krx_rebound_v2_cache")
+    RB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def rb_cache_path(code):
+        return RB_CACHE_DIR / f"{str(code).zfill(6)}_2015_2023.pkl.gz"
+
+    def rb_load_local(code):
+        fp=rb_cache_path(code)
+        if not fp.exists(): return None
+        try:
+            with gzip.open(fp,"rb") as f: return pickle.load(f)
+        except Exception:
+            return None
+
+    def rb_save_local(code,d):
+        fp=rb_cache_path(code)
+        tmp=fp.with_suffix(fp.suffix+".tmp")
+        with gzip.open(tmp,"wb",compresslevel=3) as f: pickle.dump(d,f,pickle.HIGHEST_PROTOCOL)
+        tmp.replace(fp)
+
+    def rb_download_one(code):
+        d=krx_one_v1(str(code),"2015-01-01","2024-01-01")
+        if d is not None and not d.empty:
+            rb_save_local(code,d)
+        return d
 
     def leader_rebound_scan_v2(d, code, name, market, peak_days=60, min_score=5, min_space=.15):
         if d is None or len(d)<180: return []
@@ -361,55 +358,63 @@ with tab_rebound:
             out.append(rec); last_signal=i
         return out
 
-    if st.button("🪂 대장주 낙폭반등 V2 백테스트",type="primary",use_container_width=True,key="rb2_run"):
+    # 데이터 준비와 계산을 분리한다. 첫 구축만 네트워크를 사용하고 이후 계산은 로컬 데이터만 사용한다.
+    listing=krx_listing_v1()
+    n=min(int(rb_names),len(listing))
+    sample=listing.sample(n=n,random_state=42) if n<len(listing) else listing
+    sample_rows=list(sample.itertuples(index=False))
+    cached_now=sum(rb_cache_path(r.Code).exists() for r in sample_rows)
+    st.caption(f"💾 현재 준비된 과거데이터: {cached_now:,}/{n:,}종목 · 한 번 준비된 종목은 재실행 때 다시 받지 않습니다.")
+
+    if st.button("① 과거데이터 준비/이어받기",use_container_width=True,key="rb2_build"):
+        bar=st.progress(cached_now/n if n else 0.0,text=f"데이터 준비 {cached_now:,}/{n:,}")
+        eta=st.empty(); started=time.perf_counter(); newly=0; failed=0
+        missing=[r for r in sample_rows if not rb_cache_path(r.Code).exists()]
+        total_missing=len(missing)
+        for j,row in enumerate(missing,1):
+            try:
+                d=rb_download_one(row.Code)
+                if d is None or d.empty: failed+=1
+                else: newly+=1
+            except Exception:
+                failed+=1
+            done=cached_now+j
+            elapsed=time.perf_counter()-started
+            avg=elapsed/max(j,1); remain=avg*(total_missing-j)
+            def _fmt2(sec):
+                sec=max(0,int(sec)); m,ss=divmod(sec,60)
+                return f"{m}분 {ss:02d}초" if m else f"{ss}초"
+            bar.progress(min(done/n,1.0),text=f"데이터 준비 {done:,}/{n:,} · {row.Name} · 남은 시간 약 {_fmt2(remain)}")
+            eta.caption(f"이번 실행 신규 {newly:,}개 · 실패 {failed:,}개 · 경과 {_fmt2(elapsed)} · Stop 후 다시 눌러도 이어서 진행됩니다.")
+        st.success(f"데이터 준비 완료 · 신규 {newly:,}개 · 실패 {failed:,}개")
+
+    if st.button("② 로컬 데이터로 V2 백테스트",type="primary",use_container_width=True,key="rb2_run_local"):
         try:
-            listing=krx_listing_v1(); n=min(int(rb_names),len(listing)); sample=listing.sample(n=n,random_state=42) if n<len(listing) else listing
-            rows=list(sample.itertuples(index=False))
-            recs=[]
-            bar=st.progress(0.0, text="병렬 백테스트 준비 중…")
-            eta_box=st.empty()
-            started=time.perf_counter()
-            done=0
-
-            def _fmt(sec):
-                sec=max(0,int(round(sec)))
-                if sec<60: return f"약 {sec}초"
-                m,ss=divmod(sec,60)
-                if m<60: return f"약 {m}분 {ss:02d}초"
-                h,m=divmod(m,60); return f"약 {h}시간 {m:02d}분"
-
-            # V2 FAST: 500종목을 500번 호출하지 않는다.
-            # KOSPI/KOSDAQ 코드를 Yahoo ticker로 변환해 묶음으로 받고, 받은 뒤 로컬 계산만 수행한다.
-            batch_size=int(rb_batch)
-            errors=0
-            batches=[rows[i:i+batch_size] for i in range(0,n,batch_size)]
-            for bi,batch in enumerate(batches,1):
-                items=tuple((str(r.Code),str(r.Market)) for r in batch)
-                try:
-                    bulk=krx_bulk_yf_v2(items,"2015-01-01","2024-01-01")
-                except Exception:
-                    bulk={}; errors+=len(batch)
-                for row in batch:
+            available=[r for r in sample_rows if rb_cache_path(r.Code).exists()]
+            if not available:
+                st.warning("먼저 ① 과거데이터 준비/이어받기를 눌러주세요.")
+            else:
+                recs=[]; bar=st.progress(0.0,text="로컬 백테스트 준비 중…"); eta=st.empty(); started=time.perf_counter()
+                for j,row in enumerate(available,1):
                     try:
-                        d=bulk.get(str(row.Code).zfill(6))
-                        if d is None or d.empty:
-                            errors+=1
-                        else:
+                        d=rb_load_local(row.Code)
+                        if d is not None and not d.empty:
                             recs.extend(leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space)))
                     except Exception:
-                        errors+=1
-                    done+=1
-                elapsed=time.perf_counter()-started
-                # 첫 묶음 이후부터 ETA가 의미 있어진다. 묶음 단위 평균 속도로 계산한다.
-                remain=max(0,n-done)*(elapsed/max(done,1))
-                bar.progress(done/n,text=f"{done:,}/{n:,} · 묶음 {bi}/{len(batches)} 완료 · 남은 시간 {_fmt(remain)}")
-                eta_box.caption(f"⚡ {batch_size}종목 일괄 다운로드 · 경과 {_fmt(elapsed)} · 예상 남은 시간 {_fmt(remain)} · 신호 {len(recs):,}개")
-
-            q=pd.DataFrame(recs); st.session_state["leader_rb_v2"]=q
-            bar.progress(1.0,text=f"{n:,}/{n:,} 분석 완료")
-            eta_box.caption(f"총 소요 시간 {_fmt(time.perf_counter()-started)} · 신호 {len(q):,}개 · 오류 종목 {errors:,}개")
-            st.success(f"완료 · V2 신호 {len(q):,}개")
-        except Exception as e: st.exception(e)
+                        pass
+                    elapsed=time.perf_counter()-started; remain=(elapsed/max(j,1))*(len(available)-j)
+                    def _fmt3(sec):
+                        sec=max(0,int(sec)); m,ss=divmod(sec,60)
+                        return f"{m}분 {ss:02d}초" if m else f"{ss}초"
+                    bar.progress(j/len(available),text=f"계산 {j:,}/{len(available):,} · {row.Name} · 남은 시간 약 {_fmt3(remain)}")
+                    eta.caption(f"🌐 인터넷 호출 0회 · 로컬 계산만 수행 · 경과 {_fmt3(elapsed)} · 신호 {len(recs):,}개")
+                q=pd.DataFrame(recs); st.session_state["leader_rb_v2"]=q
+                bar.progress(1.0,text=f"{len(available):,}종목 계산 완료")
+                st.success(f"완료 · 로컬 {len(available):,}종목 · V2 신호 {len(q):,}개")
+                if len(available)<n:
+                    st.info(f"현재 {len(available):,}/{n:,}종목만 준비되어 있습니다. ①을 다시 눌러 나머지를 이어받을 수 있습니다.")
+        except Exception as e:
+            st.exception(e)
 
     q=st.session_state.get("leader_rb_v2",pd.DataFrame())
     if len(q):
