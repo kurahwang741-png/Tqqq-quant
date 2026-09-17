@@ -20,12 +20,12 @@ st.set_page_config(
     layout="centered",
 )
 
-tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V3"] )
+tab_soxl, tab_kosdaq = st.tabs(["📈 SOXL 퀀트", "🇰🇷 국장 QUANT V4"] )
 
 with tab_kosdaq:
-    st.title("🇰🇷 국장 QUANT V3")
-    st.caption("장대양봉 × 절대거래대금 × 20일평균 대비 거래대금 폭증 × 눌림 후 반등 · 2016~2023 개발 / 2024~2026 블라인드")
-    st.info("V3는 V2 반등확인 구조에 장대양봉 당일 거래대금이 직전 20일 평균 대비 몇 배 폭증했는지를 추가합니다. 2×/3×/5×/8×를 독립 비교합니다.")
+    st.title("🇰🇷 국장 QUANT V4")
+    st.caption("장대양봉 × 대규모 거래대금 × 동반강세 × 눌림 후 반등 · 2016~2023 개발 / 2024~2026 블라인드")
+    st.info("V4는 V3에서 확인한 대규모 절대 거래대금을 중심으로, 장대양봉 발생일에 시장 전체에서 강한 종목이 동시에 몇 개 발생했는지(1/2+/3+/5+)를 비교합니다. 아직 테마 이름은 쓰지 않고 동반강세 자체의 효과만 검증합니다.")
 
     @st.cache_data(ttl=86400, show_spinner=False)
     def krx_listing_v1():
@@ -106,72 +106,78 @@ with tab_kosdaq:
     random_seed=c3.number_input("표본 Seed",0,9999,42,1)
     st.caption("⚠️ 현재 V1 다운로드는 현재 상장종목 기반입니다. 전략 확정 전 상장폐지 이력까지 합친 survivorship-bias 보정판으로 재검증해야 합니다.")
 
-    if st.button("🔥 국장 V3 거래대금 폭증 비교 돌리기", type="primary", use_container_width=True):
+    if st.button("🔥 국장 V4 동반강세 비교 돌리기", type="primary", use_container_width=True):
         try:
             listing=krx_listing_v1()
             n=min(int(max_names),len(listing))
             sample=listing.sample(n=n, random_state=int(random_seed)) if n<len(listing) else listing
-            rise_cuts=[.15,.20,.25]; amount_cuts=[100e9,200e9,300e9]; ratio_cuts=[2.0,3.0,5.0,8.0]
+            # V3에서 절대 거래대금 효과가 더 일관되어 보였으므로 2,000/3,000억에 집중.
+            rise_cuts=[.15,.20,.25]; amount_cuts=[200e9,300e9]; crowd_cuts=[1,2,3,5]
             rebound_modes=["전일고가돌파","5일선재돌파","양봉+거래량"]
-            buckets={(m,r,a,v):[] for m in rebound_modes for r in rise_cuts for a in amount_cuts for v in ratio_cuts}
+            all_recs=[]
+            event_dates={}
             bar=st.progress(0.0, text="종목 데이터 수집 시작")
             status=st.empty()
             for ix,row in enumerate(sample.itertuples(index=False),1):
                 try:
                     x=krx_one_v1(row.Code, f"{int(start_year)-1}-11-01", "2024-01-01")
                     if not x.empty:
-                        # 가장 느슨한 조건의 이벤트를 한 번 만든 뒤 각 조합별로 필터
+                        # 동반강세 수는 같은 표본 안에서 +15% & 2,000억 이상 장대양봉 발생 종목 수.
+                        d=x.copy().sort_index(); r1=d["Close"].pct_change()
+                        mask=(r1>=.15)&(d["Amount"]>=200e9)
+                        for dt in d.index[mask]: event_dates[dt]=event_dates.get(dt,0)+1
                         for m in rebound_modes:
-                            base=scan_one_v1(x,row.Code,row.Name,row.Market,.15,100e9,m)
-                            for rec in base:
-                                if not np.isfinite(rec.get("AmtRatio20",np.nan)): continue
-                                for r in rise_cuts:
-                                    if rec["Rise"]+1e-12 < r: continue
-                                    for a0 in amount_cuts:
-                                        if rec["Amount"] < a0: continue
-                                        for v0 in ratio_cuts:
-                                            if rec["AmtRatio20"] >= v0: buckets[(m,r,a0,v0)].append(rec)
+                            all_recs.extend(scan_one_v1(x,row.Code,row.Name,row.Market,.15,200e9,m))
                 except Exception:
                     pass
                 if ix==1 or ix%10==0 or ix==n:
                     bar.progress(ix/n,text=f"{ix:,}/{n:,} 종목 분석 · {row.Code} {row.Name}")
-                    status.caption("첫 실행은 데이터 다운로드 때문에 오래 걸릴 수 있고, 이후에는 캐시되어 빨라집니다.")
+                    status.caption("동반강세는 현재 분석 표본 안에서 계산합니다. 최종판은 전체 종목/상장폐지 포함으로 다시 검증합니다.")
+            buckets={(m,r,a,c):[] for m in rebound_modes for r in rise_cuts for a in amount_cuts for c in crowd_cuts}
+            for rec in all_recs:
+                crowd=int(event_dates.get(pd.Timestamp(rec["EventDate"]),1))
+                rec["Crowd"]=crowd
+                for r in rise_cuts:
+                    if rec["Rise"]+1e-12<r: continue
+                    for a0 in amount_cuts:
+                        if rec["Amount"]<a0: continue
+                        for c0 in crowd_cuts:
+                            # 1은 '전체(동반강세 조건 없음)', 2/3/5는 해당 개수 이상 동시 발생.
+                            if crowd>=c0: buckets[(rec["Rebound"],r,a0,c0)].append(rec)
             rows=[]
-            for (m,r,a0,v0),recs in buckets.items():
+            for (m,r,a0,c0),recs in buckets.items():
                 q=pd.DataFrame(recs)
-                z={"반등신호":m,"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","20일대비":f"{v0:g}배↑","신호수":len(q)}
+                z={"반등신호":m,"장대양봉":f"+{int(r*100)}%","거래대금":f"{int(a0/1e8):,}억","동반강세":"전체" if c0==1 else f"{c0}개+","신호수":len(q)}
                 for h in (1,3,5,10,20):
                     col=f"R{h}"
                     z[f"{h}일 승률"]=(q[col].gt(0).mean()*100) if len(q) else np.nan
                     z[f"{h}일 평균"]=(q[col].mean()*100) if len(q) else np.nan
                     z[f"{h}일 중앙값"]=(q[col].median()*100) if len(q) else np.nan
-                z["5일 평균-중앙값"]=(z.get("5일 평균",np.nan)-z.get("5일 중앙값",np.nan))
+                z["5일 평균-중앙값"]=z.get("5일 평균",np.nan)-z.get("5일 중앙값",np.nan)
                 z["표본주의"]="⚠️" if len(q)<50 else ""
                 rows.append(z)
             result=pd.DataFrame(rows)
-            st.session_state["kr_v1_result"]=result
-            st.session_state["kr_v1_buckets"]=buckets
-            st.success("개발구간 분석 완료. 2024~2026 데이터는 사용하지 않았습니다.")
+            st.session_state["kr_v4_result"]=result
+            st.session_state["kr_v4_buckets"]=buckets
+            st.success("V4 개발구간 분석 완료. 2024~2026 데이터는 사용하지 않았습니다.")
         except ModuleNotFoundError:
-            st.error("FinanceDataReader가 없습니다. requirements.txt에 finance-datareader 를 추가한 뒤 재부팅하세요.")
+            st.error("FinanceDataReader가 없습니다. requirements.txt에 FinanceDataReader 를 추가한 뒤 재부팅하세요.")
         except Exception as e:
             st.exception(e)
 
-    if "kr_v1_result" in st.session_state:
-        result=st.session_state["kr_v1_result"]
-        show=result.copy()
-        pct_cols=[c for c in show.columns if "승률" in c or "평균" in c or "중앙값" in c]
-        st.subheader("🏆 V3 요약 · 5일 중앙값 상위")
+    if "kr_v4_result" in st.session_state:
+        result=st.session_state["kr_v4_result"]
+        show=result.copy(); pct_cols=[c for c in show.columns if "승률" in c or "평균" in c or "중앙값" in c]
+        st.subheader("🏆 V4 요약 · 5일 중앙값 상위")
         valid=show[show["신호수"]>=50].copy()
         if len(valid):
             top=valid.sort_values(["5일 중앙값","5일 평균"],ascending=False).head(12)
             top_pct=[c for c in top.columns if "승률" in c or "평균" in c or "중앙값" in c]
             st.dataframe(top.style.format({c:"{:.2f}%" for c in top_pct},na_rep="-"),use_container_width=True,hide_index=True)
-        else:
-            st.warning("신호 50개 이상 조합이 없습니다. 전체 표를 확인하세요.")
-        st.subheader("📊 V3 전체 개발구간 결과")
+        else: st.warning("신호 50개 이상 조합이 없습니다. 전체 표를 확인하세요.")
+        st.subheader("📊 V4 전체 개발구간 결과")
         st.dataframe(show.style.format({c:"{:.2f}%" for c in pct_cols},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("핵심 관찰값은 5일 중앙값입니다. 신호 50개 미만은 ⚠️로 표시합니다. 2024~2026은 여전히 사용하지 않습니다.")
+        st.caption("'전체'는 동반강세 필터 없음입니다. 2개+/3개+/5개+와 비교해 동시 강세가 실제로 성과를 개선하는지 확인합니다. 2024~2026은 계속 봉인합니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
