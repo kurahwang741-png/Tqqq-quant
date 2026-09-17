@@ -226,94 +226,154 @@ with tab_kosdaq:
 
 
 with tab_rebound:
-    st.title("🪂 대장주 낙폭반등 V1")
-    st.caption("과거 대장주 → 큰 낙폭 → 지지 형성 → 하락추세 전환을 수치화해 탐색")
-    st.info("단순 낙폭과대 매수가 아니라, 과거 강한 상승·거래대금이 확인된 종목만 대상으로 지지 확인형과 추세전환 확인형을 비교합니다.")
+    st.title("🪂 대장주 낙폭반등 V2")
+    st.caption("Leader Score → 큰 낙폭 → W바닥/Higher Low → 넥라인 돌파 → 위 저항까지 공간")
+    st.info("V1의 단순 '많이 빠짐+지지'를 버리고, 과거에 실제로 강했던 종목의 2차 파동만 찾습니다. 개발구간은 2016~2023으로 고정합니다.")
 
     c1,c2,c3,c4=st.columns(4)
-    rb_names=c1.number_input("분석 종목수",100,4000,500,100,key="rb_names")
-    rb_peak_days=c2.selectbox("대장 판별 기간",[20,40,60],index=2,key="rb_peak")
-    rb_rise=c3.selectbox("과거 상승률",[30,50,70,100],index=1,key="rb_rise")/100
-    rb_amt=c4.selectbox("대장 거래대금",[500,1000,2000,3000],index=2,key="rb_amt")*1e8
-    st.caption("V1 개발구간은 2016~2023만 사용합니다. 추세선은 사람이 그리지 않고 최근 스윙고점/저점 구조로 수치화합니다.")
+    rb_names=c1.number_input("분석 종목수",100,4000,500,100,key="rb2_names")
+    rb_peak_days=c2.selectbox("대장 판별 기간",[40,60,90],index=1,key="rb2_peak")
+    rb_min_score=c3.selectbox("최소 Leader Score",[4,5,6,7],index=1,key="rb2_score")
+    rb_min_space=c4.selectbox("저항까지 최소 공간",[10,15,20,25],index=1,key="rb2_space")/100
+    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다.")
 
-    def leader_rebound_scan(d, code, name, market, peak_days, leader_rise, leader_amt):
-        if d is None or len(d)<160: return []
+    def leader_rebound_scan_v2(d, code, name, market, peak_days=60, min_score=5, min_space=.15):
+        if d is None or len(d)<180: return []
         x=d.copy().sort_index()
-        x["HH"]=x["High"].shift(1).rolling(peak_days).max()
-        x["LL20"]=x["Low"].rolling(20).min()
-        x["MA20"]=x["Close"].rolling(20).mean()
+        x["AMT20"]=x["Amount"].shift(1).rolling(20).mean()
         x["VOL20"]=x["Volume"].shift(1).rolling(20).mean()
-        out=[]; last_entry=-999
-        for i in range(max(peak_days,60),len(x)-21):
-            # 최근 peak_days 안에서 저점 대비 충분히 상승했고 큰 거래대금이 터진 '과거 대장'
-            a=max(0,i-peak_days)
-            seg=x.iloc[a:i+1]
-            low=float(seg["Low"].min()); high=float(seg["High"].max())
-            if low<=0 or high/low-1 < leader_rise: continue
-            peak_pos=int(np.argmax(seg["High"].to_numpy()))+a
-            if peak_pos>=i: continue
-            peak=float(x["High"].iloc[peak_pos])
-            if float(x["Amount"].iloc[a:peak_pos+1].max()) < leader_amt: continue
+        out=[]; last_signal=-999
+        for i in range(max(peak_days+35,100),len(x)-21):
+            # 1) 과거 대장 자격: 현재보다 최소 15일 이전에 만들어진 고점만 사용
+            look0=max(0,i-peak_days-35); look1=i-15
+            hist=x.iloc[look0:look1+1]
+            if len(hist)<peak_days//2: continue
+            peak_rel=int(np.argmax(hist["High"].to_numpy())); peak_pos=look0+peak_rel
+            peak=float(x["High"].iloc[peak_pos]); peak_date=x.index[peak_pos]
+            pre0=max(0,peak_pos-peak_days)
+            pre=x.iloc[pre0:peak_pos+1]
+            low=float(pre["Low"].min())
+            if low<=0: continue
+            rise=peak/low-1
+            max_amt=float(pre["Amount"].max())
+            daily_ret=pre["Close"].pct_change()
+            big_days=int((daily_ret>=.10).sum())
+            amt_ratio=(pre["Amount"]/(pre["Amount"].shift(1).rolling(20).mean())).replace([np.inf,-np.inf],np.nan)
+            amt_bursts=int((amt_ratio>=3).sum())
+            low_pos=pre0+int(np.argmin(pre["Low"].to_numpy()))
+            run_days=max(1,peak_pos-low_pos)
+            score=0
+            score += 1 if rise>=.40 else 0
+            score += 1 if rise>=.70 else 0
+            score += 1 if rise>=1.00 else 0
+            score += 1 if max_amt>=1e11 else 0
+            score += 1 if max_amt>=2e11 else 0
+            score += 1 if big_days>=2 else 0
+            score += 1 if big_days>=4 else 0
+            score += 1 if amt_bursts>=1 else 0
+            score += 1 if run_days<=30 and rise>=.50 else 0
+            if score<int(min_score): continue
+
+            # 2) 큰 조정
             dd=float(x["Close"].iloc[i]/peak-1)
-            if not (-0.60 <= dd <= -0.25): continue
-            # 지지: 최근 5일 저가가 20일 최저가 부근이고, 당일 종가가 저점에서 3% 이상 회복
-            support=float(x["Low"].iloc[max(0,i-19):i+1].min())
-            if float(x["Low"].iloc[i]) > support*1.05: continue
-            recovery=float(x["Close"].iloc[i]/max(float(x["Low"].iloc[i]),1e-9)-1)
-            if recovery < .03: continue
-            # 최근 하락 구간의 단기 저항: 직전 10일 고가. 돌파형은 종가가 전일 기준 저항을 넘고 거래량 확인
-            resistance=float(x["High"].iloc[max(peak_pos+1,i-10):i].max()) if i>max(peak_pos+1,i-10) else np.nan
-            vol_ok=np.isfinite(x["VOL20"].iloc[i]) and float(x["Volume"].iloc[i]) >= float(x["VOL20"].iloc[i])
-            modes=["지지확인"]
-            if np.isfinite(resistance) and float(x["Close"].iloc[i])>resistance and vol_ok:
-                modes.append("지지+추세전환")
-            for mode in modes:
-                if i-last_entry<5 and mode=="지지확인": continue
-                entry=i+1; ep=float(x["Open"].iloc[entry])
-                if ep<=0: continue
-                rec={"Code":code,"Name":name,"Market":market,"Mode":mode,"PeakDate":x.index[peak_pos],"SignalDate":x.index[i],"EntryDate":x.index[entry],"Peak":peak,"Drawdown":dd,"Support":support,"Entry":ep}
-                # 첫 저항은 과거 고점과 진입 전 최근 20일 고가 중 가까운 위쪽 가격
-                candidates=[v for v in [peak,float(x["High"].iloc[max(peak_pos+1,i-20):i+1].max())] if v>ep]
-                rec["Resistance"]=min(candidates) if candidates else peak
-                rec["UpsideToResistance"]=rec["Resistance"]/ep-1
-                rec["RiskToSupport"]=support/ep-1
-                for h in (1,3,5,10,20):
-                    k=entry+h; rec[f"R{h}"]=float(x["Close"].iloc[k]/ep-1) if k<len(x) else np.nan
-                out.append(rec)
-            last_entry=i
+            if not (-.65 <= dd <= -.25): continue
+
+            # 3) W바닥/Higher Low: 최근 35일에서 첫 저점 -> 반등고점 -> 두번째 저점
+            w0=max(peak_pos+1,i-35)
+            if i-w0<12: continue
+            lows=x["Low"].iloc[w0:i+1].to_numpy(); closes=x["Close"].iloc[w0:i+1].to_numpy()
+            first_rel=int(np.argmin(lows[:-6])) if len(lows)>7 else 0
+            first=w0+first_rel
+            if first>=i-5: continue
+            # 첫 저점 뒤 최소 3일 지난 구간에서 반등 고점(넥라인)
+            neck0=first+3
+            if neck0>=i-3: continue
+            neck_rel=int(np.argmax(x["High"].iloc[neck0:i-2].to_numpy()))
+            neck=neck0+neck_rel; neckline=float(x["High"].iloc[neck])
+            if neck>=i-2: continue
+            second_slice=x["Low"].iloc[neck+1:i+1]
+            if len(second_slice)<2: continue
+            second=neck+1+int(np.argmin(second_slice.to_numpy()))
+            low1=float(x["Low"].iloc[first]); low2=float(x["Low"].iloc[second])
+            # 두 번째 저점은 첫 저점 대비 -4% 이상 깨지지 않고 +12% 이내
+            if not (low1*.96 <= low2 <= low1*1.12): continue
+            # 두 저점 사이에 의미있는 반등이 있었는지
+            if neckline/max(low1,1e-9)-1 < .08: continue
+
+            # 4) 당일 넥라인 돌파 + 거래량 확인
+            breakout=float(x["Close"].iloc[i]) > neckline*1.005
+            vol_ok=np.isfinite(x["VOL20"].iloc[i]) and float(x["Volume"].iloc[i]) >= float(x["VOL20"].iloc[i])*.8
+            if not (breakout and vol_ok): continue
+            if i-last_signal<10: continue
+
+            entry=i+1; ep=float(x["Open"].iloc[entry])
+            if ep<=0: continue
+            # 5) 위 저항: 고점 이후, 진입 전 형성된 스윙 고가 중 진입가 위의 가장 가까운 가격 + 전고점
+            highs=x["High"].iloc[peak_pos:i+1].to_numpy()
+            resist=[]
+            for j in range(2,len(highs)-2):
+                if highs[j]==max(highs[j-2:j+3]) and highs[j]>ep*1.03:
+                    resist.append(float(highs[j]))
+            resist.append(peak)
+            resistance=min([r for r in resist if r>ep],default=peak)
+            space=resistance/ep-1
+            if space < float(min_space): continue
+            support=min(low1,low2); risk=support/ep-1
+            rr=space/max(abs(risk),.01)
+            rec={"Code":code,"Name":name,"Market":market,"LeaderScore":score,"RiseToPeak":rise,
+                 "PeakDate":peak_date,"Peak":peak,"SignalDate":x.index[i],"EntryDate":x.index[entry],
+                 "Drawdown":dd,"Low1Date":x.index[first],"Low1":low1,"Low2Date":x.index[second],"Low2":low2,
+                 "Neckline":neckline,"Entry":ep,"Support":support,"Resistance":resistance,
+                 "UpsideToResistance":space,"RiskToSupport":risk,"RR":rr}
+            for h in (1,3,5,10,20):
+                k=entry+h; rec[f"R{h}"]=float(x["Close"].iloc[k]/ep-1) if k<len(x) else np.nan
+            out.append(rec); last_signal=i
         return out
 
-    if st.button("🪂 낙폭반등 V1 백테스트",type="primary",use_container_width=True,key="rb_run"):
+    if st.button("🪂 대장주 낙폭반등 V2 백테스트",type="primary",use_container_width=True,key="rb2_run"):
         try:
             listing=krx_listing_v1(); n=min(int(rb_names),len(listing)); sample=listing.sample(n=n,random_state=42) if n<len(listing) else listing
             recs=[]; bar=st.progress(0.0)
             for ix,row in enumerate(sample.itertuples(index=False),1):
                 try:
                     d=krx_one_v1(row.Code,"2015-01-01","2024-01-01")
-                    recs.extend(leader_rebound_scan(d,row.Code,row.Name,row.Market,int(rb_peak_days),float(rb_rise),float(rb_amt)))
+                    recs.extend(leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space)))
                 except Exception: pass
                 if ix==1 or ix%10==0 or ix==n: bar.progress(ix/n,text=f"{ix:,}/{n:,} · {row.Name}")
-            q=pd.DataFrame(recs); st.session_state["leader_rb_v1"]=q
-            st.success(f"완료 · 신호 {len(q):,}개")
+            q=pd.DataFrame(recs); st.session_state["leader_rb_v2"]=q
+            st.success(f"완료 · V2 신호 {len(q):,}개")
         except Exception as e: st.exception(e)
 
-    q=st.session_state.get("leader_rb_v1",pd.DataFrame())
+    q=st.session_state.get("leader_rb_v2",pd.DataFrame())
     if len(q):
-        rows=[]
-        for mode,g in q.groupby("Mode"):
-            z={"진입방식":mode,"신호수":len(g),"평균낙폭":g["Drawdown"].mean()*100,"저항까지여유":g["UpsideToResistance"].median()*100}
-            for h in (1,3,5,10,20):
-                z[f"{h}일 승률"]=g[f"R{h}"].gt(0).mean()*100; z[f"{h}일 평균"]=g[f"R{h}"].mean()*100; z[f"{h}일 중앙값"]=g[f"R{h}"].median()*100
-            rows.append(z)
-        summary=pd.DataFrame(rows); pc=[c for c in summary if "률" in c or "평균" in c or "중앙값" in c or "여유" in c or "낙폭" in c]
-        st.subheader("📊 지지만 확인 vs 추세전환까지 확인")
+        st.subheader("📊 V2 전체 성과")
+        z={"신호수":len(q),"Leader Score 중앙값":q["LeaderScore"].median(),"평균낙폭":q["Drawdown"].mean()*100,
+           "저항까지여유 중앙값":q["UpsideToResistance"].median()*100,"손익비 중앙값":q["RR"].median()}
+        for h in (1,3,5,10,20):
+            z[f"{h}일 승률"]=q[f"R{h}"].gt(0).mean()*100; z[f"{h}일 평균"]=q[f"R{h}"].mean()*100; z[f"{h}일 중앙값"]=q[f"R{h}"].median()*100
+        summary=pd.DataFrame([z]); pc=[c for c in summary if "률" in c or "평균" in c or "중앙값" in c and "Score" not in c and "손익비" not in c]
         st.dataframe(summary.style.format({c:"{:.2f}%" for c in pc},na_rep="-"),use_container_width=True,hide_index=True)
-        st.subheader("🔎 실제 포착 종목")
-        show=q.sort_values("EntryDate",ascending=False)[["Name","Code","PeakDate","SignalDate","EntryDate","Mode","Drawdown","Support","Entry","Resistance","UpsideToResistance","R5","R10","R20"]].head(200).copy()
+
+        st.subheader("📅 연도별 안정성")
+        yy=q.copy(); yy["연도"]=pd.to_datetime(yy["EntryDate"]).dt.year
+        rows=[]
+        for y,g in yy.groupby("연도"):
+            a={"연도":int(y),"신호수":len(g)}
+            for h in (5,10,20):
+                a[f"{h}일 승률"]=g[f"R{h}"].gt(0).mean()*100; a[f"{h}일 평균"]=g[f"R{h}"].mean()*100; a[f"{h}일 중앙값"]=g[f"R{h}"].median()*100
+            rows.append(a)
+        yearly=pd.DataFrame(rows)
+        if len(yearly):
+            pc2=[c for c in yearly if "률" in c or "평균" in c or "중앙값" in c]
+            st.dataframe(yearly.style.format({c:"{:.2f}%" for c in pc2},na_rep="-"),use_container_width=True,hide_index=True)
+
+        st.subheader("🔎 실제 포착 종목 — 차트 모양 확인용")
+        cols=["Name","Code","LeaderScore","PeakDate","Peak","Drawdown","Low1Date","Low1","Low2Date","Low2","SignalDate","EntryDate","Neckline","Entry","Resistance","UpsideToResistance","RR","R5","R10","R20"]
+        show=q.sort_values("EntryDate",ascending=False)[cols].head(250).copy()
         for c in ["Drawdown","UpsideToResistance","R5","R10","R20"]: show[c]=show[c]*100
-        st.dataframe(show.style.format({"Drawdown":"{:.1f}%","UpsideToResistance":"{:.1f}%","R5":"{:.1f}%","R10":"{:.1f}%","R20":"{:.1f}%","Support":"{:,.0f}","Entry":"{:,.0f}","Resistance":"{:,.0f}"},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("첫 목표는 수익률 최적화가 아니라 대한광통신처럼 '과거 대장 → 큰 조정 → 지지/전환 → 반등' 사례가 실제 포착되는지 확인하는 것입니다.")
+        st.dataframe(show.style.format({"Drawdown":"{:.1f}%","UpsideToResistance":"{:.1f}%","R5":"{:.1f}%","R10":"{:.1f}%","R20":"{:.1f}%","Peak":"{:,.0f}","Low1":"{:,.0f}","Low2":"{:,.0f}","Neckline":"{:,.0f}","Entry":"{:,.0f}","Resistance":"{:,.0f}","RR":"{:.2f}"},na_rep="-"),use_container_width=True,hide_index=True)
+        st.download_button("CSV 다운로드",q.to_csv(index=False).encode("utf-8-sig"),"leader_rebound_v2.csv","text/csv",key="rb2_csv")
+        st.caption("이번 V2의 1차 목표는 수익률 최적화가 아니라 '과거 대장 → 큰 조정 → W/Higher Low → 넥라인 돌파'가 우리가 원하는 차트를 실제로 골라내는지 확인하는 것입니다.")
 
 with tab_soxl:
     st.title("📈 SOXL QUANT V32 DUAL")
