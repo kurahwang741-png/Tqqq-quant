@@ -433,6 +433,70 @@ if page == "🇰🇷 대장주 낙폭반등":
             st.success(f"후보 A OHLC 구축 완료 · 정상 데이터 {ok_codes:,}/{len(a_codes):,}종목")
             st.info("이 체크포인트를 보내주면 최대 3종목·종목별 분할매수·현금 유지 전략을 실제 일별 경로로 백테스트할 수 있습니다.")
 
+
+    # ------------------------------------------------------------
+    # ④ 시장필터 데이터 구축
+    # KOSPI(KS11) / KOSDAQ(KQ11) 2015~2023만 저장합니다.
+    # 2015년은 2016년 신호의 이동평균 워밍업용이며 2024~2026은 접근하지 않습니다.
+    # ------------------------------------------------------------
+    st.subheader("④ 시장필터 데이터 구축")
+    st.caption("KOSPI·KOSDAQ 지수 2개만 받습니다. 2024~2026 블라인드 구간은 사용하지 않습니다.")
+
+    KR_MARKET_FILTER_FILE = Path("kr_market_filter_2015_2023.pkl.gz")
+
+    def _kr_market_portable_frame(df):
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        q = df.copy()
+        q.index = pd.to_datetime(q.index, errors="coerce").tz_localize(None)
+        q = q.loc[(q.index >= pd.Timestamp("2015-01-01")) & (q.index <= pd.Timestamp("2023-12-31"))]
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in q.columns]
+        q = q[keep].sort_index()
+        records = []
+        for dt, rr in q.iterrows():
+            rec = {"Date": pd.Timestamp(dt).strftime("%Y-%m-%d")}
+            for c in keep:
+                v = rr[c]
+                rec[c] = None if pd.isna(v) else float(v)
+            records.append(rec)
+        return records
+
+    if st.button("▶ KOSPI·KOSDAQ 시장필터 데이터 받기", type="primary", use_container_width=True, key="kr_market_filter_build"):
+        with st.spinner("KS11·KQ11 데이터를 받는 중입니다..."):
+            try:
+                ks11 = fdr.DataReader("KS11", "2015-01-01", "2023-12-31")
+                kq11 = fdr.DataReader("KQ11", "2015-01-01", "2023-12-31")
+                payload = {
+                    "format": "kr_market_filter_portable_v1",
+                    "development_period": "2016-2023",
+                    "warmup_start": "2015-01-01",
+                    "blind_period": "2024-2026",
+                    "indices": {
+                        "KS11": _kr_market_portable_frame(ks11),
+                        "KQ11": _kr_market_portable_frame(kq11),
+                    },
+                }
+                KR_MARKET_FILTER_FILE.write_bytes(
+                    gzip.compress(pickle.dumps(payload, protocol=4), compresslevel=3)
+                )
+                st.success(
+                    f"시장필터 데이터 구축 완료 · KOSPI {len(payload['indices']['KS11']):,}일 / "
+                    f"KOSDAQ {len(payload['indices']['KQ11']):,}일"
+                )
+            except Exception as e:
+                st.error(f"시장필터 데이터 구축 실패: {type(e).__name__}: {e}")
+
+    if KR_MARKET_FILTER_FILE.exists():
+        st.download_button(
+            "📥 시장필터 데이터 내려받기 (이 파일을 보내주세요)",
+            data=KR_MARKET_FILTER_FILE.read_bytes(),
+            file_name="kr_market_filter_2015_2023.pkl.gz",
+            mime="application/gzip",
+            use_container_width=True,
+            key="kr_market_filter_download",
+        )
+        st.caption("이 파일을 보내주면 기존 후보 A OHLC와 결합해 시장필터 없음/진입차단/비중축소를 비교할 수 있습니다.")
+
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
