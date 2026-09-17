@@ -497,6 +497,209 @@ if page == "🇰🇷 대장주 낙폭반등":
         )
         st.caption("이 파일을 보내주면 기존 후보 A OHLC와 결합해 시장필터 없음/진입차단/비중축소를 비교할 수 있습니다.")
 
+
+    # ------------------------------------------------------------
+    # ⑤ 2024~2026 블라인드 구축
+    # 개발구간에서 잠근 후보 A 규칙을 변경하지 않고 2024-01-01 이후에 적용합니다.
+    # 2023년 데이터는 2024년 초 신호 계산을 위한 워밍업으로만 사용합니다.
+    # ------------------------------------------------------------
+    st.subheader("⑤ 2024~2026 블라인드 구축")
+    st.warning("🔓 블라인드 검증 전용입니다. 후보 A 규칙은 고정: Leader Score 6~7 · 낙폭 -50~-55% · 저항여력 50% 이상")
+
+    KR_BLIND_CKPT = Path("kr_leader_blind_2024_2026_checkpoint.pkl.gz")
+    KR_BLIND_PORTABLE = Path("kr_leader_blind_2024_2026_portable.pkl.gz")
+    KR_BLIND_DATA_START = "2023-01-01"
+    KR_BLIND_START = pd.Timestamp("2024-01-01")
+    KR_BLIND_END_STR = datetime.now().strftime("%Y-%m-%d")
+    KR_BLIND_END = pd.Timestamp(KR_BLIND_END_STR)
+
+    def _kr_blind_price(code):
+        d = fdr.DataReader(str(code), KR_BLIND_DATA_START, KR_BLIND_END_STR)
+        if d is None or d.empty:
+            return pd.DataFrame()
+        d = d.copy()
+        d.index = pd.to_datetime(d.index).tz_localize(None)
+        need = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in need):
+            return pd.DataFrame()
+        for c in need:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        return d.dropna(subset=need).sort_index()
+
+    def _kr_blind_scan_candidate_a(code, name, source, d):
+        """기존 _kr_scan의 신호 생성/15일 중복제거를 그대로 적용한 뒤 후보 A만 반환."""
+        if len(d) < 121:
+            return []
+        x = _kr_leader_events(d)
+        rows, last = [], None
+        for i in range(120, len(x) - 1):
+            dt = x.index[i]
+            if dt < KR_BLIND_START or dt > KR_BLIND_END:
+                continue
+            hist = x.iloc[max(0, i - 120):i + 1]
+            leaders = hist[hist.LeaderScore >= 6]
+            if leaders.empty:
+                continue
+            lead_dt = leaders.LeaderScore.idxmax()
+            after = x.loc[lead_dt:dt]
+            peak = float(after.High.max())
+            close = float(x.Close.iloc[i])
+            dd = close / peak - 1 if peak > 0 else np.nan
+            if not np.isfinite(dd) or not (-.65 <= dd <= -.25):
+                continue
+            # 개발구간과 동일: broad signal 기준 15 calendar-day 중복 제거
+            if last is not None and (dt - last).days < 15:
+                continue
+            entry = float(x.Open.iloc[i + 1])
+            if entry <= 0:
+                continue
+            resistance = float(x.High.iloc[max(0, i - 60):i + 1].max())
+            leader_score = float(leaders.LeaderScore.max())
+            upside = resistance / entry - 1
+            # broad signal은 여기서 확정되므로 후보 A 여부와 무관하게 last 갱신
+            last = dt
+            # 잠근 후보 A: Score 6~7, DD -55~-50%, 저항여력 >=50%
+            if not (6 <= leader_score < 8 and -.55 <= dd <= -.50 and upside >= .50):
+                continue
+            def rr(n):
+                return float(x.Close.iloc[i + n] / entry - 1) if i + n < len(x) else np.nan
+            rows.append({
+                "Code": str(code), "Name": str(name), "Source": str(source),
+                "SignalDate": dt, "LeaderScore": leader_score, "Drawdown": dd,
+                "Entry": entry, "Resistance": resistance, "UpsideToResistance": upside,
+                "R5": rr(5), "R10": rr(10), "R20": rr(20),
+            })
+        return rows
+
+    def _kr_blind_window(d, signal_dates):
+        if d is None or d.empty:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        parts = []
+        for sd in pd.to_datetime(list(signal_dates)):
+            pos = int(d.index.searchsorted(sd, side="left"))
+            lo = max(0, pos - 2)
+            hi = min(len(d), pos + 62)  # 신호일 전 2행 + 이후 최대 60여 거래일
+            w = d.iloc[lo:hi][["Open", "High", "Low", "Close", "Volume"]]
+            if not w.empty:
+                parts.append(w)
+        if not parts:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        return pd.concat(parts).sort_index().loc[lambda q: ~q.index.duplicated(keep="first")]
+
+    def _kr_blind_portable_bytes(ckpt):
+        portable_ohlc = {}
+        for code, frame in (ckpt.get("ohlc", {}) or {}).items():
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            records = []
+            for dt, rr in frame.iterrows():
+                records.append({
+                    "Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                    "Open": float(rr["Open"]), "High": float(rr["High"]),
+                    "Low": float(rr["Low"]), "Close": float(rr["Close"]),
+                    "Volume": float(rr["Volume"]),
+                })
+            portable_ohlc[str(code)] = records
+        portable_signals = []
+        for r in (ckpt.get("rows", []) or []):
+            q = dict(r)
+            q["SignalDate"] = pd.Timestamp(q["SignalDate"]).strftime("%Y-%m-%d")
+            for k in ["LeaderScore", "Drawdown", "Entry", "Resistance", "UpsideToResistance", "R5", "R10", "R20"]:
+                if k in q:
+                    v = q[k]
+                    q[k] = None if pd.isna(v) else float(v)
+            portable_signals.append(q)
+        payload = {
+            "format": "kr_leader_blind_portable_v1",
+            "rule_locked": "LeaderScore 6~7; Drawdown -55~-50%; UpsideToResistance >=50%",
+            "blind_period": f"2024-01-01~{KR_BLIND_END_STR}",
+            "warmup_start": KR_BLIND_DATA_START,
+            "include_delisted": bool(ckpt.get("include_delisted", True)),
+            "processed_count": len(ckpt.get("done", {}) or {}),
+            "signals": portable_signals,
+            "ohlc": portable_ohlc,
+        }
+        return gzip.compress(pickle.dumps(payload, protocol=4), compresslevel=3)
+
+    blind_include_delisted = st.checkbox("블라인드: 상장폐지 종목 포함", value=True, key="kr_blind_delisted")
+    blind_batch = st.select_slider("블라인드 한 번에 처리할 종목 수", options=[50, 100, 200, 300, 400, 500], value=300, key="kr_blind_batch")
+
+    blind_restore = st.file_uploader("블라인드 체크포인트가 있으면 복원", type=["gz"], key="kr_blind_restore")
+    if blind_restore is not None and st.button("블라인드 체크포인트 복원", use_container_width=True, key="kr_blind_restore_btn"):
+        KR_BLIND_CKPT.write_bytes(blind_restore.getvalue())
+        st.success("블라인드 체크포인트를 복원했습니다.")
+        st.rerun()
+
+    try:
+        blind_u = _kr_universe(blind_include_delisted)
+    except Exception as e:
+        blind_u = pd.DataFrame(columns=["Code", "Name", "Source"])
+        st.error(f"블라인드 종목 목록을 불러오지 못했습니다: {e}")
+
+    blind_ck = _kr_load(KR_BLIND_CKPT, {"done": {}, "rows": [], "ohlc": {}, "include_delisted": blind_include_delisted})
+    blind_done = blind_ck.get("done", {}) if isinstance(blind_ck, dict) else {}
+    blind_rows = blind_ck.get("rows", []) if isinstance(blind_ck, dict) else []
+    blind_ohlc = blind_ck.get("ohlc", {}) if isinstance(blind_ck, dict) else {}
+    if blind_ck.get("include_delisted") != blind_include_delisted and blind_done:
+        st.warning("복원한 블라인드 체크포인트와 '상장폐지 포함' 설정이 다릅니다. 원래 설정으로 맞춰주세요.")
+
+    blind_total = len(blind_u)
+    blind_processed = len(blind_done)
+    b1, b2, b3 = st.columns(3)
+    b1.metric("블라인드 전체 종목", f"{blind_total:,}")
+    b2.metric("처리 완료", f"{blind_processed:,}")
+    b3.metric("후보 A 신호", f"{len(blind_rows):,}")
+    if blind_total:
+        st.progress(min(blind_processed / blind_total, 1.0), text=f"블라인드 {blind_processed:,} / {blind_total:,} ({blind_processed/blind_total:.1%})")
+
+    if st.button(f"▶ 블라인드 다음 {blind_batch}종목 구축", type="primary", use_container_width=True,
+                 disabled=(not blind_total or blind_processed >= blind_total), key="kr_blind_build"):
+        pending = blind_u[~blind_u.Code.astype(str).isin(blind_done)].head(blind_batch)
+        bbar = st.progress(0.0, text="블라인드 구축 시작")
+        bstatus = st.empty()
+        bt0 = time.time()
+        for j, (_, r) in enumerate(pending.iterrows(), 1):
+            code = str(r.Code)
+            try:
+                d = _kr_blind_price(code)
+                add = _kr_blind_scan_candidate_a(code, str(r.Name), str(r.Source), d) if not d.empty else []
+                blind_rows.extend(add)
+                if add:
+                    blind_ohlc[code] = _kr_blind_window(d, [q["SignalDate"] for q in add])
+                blind_done[code] = len(add)
+            except Exception as e:
+                blind_done[code] = f"ERR:{type(e).__name__}"
+            if j % 10 == 0 or j == len(pending):
+                _kr_save(KR_BLIND_CKPT, {
+                    "done": blind_done, "rows": blind_rows, "ohlc": blind_ohlc,
+                    "include_delisted": blind_include_delisted,
+                    "rule_locked": "A_v1", "blind_start": "2024-01-01", "blind_end": KR_BLIND_END_STR,
+                })
+            elapsed = time.time() - bt0
+            rate = j / elapsed if elapsed else 0
+            eta = (len(pending) - j) / rate if rate else 0
+            bbar.progress(j / max(len(pending), 1), text=f"이번 묶음 {j}/{len(pending)}")
+            bstatus.caption(f"현재 {r.Name} ({code}) · {rate:.2f}종목/초 · 이번 묶음 남은시간 약 {eta/60:.1f}분")
+        st.success("이번 블라인드 묶음 구축이 끝났습니다.")
+        st.rerun()
+
+    if KR_BLIND_CKPT.exists():
+        st.download_button("💾 블라인드 체크포인트 내려받기", data=KR_BLIND_CKPT.read_bytes(),
+                           file_name="kr_leader_blind_2024_2026_checkpoint.pkl.gz", mime="application/gzip",
+                           use_container_width=True, key="kr_blind_ckpt_download")
+        try:
+            blind_ck_now = _kr_load(KR_BLIND_CKPT, blind_ck)
+            blind_portable = _kr_blind_portable_bytes(blind_ck_now)
+            st.download_button("📦 블라인드 분석용 파일 내려받기 (완료 후 이 파일을 보내주세요)",
+                               data=blind_portable, file_name="kr_leader_blind_2024_2026_portable.pkl.gz",
+                               mime="application/gzip", use_container_width=True, key="kr_blind_portable_download")
+        except Exception as e:
+            st.error(f"블라인드 분석용 파일 변환 실패: {e}")
+
+    if blind_total and blind_processed >= blind_total:
+        st.success(f"🎯 블라인드 전체시장 구축 완료 · 후보 A {len(blind_rows):,}신호. 분석용 파일을 내려받아 보내주세요.")
+    st.caption("중간에 Streamlit이 재부팅될 수 있으므로 각 묶음 뒤 체크포인트를 내려받아 보관하세요. 완료 전 분석용 파일은 부분 데이터입니다.")
+
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
