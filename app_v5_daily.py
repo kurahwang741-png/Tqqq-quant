@@ -11,7 +11,6 @@ import pickle
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from pathlib import Path
 
@@ -236,8 +235,38 @@ with tab_rebound:
     rb_peak_days=c2.selectbox("대장 판별 기간",[40,60,90],index=1,key="rb2_peak")
     rb_min_score=c3.selectbox("최소 Leader Score",[4,5,6,7],index=1,key="rb2_score")
     rb_min_space=c4.selectbox("저항까지 최소 공간",[10,15,20,25],index=1,key="rb2_space")/100
-    rb_workers=st.select_slider("⚡ 동시 데이터 처리", options=[2,4,6,8,10], value=6, key="rb2_workers", help="첫 실행 속도를 높입니다. 너무 높이면 데이터 서버가 느려질 수 있어 기본 6을 권장합니다.")
-    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다. 시세는 24시간 캐시되며 재실행은 훨씬 빨라집니다.")
+    rb_batch=st.select_slider("⚡ 일괄 다운로드 묶음", options=[25,50,75,100], value=50, key="rb2_batch", help="종목별 500번 호출하지 않고 Yahoo Finance에서 여러 종목을 한 번에 받습니다. 기본 50을 권장합니다.")
+    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다. V2 FAST는 종목별 호출 대신 묶음 다운로드 후 메모리에서 계산합니다.")
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def krx_bulk_yf_v2(items, start="2015-01-01", end="2024-01-01"):
+        # items: ((Code, Market), ...) — 한 묶음을 단 한 번의 Yahoo 호출로 받는다.
+        ticker_map={}
+        for code,market in items:
+            code=str(code).zfill(6)
+            ticker_map[code + (".KS" if str(market)=="KOSPI" else ".KQ")]=code
+        tickers=list(ticker_map)
+        raw=yf.download(tickers, start=start, end=end, group_by="ticker", auto_adjust=False,
+                        actions=False, threads=True, progress=False, timeout=20)
+        out={}
+        if raw is None or raw.empty:
+            return out
+        for ticker,code in ticker_map.items():
+            try:
+                if isinstance(raw.columns,pd.MultiIndex):
+                    d=raw[ticker].copy()
+                else:
+                    d=raw.copy()
+                d=d.rename(columns={"Adj Close":"AdjClose"})
+                need=[c for c in ["Open","High","Low","Close","Volume"] if c in d.columns]
+                d=d[need].dropna(subset=["Open","High","Low","Close"],how="any")
+                if d.empty or "Volume" not in d: continue
+                d.index=pd.to_datetime(d.index).tz_localize(None)
+                d["Amount"]=d["Close"].astype(float)*d["Volume"].astype(float)
+                out[code]=d
+            except Exception:
+                pass
+        return out
 
     def leader_rebound_scan_v2(d, code, name, market, peak_days=60, min_score=5, min_space=.15):
         if d is None or len(d)<180: return []
@@ -349,30 +378,32 @@ with tab_rebound:
                 if m<60: return f"약 {m}분 {ss:02d}초"
                 h,m=divmod(m,60); return f"약 {h}시간 {m:02d}분"
 
-            # 데이터 다운로드가 병목이라 여러 종목을 동시에 처리한다.
-            # krx_one_v1은 st.cache_data이므로 한 번 받은 종목은 24시간 재사용된다.
-            def _work(row):
-                try:
-                    d=krx_one_v1(row.Code,"2015-01-01","2024-01-01")
-                    r=leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space))
-                    return row.Name, r, None
-                except Exception as e:
-                    return row.Name, [], str(e)
-
-            workers=min(int(rb_workers), n)
+            # V2 FAST: 500종목을 500번 호출하지 않는다.
+            # KOSPI/KOSDAQ 코드를 Yahoo ticker로 변환해 묶음으로 받고, 받은 뒤 로컬 계산만 수행한다.
+            batch_size=int(rb_batch)
             errors=0
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures=[ex.submit(_work,row) for row in rows]
-                for fut in as_completed(futures):
-                    name,r,err=fut.result(); recs.extend(r); done+=1
-                    if err: errors+=1
-                    if done==1 or done%5==0 or done==n:
-                        elapsed=time.perf_counter()-started
-                        sec_per=elapsed/max(done,1)
-                        # 병렬 처리에서는 완료 종목 기준 평균으로 ETA 계산
-                        remain=max(0,n-done)*sec_per
-                        bar.progress(done/n,text=f"{done:,}/{n:,} · {name} · 남은 시간 {_fmt(remain)}")
-                        eta_box.caption(f"⚡ {workers}개 동시 처리 · 경과 {_fmt(elapsed)} · 예상 남은 시간 {_fmt(remain)} · 신호 {len(recs):,}개")
+            batches=[rows[i:i+batch_size] for i in range(0,n,batch_size)]
+            for bi,batch in enumerate(batches,1):
+                items=tuple((str(r.Code),str(r.Market)) for r in batch)
+                try:
+                    bulk=krx_bulk_yf_v2(items,"2015-01-01","2024-01-01")
+                except Exception:
+                    bulk={}; errors+=len(batch)
+                for row in batch:
+                    try:
+                        d=bulk.get(str(row.Code).zfill(6))
+                        if d is None or d.empty:
+                            errors+=1
+                        else:
+                            recs.extend(leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space)))
+                    except Exception:
+                        errors+=1
+                    done+=1
+                elapsed=time.perf_counter()-started
+                # 첫 묶음 이후부터 ETA가 의미 있어진다. 묶음 단위 평균 속도로 계산한다.
+                remain=max(0,n-done)*(elapsed/max(done,1))
+                bar.progress(done/n,text=f"{done:,}/{n:,} · 묶음 {bi}/{len(batches)} 완료 · 남은 시간 {_fmt(remain)}")
+                eta_box.caption(f"⚡ {batch_size}종목 일괄 다운로드 · 경과 {_fmt(elapsed)} · 예상 남은 시간 {_fmt(remain)} · 신호 {len(recs):,}개")
 
             q=pd.DataFrame(recs); st.session_state["leader_rb_v2"]=q
             bar.progress(1.0,text=f"{n:,}/{n:,} 분석 완료")
