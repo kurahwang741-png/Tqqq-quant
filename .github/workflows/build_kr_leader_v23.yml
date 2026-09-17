@@ -26,13 +26,11 @@ jobs:
 
           python-version: '3.11'
 
-          cache: 'pip'
-
       - name: Install dependencies
 
         run: pip install pandas numpy finance-datareader
 
-      - name: Build full-market dataset
+      - name: Build dataset
 
         run: python build_kr_leader_v23.py
 
@@ -48,6 +46,6 @@ jobs:
 
           git diff --cached --quiet && exit 0
 
-          git commit -m "Build KR leader V2.3 dataset"
+          git commit -m "Build KR Leader V2.3 dataset"
 
           git push
