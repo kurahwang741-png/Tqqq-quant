@@ -29,63 +29,241 @@ page = st.sidebar.radio(
 )
 
 if page == "🇰🇷 대장주 낙폭반등":
-    st.title("🇰🇷 대장주 낙폭반등 V2.3 · 사전계산 데이터")
-    st.caption("전체시장 계산은 GitHub Actions에서 1회 수행 · Streamlit은 결과 파일만 읽어 즉시 분석 · 2016~2023 개발구간 전용")
-    st.info("🔒 2024~2026은 봉인합니다. 이 화면에서는 KRX 전 종목 장기 데이터를 다운로드하지 않습니다. SOXL과 완전히 분리되어 있습니다.")
+    st.title("🇰🇷 대장주 낙폭반등 V2.3 · 분할 구축")
+    st.caption("Streamlit에서 전 종목을 작은 묶음으로 구축 · 중간저장 후 이어받기 · 2016~2023 개발구간")
+    st.info("🔒 2024~2026은 봉인합니다. SOXL 코드는 이 메뉴에서 실행되지 않습니다.")
+
+    import FinanceDataReader as fdr
 
     KR_RESULT = Path("kr_leader_v23_signals.pkl.gz")
     KR_META = Path("kr_leader_v23_meta.json")
+    KR_CKPT = Path("kr_leader_v23_build_checkpoint.pkl.gz")
+    KR_START, KR_END = "2015-01-01", "2023-12-31"
 
-    def _load_v23_result():
+    def _kr_save(path, obj):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with gzip.open(tmp, "wb", compresslevel=3) as f:
+            pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+
+    def _kr_load(path, default):
         try:
-            if not KR_RESULT.exists():
-                return pd.DataFrame()
-            with gzip.open(KR_RESULT, "rb") as f:
-                obj = pickle.load(f)
-            return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame(obj)
-        except Exception as e:
-            st.warning(f"사전계산 결과를 읽지 못했습니다: {e}")
+            with gzip.open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return default
+
+    def _kr_normalize(d, source):
+        if d is None or d.empty:
+            return pd.DataFrame(columns=["Code", "Name", "Source"])
+        code = next((c for c in ["Code", "Symbol"] if c in d.columns), None)
+        name = next((c for c in ["Name", "Company"] if c in d.columns), None)
+        if not code or not name:
+            return pd.DataFrame(columns=["Code", "Name", "Source"])
+        return pd.DataFrame({
+            "Code": d[code].astype(str).str.zfill(6),
+            "Name": d[name].astype(str),
+            "Source": source,
+        }).drop_duplicates("Code")
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def _kr_universe(include_delisted=True):
+        frames = [_kr_normalize(fdr.StockListing("KRX"), "현재상장")]
+        if include_delisted:
+            try:
+                frames.append(_kr_normalize(fdr.StockListing("KRX-DELISTING"), "상장폐지"))
+            except Exception:
+                pass
+        u = pd.concat(frames, ignore_index=True).drop_duplicates("Code", keep="first")
+        return u[u.Code.str.fullmatch(r"\d{6}", na=False)].reset_index(drop=True)
+
+    def _kr_price(code):
+        d = fdr.DataReader(str(code), KR_START, KR_END)
+        if d is None or d.empty:
             return pd.DataFrame()
+        d = d.copy()
+        d.index = pd.to_datetime(d.index).tz_localize(None)
+        need = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in need):
+            return pd.DataFrame()
+        for c in need:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        return d.dropna(subset=need).sort_index()
 
-    def _bucket_summary(sig):
-        if sig.empty: return pd.DataFrame()
-        z=sig.copy()
-        z["낙폭구간"]=pd.cut(z["Drawdown"],bins=[-.651,-.50,-.40,-.35,-.30,-.25],labels=["-65~-50%","-50~-40%","-40~-35%","-35~-30%","-30~-25%"])
-        z["Leader구간"]=pd.cut(z["LeaderScore"],bins=[5.99,7.99,9.99,99],labels=["6~7","8~9","10+"])
-        out=[]
-        for (lb,dd),g in z.groupby(["Leader구간","낙폭구간"],observed=True):
-            r={"Leader Score":str(lb),"낙폭":str(dd),"신호수":len(g)}
-            for n in (5,10,20):
-                s=g[f"R{n}"].dropna(); r[f"{n}일 승률"]=(s>0).mean() if len(s) else np.nan; r[f"{n}일 평균"]=s.mean() if len(s) else np.nan; r[f"{n}일 중앙값"]=s.median() if len(s) else np.nan
+    def _kr_leader_events(d):
+        x = d.copy()
+        x["R20"] = x.Close.pct_change(20)
+        x["R40"] = x.Close.pct_change(40)
+        x["R60"] = x.Close.pct_change(60)
+        x["R1"] = x.Close.pct_change()
+        x["AmountProxy"] = x.Close * x.Volume
+        x["Amt20"] = x.AmountProxy.rolling(20).mean()
+        x["AmtRatio"] = x.AmountProxy / x.Amt20.replace(0, np.nan)
+        x["BigUp"] = (x.R1 >= .12).astype(int)
+        x["BigUp20"] = x.BigUp.rolling(20).sum()
+        x["LeaderScore"] = (
+            x.R20.ge(.25).astype(int) * 2
+            + x.R40.ge(.45).astype(int) * 2
+            + x.R60.ge(.70).astype(int) * 2
+            + x.AmountProxy.ge(50_000_000_000).astype(int)
+            + x.AmountProxy.ge(150_000_000_000).astype(int)
+            + x.AmtRatio.ge(2).astype(int)
+            + x.BigUp20.ge(2).astype(int)
+        )
+        return x
+
+    def _kr_scan(code, name, source, d):
+        if len(d) < 180:
+            return []
+        x = _kr_leader_events(d)
+        dev = x[(x.index.year >= 2016) & (x.index.year <= 2023)]
+        if dev.empty or float(dev.LeaderScore.max()) < 6:
+            return []
+        rows, last = [], None
+        for i in range(120, len(x) - 21):
+            dt = x.index[i]
+            if not 2016 <= dt.year <= 2023:
+                continue
+            hist = x.iloc[max(0, i - 120):i + 1]
+            leaders = hist[hist.LeaderScore >= 6]
+            if leaders.empty:
+                continue
+            lead_dt = leaders.LeaderScore.idxmax()
+            after = x.loc[lead_dt:dt]
+            peak = float(after.High.max())
+            close = float(x.Close.iloc[i])
+            dd = close / peak - 1 if peak > 0 else np.nan
+            if not np.isfinite(dd) or not (-.65 <= dd <= -.25):
+                continue
+            if last is not None and (dt - last).days < 15:
+                continue
+            entry = float(x.Open.iloc[i + 1])
+            if entry <= 0:
+                continue
+            resistance = float(x.High.iloc[max(0, i - 60):i + 1].max())
+            def rr(n):
+                return float(x.Close.iloc[i + n] / entry - 1) if i + n < len(x) else np.nan
+            rows.append({
+                "Code": code, "Name": name, "Source": source, "SignalDate": dt,
+                "LeaderScore": float(leaders.LeaderScore.max()), "Drawdown": dd,
+                "Entry": entry, "Resistance": resistance,
+                "UpsideToResistance": resistance / entry - 1,
+                "R5": rr(5), "R10": rr(10), "R20": rr(20),
+            })
+            last = dt
+        return rows
+
+    def _kr_bucket_summary(sig):
+        if sig.empty:
+            return pd.DataFrame()
+        z = sig.copy()
+        z["낙폭구간"] = pd.cut(z["Drawdown"], bins=[-.651, -.50, -.40, -.35, -.30, -.25], labels=["-65~-50%", "-50~-40%", "-40~-35%", "-35~-30%", "-30~-25%"])
+        z["Leader구간"] = pd.cut(z["LeaderScore"], bins=[5.99, 7.99, 9.99, 99], labels=["6~7", "8~9", "10+"])
+        out = []
+        for (lb, dd), g in z.groupby(["Leader구간", "낙폭구간"], observed=True):
+            r = {"Leader Score": str(lb), "낙폭": str(dd), "신호수": len(g)}
+            for n in (5, 10, 20):
+                ss = g[f"R{n}"].dropna()
+                r[f"{n}일 승률"] = (ss > 0).mean() if len(ss) else np.nan
+                r[f"{n}일 평균"] = ss.mean() if len(ss) else np.nan
+                r[f"{n}일 중앙값"] = ss.median() if len(ss) else np.nan
             out.append(r)
-        return pd.DataFrame(out).sort_values(["Leader Score","낙폭"])
+        return pd.DataFrame(out).sort_values(["Leader Score", "낙폭"])
 
-    sig = _load_v23_result()
-    if sig.empty:
-        st.warning("아직 `kr_leader_v23_signals.pkl.gz`가 없습니다. GitHub에서 `Build KR Leader V2.3 Dataset` Action을 한 번 실행하면 결과가 저장됩니다.")
-        st.markdown("**처음 한 번만:** GitHub → Actions → `Build KR Leader V2.3 Dataset` → `Run workflow`. 완료되면 이 앱은 전 종목을 다시 다운로드하지 않습니다.")
+    st.subheader("① 구축 상태")
+    include_delisted = st.checkbox("상장폐지 종목 포함", value=True, key="kr_v23_delisted")
+    batch_size = st.select_slider("한 번에 처리할 종목 수", options=[50, 100, 200, 300, 400, 500], value=300)
+
+    restore = st.file_uploader("이전에 내려받은 체크포인트가 있으면 여기서 복원", type=["gz"], key="kr_ckpt_restore")
+    if restore is not None and st.button("체크포인트 복원", use_container_width=True):
+        KR_CKPT.write_bytes(restore.getvalue())
+        st.success("체크포인트를 복원했습니다.")
+        st.rerun()
+
+    try:
+        u = _kr_universe(include_delisted)
+    except Exception as e:
+        u = pd.DataFrame(columns=["Code", "Name", "Source"])
+        st.error(f"종목 목록을 불러오지 못했습니다: {e}")
+
+    ck = _kr_load(KR_CKPT, {"done": {}, "rows": [], "include_delisted": include_delisted})
+    if ck.get("include_delisted") != include_delisted and ck.get("done"):
+        st.warning("현재 체크포인트의 '상장폐지 포함' 설정이 다릅니다. 기존 구축을 계속하려면 체크박스를 원래 설정으로 맞춰주세요.")
+    done = ck.get("done", {})
+    rows = ck.get("rows", [])
+    total = len(u)
+    processed = len(done)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("전체 종목", f"{total:,}")
+    c2.metric("구축 완료", f"{processed:,}")
+    c3.metric("누적 신호", f"{len(rows):,}")
+    if total:
+        st.progress(min(processed / total, 1.0), text=f"{processed:,} / {total:,} ({processed/total:.1%})")
+
+    if st.button(f"▶ 다음 {batch_size}종목 구축", type="primary", use_container_width=True, disabled=(not total or processed >= total)):
+        pending = u[~u.Code.astype(str).isin(done)].head(batch_size)
+        bar = st.progress(0.0, text="분할 구축 시작")
+        status = st.empty()
+        t0 = time.time()
+        for k, (_, r) in enumerate(pending.iterrows(), 1):
+            code = str(r.Code)
+            try:
+                d = _kr_price(code)
+                add = _kr_scan(code, str(r.Name), str(r.Source), d) if not d.empty else []
+                rows.extend(add)
+                done[code] = len(add)
+            except Exception as e:
+                done[code] = f"ERR:{type(e).__name__}"
+            if k % 10 == 0 or k == len(pending):
+                _kr_save(KR_CKPT, {"done": done, "rows": rows, "include_delisted": include_delisted})
+            elapsed = time.time() - t0
+            rate = k / elapsed if elapsed else 0
+            eta = (len(pending) - k) / rate if rate else 0
+            bar.progress(k / max(len(pending), 1), text=f"이번 묶음 {k}/{len(pending)}")
+            status.caption(f"현재: {r.Name} ({code}) · {rate:.2f}종목/초 · 이번 묶음 남은시간 약 {eta/60:.1f}분")
+        _kr_save(KR_CKPT, {"done": done, "rows": rows, "include_delisted": include_delisted})
+        if len(done) >= total:
+            sig_done = pd.DataFrame(rows)
+            _kr_save(KR_RESULT, sig_done)
+            KR_META.write_text(json.dumps({"built_at": datetime.now(timezone.utc).isoformat(), "universe_count": total, "signal_count": len(sig_done), "development_period": "2016-2023", "blind_period": "2024-2026"}, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.success("전체시장 구축 완료. 결과 파일을 생성했습니다.")
+        else:
+            st.success(f"이번 묶음 완료. 누적 {len(done):,}/{total:,}종목입니다. 다음 묶음을 이어서 실행하면 됩니다.")
+        st.rerun()
+
+    if KR_CKPT.exists():
+        st.download_button("💾 체크포인트 내려받기", data=KR_CKPT.read_bytes(), file_name="kr_leader_v23_build_checkpoint.pkl.gz", mime="application/gzip", use_container_width=True)
+    if st.button("구축 초기화", use_container_width=True):
+        for fp in (KR_CKPT, KR_RESULT, KR_META):
+            try:
+                fp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        st.rerun()
+
+    st.caption("Streamlit Cloud의 로컬 파일은 재부팅/재배포 시 사라질 수 있습니다. 묶음 작업 후 체크포인트를 내려받아 두면 다음에 복원할 수 있습니다.")
+
+    st.subheader("② 현재까지 결과")
+    if KR_RESULT.exists():
+        sig = _kr_load(KR_RESULT, pd.DataFrame())
     else:
-        meta={}
-        try:
-            if KR_META.exists(): meta=json.loads(KR_META.read_text(encoding="utf-8"))
-        except Exception: pass
-        c1,c2,c3=st.columns(3)
-        c1.metric("전체 신호",f"{len(sig):,}")
-        c2.metric("분석 종목",f"{int(meta.get('universe_count',0)):,}" if meta.get('universe_count') else "전체시장")
-        c3.metric("블라인드","2024–2026 🔒")
-        if meta.get("built_at"): st.caption(f"사전계산 완료: {meta['built_at']} · Streamlit에서는 저장 결과만 분석합니다.")
-
-        st.subheader("📊 Leader Score × 낙폭구간")
-        bs=_bucket_summary(sig); pct=[c for c in bs.columns if "승률" in c or "평균" in c or "중앙값" in c]
-        st.dataframe(bs.style.format({c:"{:.2%}" for c in pct},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("W/Higher Low·추세전환은 필수조건에서 제외하고, 먼저 전체시장에서 대장 강도와 낙폭 자체의 엣지를 검증합니다.")
-        st.subheader("🔎 신호 사례")
-        show=sig.sort_values(["SignalDate","LeaderScore"],ascending=[False,False]).head(300).copy()
-        cols=["SignalDate","Code","Name","Source","LeaderScore","Drawdown","Entry","Resistance","UpsideToResistance","R5","R10","R20"]
-        show=show[[c for c in cols if c in show.columns]]
-        for c in ["Drawdown","UpsideToResistance","R5","R10","R20"]:
-            if c in show: show[c]=show[c]*100
-        st.dataframe(show.style.format({"Drawdown":"{:.1f}%","UpsideToResistance":"{:.1f}%","R5":"{:.1f}%","R10":"{:.1f}%","R20":"{:.1f}%","Entry":"{:,.0f}","Resistance":"{:,.0f}"},na_rep="-"),use_container_width=True,hide_index=True)
+        sig = pd.DataFrame(rows)
+    if sig.empty:
+        st.info("아직 신호가 없습니다. 위의 구축 버튼으로 첫 묶음을 실행하세요.")
+    else:
+        bs = _kr_bucket_summary(sig)
+        pct = [c for c in bs.columns if "승률" in c or "평균" in c or "중앙값" in c]
+        st.dataframe(bs.style.format({c: "{:.2%}" for c in pct}, na_rep="-"), use_container_width=True, hide_index=True)
+        st.caption("완료 전에는 '현재까지 처리된 종목'의 중간 결과입니다. 전체 구축 완료 후 최종 판단합니다.")
+        show = sig.sort_values(["SignalDate", "LeaderScore"], ascending=[False, False]).head(300).copy()
+        cols = ["SignalDate", "Code", "Name", "Source", "LeaderScore", "Drawdown", "Entry", "Resistance", "UpsideToResistance", "R5", "R10", "R20"]
+        show = show[[c for c in cols if c in show.columns]]
+        for c in ["Drawdown", "UpsideToResistance", "R5", "R10", "R20"]:
+            if c in show:
+                show[c] = show[c] * 100
+        st.dataframe(show.style.format({"Drawdown": "{:.1f}%", "UpsideToResistance": "{:.1f}%", "R5": "{:.1f}%", "R10": "{:.1f}%", "R20": "{:.1f}%", "Entry": "{:,.0f}", "Resistance": "{:,.0f}"}, na_rep="-"), use_container_width=True, hide_index=True)
+        out_bytes = gzip.compress(pickle.dumps(sig, pickle.HIGHEST_PROTOCOL), compresslevel=3)
+        st.download_button("📥 현재 신호 데이터 내려받기", data=out_bytes, file_name="kr_leader_v23_signals.pkl.gz", mime="application/gzip", use_container_width=True)
 
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
