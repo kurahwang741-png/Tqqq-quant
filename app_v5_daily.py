@@ -29,115 +29,23 @@ page = st.sidebar.radio(
 )
 
 if page == "🇰🇷 대장주 낙폭반등":
-    st.title("🇰🇷 대장주 낙폭반등 V2.2 · 전 종목 FAST")
-    st.caption("전 종목 유지 · 제한 병렬수집 → 과거 대장 후보만 정밀분석 → 체크포인트 저장 · 2016~2023 개발구간 전용")
-    st.info("🔒 2024~2026은 봉인합니다. 실행 버튼을 누르기 전에는 KRX/과거가격을 조회하지 않습니다. SOXL 메뉴와 완전히 분리되어 있습니다.")
+    st.title("🇰🇷 대장주 낙폭반등 V2.3 · 사전계산 데이터")
+    st.caption("전체시장 계산은 GitHub Actions에서 1회 수행 · Streamlit은 결과 파일만 읽어 즉시 분석 · 2016~2023 개발구간 전용")
+    st.info("🔒 2024~2026은 봉인합니다. 이 화면에서는 KRX 전 종목 장기 데이터를 다운로드하지 않습니다. SOXL과 완전히 분리되어 있습니다.")
 
-    KR_CKPT = Path(".kr_leader_v22_checkpoint.pkl.gz")
-    KR_RESULT = Path("kr_leader_v22_signals.pkl.gz")
+    KR_RESULT = Path("kr_leader_v23_signals.pkl.gz")
+    KR_META = Path("kr_leader_v23_meta.json")
 
-    def _kr_fdr():
+    def _load_v23_result():
         try:
-            import FinanceDataReader as fdr
-            return fdr
+            if not KR_RESULT.exists():
+                return pd.DataFrame()
+            with gzip.open(KR_RESULT, "rb") as f:
+                obj = pickle.load(f)
+            return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame(obj)
         except Exception as e:
-            raise RuntimeError("FinanceDataReader가 필요합니다. requirements.txt에 finance-datareader를 확인하세요.") from e
-
-    def _normalize_listing(d, source):
-        if d is None or d.empty:
-            return pd.DataFrame(columns=["Code","Name","Source"])
-        d=d.copy()
-        code_col=next((c for c in ["Code","Symbol"] if c in d.columns),None)
-        name_col=next((c for c in ["Name","Company"] if c in d.columns),None)
-        if code_col is None or name_col is None:
-            return pd.DataFrame(columns=["Code","Name","Source"])
-        out=pd.DataFrame({"Code":d[code_col].astype(str).str.zfill(6),"Name":d[name_col].astype(str),"Source":source})
-        return out.dropna().drop_duplicates("Code")
-
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def _kr_full_universe(include_delisted=True):
-        fdr=_kr_fdr()
-        cur=_normalize_listing(fdr.StockListing("KRX"),"현재상장")
-        frames=[cur]
-        if include_delisted:
-            try:
-                de=_normalize_listing(fdr.StockListing("KRX-DELISTING"),"상장폐지")
-                frames.append(de)
-            except Exception:
-                pass
-        u=pd.concat(frames,ignore_index=True).drop_duplicates("Code",keep="first")
-        u=u[u["Code"].str.fullmatch(r"\d{6}",na=False)].reset_index(drop=True)
-        return u
-
-    def _kr_price(code):
-        fdr=_kr_fdr()
-        d=fdr.DataReader(str(code),"2015-01-01","2023-12-31")
-        if d is None or d.empty: return pd.DataFrame()
-        d=d.copy(); d.index=pd.to_datetime(d.index).tz_localize(None)
-        need=["Open","High","Low","Close","Volume"]
-        if any(c not in d.columns for c in need): return pd.DataFrame()
-        for c in need: d[c]=pd.to_numeric(d[c],errors="coerce")
-        return d.dropna(subset=need).sort_index()
-
-    def _leader_events(d):
-        x=d.copy()
-        x["R20"]=x["Close"].pct_change(20); x["R40"]=x["Close"].pct_change(40); x["R60"]=x["Close"].pct_change(60)
-        x["R1"]=x["Close"].pct_change(); x["AmountProxy"]=x["Close"]*x["Volume"]
-        x["Amt20"]=x["AmountProxy"].rolling(20).mean(); x["AmtRatio"]=x["AmountProxy"]/x["Amt20"].replace(0,np.nan)
-        x["BigUp"]=(x["R1"]>=.12).astype(int); x["BigUp20"]=x["BigUp"].rolling(20).sum()
-        x["LeaderScore"]=(
-            (x["R20"]>=.25).astype(int)*2+(x["R40"]>=.45).astype(int)*2+(x["R60"]>=.70).astype(int)*2+
-            (x["AmountProxy"]>=50_000_000_000).astype(int)+(x["AmountProxy"]>=150_000_000_000).astype(int)+
-            (x["AmtRatio"]>=2).astype(int)+(x["BigUp20"]>=2).astype(int))
-        return x
-
-    def _is_leader_candidate(d):
-        if len(d)<180: return False,0
-        x=_leader_events(d)
-        dev=x[(x.index.year>=2016)&(x.index.year<=2023)]
-        if dev.empty: return False,0
-        mx=float(dev["LeaderScore"].max())
-        return bool(mx>=6),mx
-
-    def _scan_one(code,name,d,source="현재상장"):
-        if len(d)<180: return []
-        x=_leader_events(d); rows=[]; last_signal=None
-        for i in range(120,len(x)-21):
-            dt=x.index[i]
-            if dt.year<2016 or dt.year>2023: continue
-            hist=x.iloc[max(0,i-120):i+1]; leaders=hist[hist["LeaderScore"]>=6]
-            if leaders.empty: continue
-            lead_dt=leaders["LeaderScore"].idxmax(); after=x.loc[lead_dt:dt]
-            if after.empty: continue
-            peak=float(after["High"].max()); close=float(x["Close"].iloc[i]); dd=close/peak-1 if peak>0 else np.nan
-            if not np.isfinite(dd) or not (-.65<=dd<=-.25): continue
-            w=x.iloc[max(0,i-35):i+1]
-            if len(w)<25: continue
-            split=max(10,len(w)//2); low1=float(w["Low"].iloc[:split].min()); low2=float(w["Low"].iloc[split:].min())
-            w_ok=(low2>=low1*.97) and (low2<=low1*1.18)
-            prev10=float(x["High"].iloc[max(0,i-10):i].max()); ma20=float(x["Close"].iloc[max(0,i-19):i+1].mean())
-            trend_ok=(close>prev10) or (close>=ma20 and float(x["Close"].iloc[i-1])<float(x["Close"].iloc[max(0,i-20):i].mean()))
-            vol20=float(x["Volume"].iloc[max(0,i-20):i].mean()); vol_ok=vol20>0 and float(x["Volume"].iloc[i])>=vol20*1.3
-            if last_signal is not None and (dt-last_signal).days<15: continue
-            entry=float(x["Open"].iloc[i+1]);
-            if entry<=0: continue
-            resistance=float(x["High"].iloc[max(0,i-60):i+1].max()); upside=resistance/entry-1
-            def rr(n): return float(x["Close"].iloc[i+n]/entry-1) if i+n<len(x) else np.nan
-            rows.append({"Code":code,"Name":name,"Source":source,"SignalDate":dt,"LeaderScore":float(leaders["LeaderScore"].max()),
-                         "Drawdown":dd,"W_HL":bool(w_ok),"Trend":bool(trend_ok),"VolumeConfirm":bool(vol_ok),"Entry":entry,
-                         "Resistance":resistance,"UpsideToResistance":upside,"R5":rr(5),"R10":rr(10),"R20":rr(20)})
-            last_signal=dt
-        return rows
-
-    def _save_gz(path,obj):
-        tmp=path.with_suffix(path.suffix+".tmp")
-        with gzip.open(tmp,"wb",compresslevel=3) as f: pickle.dump(obj,f,pickle.HIGHEST_PROTOCOL)
-        tmp.replace(path)
-
-    def _load_gz(path,default=None):
-        try:
-            with gzip.open(path,"rb") as f: return pickle.load(f)
-        except Exception: return default
+            st.warning(f"사전계산 결과를 읽지 못했습니다: {e}")
+            return pd.DataFrame()
 
     def _bucket_summary(sig):
         if sig.empty: return pd.DataFrame()
@@ -152,66 +60,25 @@ if page == "🇰🇷 대장주 낙폭반등":
             out.append(r)
         return pd.DataFrame(out).sort_values(["Leader Score","낙폭"])
 
-    c1,c2,c3=st.columns(3)
-    include_delisted=c1.checkbox("상장폐지 종목 포함",value=True,key="v22_delisted")
-    c2.metric("개발구간","2016–2023")
-    c3.metric("블라인드","2024–2026 🔒")
-    workers=st.select_slider("동시 조회 수",options=[1,2,3,4],value=3,key="v22_workers",help="Streamlit/FDR 과부하를 피하려고 최대 4개로 제한합니다. 3개 권장.")
-    st.caption("전체시장 표본은 그대로 유지합니다. V2.2는 여러 종목의 가격 수집만 제한적으로 병렬화하고, 각 종목 내부 계산은 동일합니다. 완료 종목은 체크포인트에 저장되어 다시 받지 않습니다.")
-
-    def _fetch_analyze(item):
-        code,name,source=item
-        try:
-            d=_kr_price(code)
-            if d.empty: return code,name,"데이터없음",0,[]
-            ok,mx=_is_leader_candidate(d)
-            if not ok: return code,name,f"1차탈락(score {mx:.0f})",0,[]
-            rows=_scan_one(code,name,d,source)
-            return code,name,f"대장후보(score {mx:.0f})",1,rows
-        except Exception:
-            return code,name,"조회실패",0,[]
-
-    if st.button("🚀 전 종목 V2.2 FAST 구축/이어받기",type="primary",use_container_width=True,key="run_leader_v22"):
-        try:
-            u=_kr_full_universe(include_delisted)
-            ck=_load_gz(KR_CKPT,{"done":{},"rows":[],"candidates":0})
-            done=ck.get("done",{}); all_rows=ck.get("rows",[]); candidates=int(ck.get("candidates",0))
-            total=len(u); started=time.time(); processed_now=0
-            todo=[(str(r.Code),str(r.Name),str(r.Source)) for _,r in u.iterrows() if str(r.Code) not in done]
-            bar=st.progress(len(done)/max(total,1),text=f"전체 {total:,}종목 · 남은 {len(todo):,}종목")
-            stat=st.empty()
-            with ThreadPoolExecutor(max_workers=int(workers)) as ex:
-                futures={ex.submit(_fetch_analyze,item):item for item in todo}
-                for fut in as_completed(futures):
-                    code,name,status,cand,rows=fut.result()
-                    candidates+=cand; all_rows.extend(rows); done[code]=status; processed_now+=1
-                    if processed_now%25==0:
-                        _save_gz(KR_CKPT,{"done":done,"rows":all_rows,"candidates":candidates})
-                    completed=len(done); elapsed=time.time()-started
-                    rate=processed_now/elapsed if elapsed>0 else 0; remain=max(total-completed,0); eta=remain/rate if rate>0 else 0
-                    bar.progress(min(completed/max(total,1),1.0),text=f"{completed:,}/{total:,} · {name} · {status}")
-                    stat.caption(f"동시조회 {workers} · 대장후보 {candidates:,}개 · 신호 {len(all_rows):,}개 · 처리속도 {rate:.2f}종목/초 · 예상 남은시간 {eta/60:.1f}분")
-            _save_gz(KR_CKPT,{"done":done,"rows":all_rows,"candidates":candidates})
-            sig=pd.DataFrame(all_rows); _save_gz(KR_RESULT,sig)
-            st.session_state["leader_v22_signals"]=sig
-            bar.empty(); stat.success(f"완료 · 전체 {total:,}종목 / 대장후보 {candidates:,}개 / 신호 {len(sig):,}개")
-        except Exception as e: st.error(f"V2.2 실행 실패: {e}")
-
-    if st.button("📂 저장 결과 불러오기",use_container_width=True,key="load_leader_v22"):
-        sig=_load_gz(KR_RESULT,pd.DataFrame())
-        if isinstance(sig,pd.DataFrame) and not sig.empty: st.session_state["leader_v22_signals"]=sig
-        else: st.warning("저장된 완료 결과가 아직 없습니다.")
-
-    sig=st.session_state.get("leader_v22_signals")
-    if not isinstance(sig,pd.DataFrame) or sig.empty:
-        ck=_load_gz(KR_CKPT,None)
-        if isinstance(ck,dict) and ck.get("done"):
-            st.caption(f"💾 V2.2 체크포인트: {len(ck['done']):,}종목 완료 · 대장후보 {ck.get('candidates',0):,}개 · 신호 {len(ck.get('rows',[])):,}개")
+    sig = _load_v23_result()
+    if sig.empty:
+        st.warning("아직 `kr_leader_v23_signals.pkl.gz`가 없습니다. GitHub에서 `Build KR Leader V2.3 Dataset` Action을 한 번 실행하면 결과가 저장됩니다.")
+        st.markdown("**처음 한 번만:** GitHub → Actions → `Build KR Leader V2.3 Dataset` → `Run workflow`. 완료되면 이 앱은 전 종목을 다시 다운로드하지 않습니다.")
     else:
+        meta={}
+        try:
+            if KR_META.exists(): meta=json.loads(KR_META.read_text(encoding="utf-8"))
+        except Exception: pass
+        c1,c2,c3=st.columns(3)
+        c1.metric("전체 신호",f"{len(sig):,}")
+        c2.metric("분석 종목",f"{int(meta.get('universe_count',0)):,}" if meta.get('universe_count') else "전체시장")
+        c3.metric("블라인드","2024–2026 🔒")
+        if meta.get("built_at"): st.caption(f"사전계산 완료: {meta['built_at']} · Streamlit에서는 저장 결과만 분석합니다.")
+
         st.subheader("📊 Leader Score × 낙폭구간")
         bs=_bucket_summary(sig); pct=[c for c in bs.columns if "승률" in c or "평균" in c or "중앙값" in c]
         st.dataframe(bs.style.format({c:"{:.2%}" for c in pct},na_rep="-"),use_container_width=True,hide_index=True)
-        st.caption("V2에서 성과를 훼손했던 W/Higher Low·추세전환은 우선 필수조건에서 제외했습니다. 먼저 대장 강도와 낙폭 자체의 엣지를 전 종목에서 확인합니다.")
+        st.caption("W/Higher Low·추세전환은 필수조건에서 제외하고, 먼저 전체시장에서 대장 강도와 낙폭 자체의 엣지를 검증합니다.")
         st.subheader("🔎 신호 사례")
         show=sig.sort_values(["SignalDate","LeaderScore"],ascending=[False,False]).head(300).copy()
         cols=["SignalDate","Code","Name","Source","LeaderScore","Drawdown","Entry","Resistance","UpsideToResistance","R5","R10","R20"]
