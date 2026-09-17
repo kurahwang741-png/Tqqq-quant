@@ -333,14 +333,39 @@ with tab_rebound:
     if st.button("🪂 대장주 낙폭반등 V2 백테스트",type="primary",use_container_width=True,key="rb2_run"):
         try:
             listing=krx_listing_v1(); n=min(int(rb_names),len(listing)); sample=listing.sample(n=n,random_state=42) if n<len(listing) else listing
-            recs=[]; bar=st.progress(0.0)
+            recs=[]
+            bar=st.progress(0.0, text="백테스트 준비 중…")
+            eta_box=st.empty()
+            started=time.perf_counter()
+            lap_started=started
+            recent_times=[]
             for ix,row in enumerate(sample.itertuples(index=False),1):
+                one_started=time.perf_counter()
                 try:
                     d=krx_one_v1(row.Code,"2015-01-01","2024-01-01")
                     recs.extend(leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space)))
                 except Exception: pass
-                if ix==1 or ix%10==0 or ix==n: bar.progress(ix/n,text=f"{ix:,}/{n:,} · {row.Name}")
+                recent_times.append(time.perf_counter()-one_started)
+                if len(recent_times)>30:
+                    recent_times.pop(0)
+                if ix==1 or ix%5==0 or ix==n:
+                    elapsed=time.perf_counter()-started
+                    # 최근 30종목 속도와 전체 평균을 섞어, 초반 ETA 출렁임을 줄인다.
+                    avg_all=elapsed/max(ix,1)
+                    avg_recent=sum(recent_times)/max(len(recent_times),1)
+                    sec_per_stock=(avg_recent*0.7 + avg_all*0.3)
+                    remain=max(0,n-ix)*sec_per_stock
+                    def _fmt(sec):
+                        sec=max(0,int(round(sec)))
+                        if sec<60: return f"약 {sec}초"
+                        m,ss=divmod(sec,60)
+                        if m<60: return f"약 {m}분 {ss:02d}초"
+                        h,m=divmod(m,60); return f"약 {h}시간 {m:02d}분"
+                    bar.progress(ix/n,text=f"{ix:,}/{n:,} · {row.Name} · 남은 시간 {_fmt(remain)}")
+                    eta_box.caption(f"경과 {_fmt(elapsed)} · 예상 남은 시간 {_fmt(remain)} · 현재까지 신호 {len(recs):,}개")
             q=pd.DataFrame(recs); st.session_state["leader_rb_v2"]=q
+            bar.progress(1.0,text=f"{n:,}/{n:,} 분석 완료")
+            eta_box.caption(f"총 소요 시간 {_fmt(time.perf_counter()-started)} · 신호 {len(q):,}개")
             st.success(f"완료 · V2 신호 {len(q):,}개")
         except Exception as e: st.exception(e)
 
