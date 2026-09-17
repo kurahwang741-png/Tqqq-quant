@@ -265,6 +265,127 @@ if page == "🇰🇷 대장주 낙폭반등":
         out_bytes = gzip.compress(pickle.dumps(sig, pickle.HIGHEST_PROTOCOL), compresslevel=3)
         st.download_button("📥 현재 신호 데이터 내려받기", data=out_bytes, file_name="kr_leader_v23_signals.pkl.gz", mime="application/gzip", use_container_width=True)
 
+
+    # ------------------------------------------------------------
+    # ③ 후보 A 전용 OHLC 구축
+    # SOXL 영역과 완전히 분리. 2016~2023 후보 A의 신호 주변 가격경로만 저장합니다.
+    # 후보 A 잠금: LeaderScore 6~7 / Drawdown -50~-55% / 저항여력 >= 50%
+    # ------------------------------------------------------------
+    st.subheader("③ 후보 A OHLC 구축")
+    st.caption("후보 A만 대상으로 신호 전후 일별 OHLC를 저장합니다. 2024~2026 데이터는 사용하지 않습니다.")
+
+    KR_A_OHLC_CKPT = Path("kr_leader_candidate_a_ohlc_checkpoint.pkl.gz")
+
+    def _kr_candidate_a(sig_df):
+        if sig_df is None or sig_df.empty:
+            return pd.DataFrame()
+        z = sig_df.copy()
+        for c in ["LeaderScore", "Drawdown", "UpsideToResistance"]:
+            if c not in z.columns:
+                return pd.DataFrame()
+            z[c] = pd.to_numeric(z[c], errors="coerce")
+        z["SignalDate"] = pd.to_datetime(z["SignalDate"], errors="coerce").dt.tz_localize(None)
+        return z[
+            z["LeaderScore"].between(6, 7, inclusive="both")
+            & z["Drawdown"].between(-0.55, -0.50, inclusive="both")
+            & z["UpsideToResistance"].ge(0.50)
+            & z["SignalDate"].dt.year.between(2016, 2023)
+        ].copy()
+
+    def _kr_signal_windows(d, signal_dates):
+        """각 신호의 직전 5일~이후 45일(달력일)만 합쳐 저장해 파일 크기를 줄입니다."""
+        if d is None or d.empty:
+            return pd.DataFrame()
+        parts = []
+        for dt in pd.to_datetime(pd.Series(signal_dates).dropna().unique()):
+            start = pd.Timestamp(dt) - pd.Timedelta(days=5)
+            end = pd.Timestamp(dt) + pd.Timedelta(days=45)
+            w = d.loc[(d.index >= start) & (d.index <= end), ["Open", "High", "Low", "Close", "Volume"]]
+            if not w.empty:
+                parts.append(w)
+        if not parts:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        return pd.concat(parts).sort_index().loc[lambda q: ~q.index.duplicated(keep="first")]
+
+    # 현재 구축 체크포인트/결과에서 후보 A를 즉시 산출합니다.
+    sig_for_a = sig.copy() if "sig" in locals() and isinstance(sig, pd.DataFrame) else pd.DataFrame(rows)
+    cand_a = _kr_candidate_a(sig_for_a)
+    a_codes = sorted(cand_a["Code"].astype(str).str.zfill(6).unique().tolist()) if not cand_a.empty else []
+
+    a1, a2 = st.columns(2)
+    a1.metric("후보 A 신호", f"{len(cand_a):,}")
+    a2.metric("후보 A 종목", f"{len(a_codes):,}")
+
+    a_restore = st.file_uploader(
+        "후보 A OHLC 체크포인트가 있으면 복원",
+        type=["gz"], key="kr_a_ohlc_restore"
+    )
+    if a_restore is not None and st.button("후보 A OHLC 체크포인트 복원", use_container_width=True):
+        KR_A_OHLC_CKPT.write_bytes(a_restore.getvalue())
+        st.success("후보 A OHLC 체크포인트를 복원했습니다.")
+        st.rerun()
+
+    a_ck = _kr_load(KR_A_OHLC_CKPT, {"done": {}, "ohlc": {}, "candidate_rule": "A_v1"})
+    a_done = a_ck.get("done", {}) if isinstance(a_ck, dict) else {}
+    a_ohlc = a_ck.get("ohlc", {}) if isinstance(a_ck, dict) else {}
+    a_processed = sum(1 for c in a_codes if c in a_done)
+
+    if a_codes:
+        st.progress(a_processed / len(a_codes), text=f"OHLC {a_processed:,} / {len(a_codes):,}종목 ({a_processed/len(a_codes):.1%})")
+        a_batch = st.select_slider(
+            "OHLC 한 번에 처리할 종목 수",
+            options=[20, 30, 50, 75, 100], value=50, key="kr_a_ohlc_batch"
+        )
+        if st.button(
+            f"▶ 후보 A OHLC 다음 {a_batch}종목 구축",
+            type="primary", use_container_width=True,
+            disabled=(a_processed >= len(a_codes)), key="kr_a_ohlc_build"
+        ):
+            pending_codes = [c for c in a_codes if c not in a_done][:a_batch]
+            abar = st.progress(0.0, text="후보 A OHLC 구축 시작")
+            astatus = st.empty()
+            t0a = time.time()
+            for j, code in enumerate(pending_codes, 1):
+                try:
+                    d = _kr_price(code)  # KR_END=2023-12-31 고정: 블라인드 구간 접근 없음
+                    dates = cand_a.loc[cand_a["Code"].astype(str).str.zfill(6).eq(code), "SignalDate"]
+                    w = _kr_signal_windows(d, dates)
+                    if not w.empty:
+                        a_ohlc[code] = w
+                        a_done[code] = int(len(w))
+                    else:
+                        a_done[code] = "EMPTY"
+                except Exception as e:
+                    a_done[code] = f"ERR:{type(e).__name__}"
+                if j % 5 == 0 or j == len(pending_codes):
+                    _kr_save(KR_A_OHLC_CKPT, {
+                        "done": a_done, "ohlc": a_ohlc, "candidate_rule": "A_v1",
+                        "candidate_signal_count": len(cand_a), "candidate_code_count": len(a_codes),
+                        "development_period": "2016-2023", "blind_period": "2024-2026"
+                    })
+                elapsed = time.time() - t0a
+                rate = j / elapsed if elapsed else 0
+                eta = (len(pending_codes) - j) / rate if rate else 0
+                abar.progress(j / max(len(pending_codes), 1), text=f"이번 묶음 {j}/{len(pending_codes)}")
+                astatus.caption(f"현재 {code} · {rate:.2f}종목/초 · 이번 묶음 남은시간 약 {eta/60:.1f}분")
+            st.success("이번 후보 A OHLC 묶음 구축이 끝났습니다.")
+            st.rerun()
+    else:
+        st.info("후보 A 신호가 없습니다. 먼저 V2.3 전체시장 체크포인트를 복원하거나 구축하세요.")
+
+    if KR_A_OHLC_CKPT.exists():
+        st.download_button(
+            "💾 후보 A OHLC 체크포인트 내려받기",
+            data=KR_A_OHLC_CKPT.read_bytes(),
+            file_name="kr_leader_candidate_a_ohlc_checkpoint.pkl.gz",
+            mime="application/gzip", use_container_width=True,
+            key="kr_a_ohlc_download"
+        )
+        if a_codes and a_processed >= len(a_codes):
+            ok_codes = sum(isinstance(v, (int, np.integer)) for c, v in a_done.items() if c in a_codes)
+            st.success(f"후보 A OHLC 구축 완료 · 정상 데이터 {ok_codes:,}/{len(a_codes):,}종목")
+            st.info("이 체크포인트를 보내주면 최대 3종목·종목별 분할매수·현금 유지 전략을 실제 일별 경로로 백테스트할 수 있습니다.")
+
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
