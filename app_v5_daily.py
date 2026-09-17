@@ -11,6 +11,7 @@ import pickle
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from pathlib import Path
 
@@ -235,7 +236,8 @@ with tab_rebound:
     rb_peak_days=c2.selectbox("대장 판별 기간",[40,60,90],index=1,key="rb2_peak")
     rb_min_score=c3.selectbox("최소 Leader Score",[4,5,6,7],index=1,key="rb2_score")
     rb_min_space=c4.selectbox("저항까지 최소 공간",[10,15,20,25],index=1,key="rb2_space")/100
-    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다.")
+    rb_workers=st.select_slider("⚡ 동시 데이터 처리", options=[2,4,6,8,10], value=6, key="rb2_workers", help="첫 실행 속도를 높입니다. 너무 높이면 데이터 서버가 느려질 수 있어 기본 6을 권장합니다.")
+    st.caption("Leader Score는 상승폭·거래대금·장대양봉·거래대금 폭발·고점 형성 속도를 합산합니다. 미래 데이터는 사용하지 않습니다. 시세는 24시간 캐시되며 재실행은 훨씬 빨라집니다.")
 
     def leader_rebound_scan_v2(d, code, name, market, peak_days=60, min_score=5, min_space=.15):
         if d is None or len(d)<180: return []
@@ -333,39 +335,48 @@ with tab_rebound:
     if st.button("🪂 대장주 낙폭반등 V2 백테스트",type="primary",use_container_width=True,key="rb2_run"):
         try:
             listing=krx_listing_v1(); n=min(int(rb_names),len(listing)); sample=listing.sample(n=n,random_state=42) if n<len(listing) else listing
+            rows=list(sample.itertuples(index=False))
             recs=[]
-            bar=st.progress(0.0, text="백테스트 준비 중…")
+            bar=st.progress(0.0, text="병렬 백테스트 준비 중…")
             eta_box=st.empty()
             started=time.perf_counter()
-            lap_started=started
-            recent_times=[]
-            for ix,row in enumerate(sample.itertuples(index=False),1):
-                one_started=time.perf_counter()
+            done=0
+
+            def _fmt(sec):
+                sec=max(0,int(round(sec)))
+                if sec<60: return f"약 {sec}초"
+                m,ss=divmod(sec,60)
+                if m<60: return f"약 {m}분 {ss:02d}초"
+                h,m=divmod(m,60); return f"약 {h}시간 {m:02d}분"
+
+            # 데이터 다운로드가 병목이라 여러 종목을 동시에 처리한다.
+            # krx_one_v1은 st.cache_data이므로 한 번 받은 종목은 24시간 재사용된다.
+            def _work(row):
                 try:
                     d=krx_one_v1(row.Code,"2015-01-01","2024-01-01")
-                    recs.extend(leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space)))
-                except Exception: pass
-                recent_times.append(time.perf_counter()-one_started)
-                if len(recent_times)>30:
-                    recent_times.pop(0)
-                if ix==1 or ix%5==0 or ix==n:
-                    elapsed=time.perf_counter()-started
-                    # 최근 30종목 속도와 전체 평균을 섞어, 초반 ETA 출렁임을 줄인다.
-                    avg_all=elapsed/max(ix,1)
-                    avg_recent=sum(recent_times)/max(len(recent_times),1)
-                    sec_per_stock=(avg_recent*0.7 + avg_all*0.3)
-                    remain=max(0,n-ix)*sec_per_stock
-                    def _fmt(sec):
-                        sec=max(0,int(round(sec)))
-                        if sec<60: return f"약 {sec}초"
-                        m,ss=divmod(sec,60)
-                        if m<60: return f"약 {m}분 {ss:02d}초"
-                        h,m=divmod(m,60); return f"약 {h}시간 {m:02d}분"
-                    bar.progress(ix/n,text=f"{ix:,}/{n:,} · {row.Name} · 남은 시간 {_fmt(remain)}")
-                    eta_box.caption(f"경과 {_fmt(elapsed)} · 예상 남은 시간 {_fmt(remain)} · 현재까지 신호 {len(recs):,}개")
+                    r=leader_rebound_scan_v2(d,row.Code,row.Name,row.Market,int(rb_peak_days),int(rb_min_score),float(rb_min_space))
+                    return row.Name, r, None
+                except Exception as e:
+                    return row.Name, [], str(e)
+
+            workers=min(int(rb_workers), n)
+            errors=0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures=[ex.submit(_work,row) for row in rows]
+                for fut in as_completed(futures):
+                    name,r,err=fut.result(); recs.extend(r); done+=1
+                    if err: errors+=1
+                    if done==1 or done%5==0 or done==n:
+                        elapsed=time.perf_counter()-started
+                        sec_per=elapsed/max(done,1)
+                        # 병렬 처리에서는 완료 종목 기준 평균으로 ETA 계산
+                        remain=max(0,n-done)*sec_per
+                        bar.progress(done/n,text=f"{done:,}/{n:,} · {name} · 남은 시간 {_fmt(remain)}")
+                        eta_box.caption(f"⚡ {workers}개 동시 처리 · 경과 {_fmt(elapsed)} · 예상 남은 시간 {_fmt(remain)} · 신호 {len(recs):,}개")
+
             q=pd.DataFrame(recs); st.session_state["leader_rb_v2"]=q
             bar.progress(1.0,text=f"{n:,}/{n:,} 분석 완료")
-            eta_box.caption(f"총 소요 시간 {_fmt(time.perf_counter()-started)} · 신호 {len(q):,}개")
+            eta_box.caption(f"총 소요 시간 {_fmt(time.perf_counter()-started)} · 신호 {len(q):,}개 · 오류 종목 {errors:,}개")
             st.success(f"완료 · V2 신호 {len(q):,}개")
         except Exception as e: st.exception(e)
 
