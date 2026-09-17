@@ -22,270 +22,181 @@ st.set_page_config(
 
 page = st.sidebar.radio(
     "메뉴",
-    ["📈 SOXL 퀀트", "🇰🇷 코코레 → 본주"],
+    ["📈 SOXL 퀀트", "🇰🇷 대장주 낙폭반등"],
     index=0,
     key="main_page",
 )
 
-if page == "🇰🇷 코코레 → 본주":
-    st.title("🇰🇷 코코레 → KODEX 코스닥150 QUANT")
-    st.caption("V5.8 · 2026 재봉인 + SOX필수 중간형 탐색")
-    st.info("🛡️ 2026은 끝까지 봉인합니다. 2016~2025만 이용해 위험 OFF 필터를 고른 뒤, 선택이 끝난 다음 2026에서 딱 한 번 검증합니다. 기준 전략은 V3-12형 + 20일 -10% 엔벨로프 + MA10 + 최소변화폭 15%입니다.")
+if page == "🇰🇷 대장주 낙폭반등":
+    st.title("🇰🇷 대장주 낙폭반등 V2")
+    st.caption("과거 대장 → 큰 조정 → W바닥/Higher Low → 추세전환 · 2016~2023 개발구간 전용")
+    st.info("🔒 2024~2026은 봉인합니다. 이 화면은 아래 실행 버튼을 누르기 전에는 KRX 종목/과거가격을 조회하지 않습니다.")
 
-    @st.cache_data(ttl=900)
-    def download_kosdaq_research_data():
-        symbols=["233740.KS","229200.KS","^NDX","^SOX","^VIX"]
-        raw=yf.download(symbols,period="max",interval="1d",auto_adjust=True,progress=False,group_by="column")
-        if raw is None or raw.empty: raise ValueError("코스닥/미국장 데이터를 받지 못했습니다.")
-        def close_of(sym):
-            if isinstance(raw.columns,pd.MultiIndex):
-                if "Close" in raw.columns.get_level_values(0): return raw["Close"][sym].dropna()
-                return raw.xs("Close",axis=1,level=-1)[sym].dropna()
-            raise ValueError("종가 데이터를 찾지 못했습니다.")
-        kr=pd.concat([close_of("233740.KS").rename("KOKORE"),close_of("229200.KS").rename("BASE")],axis=1).dropna().reset_index()
-        kr.columns=["Date","KOKORE","BASE"]; kr["Date"]=pd.to_datetime(kr["Date"]).dt.tz_localize(None).dt.normalize()
-        us=pd.concat([close_of("^NDX").rename("NDX"),close_of("^SOX").rename("SOX"),close_of("^VIX").rename("VIX")],axis=1).dropna().reset_index()
-        us.columns=["USDate","NDX","SOX","VIX"]; us["USDate"]=pd.to_datetime(us["USDate"]).dt.tz_localize(None).dt.normalize()
-        us["NDX_R1"]=us["NDX"].pct_change(); us["SOX_R1"]=us["SOX"].pct_change(); us["VIX_R1"]=us["VIX"].pct_change()
-        return pd.merge_asof(kr.sort_values("Date"),us.sort_values("USDate"),left_on="Date",right_on="USDate",direction="backward",allow_exact_matches=False).set_index("Date").dropna(subset=["KOKORE","BASE"])
-
-    def features_v5(df, env_lower):
-        d=df.copy(); k=d["KOKORE"].astype(float)
-        delta=k.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-        d["RSI14"]=100-100/(1+gain/loss.replace(0,np.nan))
-        for n in (5,8,10,12,20,60): d[f"MA{n}"]=k.rolling(n,min_periods=max(3,n//2)).mean()
-        # 생존필터용 장기 추세선
-        d["BASE_MA120"]=d["BASE"].astype(float).rolling(120,min_periods=60).mean()
-        d["BASE_MA200"]=d["BASE"].astype(float).rolling(200,min_periods=100).mean()
-        d["KOKORE_MA120"]=k.rolling(120,min_periods=60).mean()
-        d["SOX_MA120"]=d["SOX"].astype(float).rolling(120,min_periods=60).mean()
-        d["DIST10"]=k/d["MA10"]-1; d["DIST20"]=k/d["MA20"]-1
-        d["DD60"]=k/k.rolling(60,min_periods=20).max()-1
-        d["RSI_D3"]=d["RSI14"].diff(3); d["DIST10_D3"]=d["DIST10"].diff(3)
-        d["ENV_BELOW"]=d["DIST20"]<=float(env_lower)
-        d["ENV_REENTRY"]=(d["DIST20"].shift(1)<=float(env_lower)) & (d["DIST20"]>float(env_lower))
-        return d
-
-    def target_v5(r,p,exposure):
-        score=0.0
-        dd=float(r.get("DD60",np.nan)); rsi=float(r.get("RSI14",np.nan)); dist=float(r.get("DIST10",np.nan))
-        if np.isfinite(dd): score += int(dd<=-.10)+int(dd<=-.18)+int(dd<=-.28)
-        if np.isfinite(rsi): score += int(rsi<=45)+int(rsi<=35)
-        if np.isfinite(dist) and dist<=-.03: score += 1.0
-        sox=float(r.get("SOX_R1",np.nan)); ndx=float(r.get("NDX_R1",np.nan))
-        if np.isfinite(ndx): score += .5 if ndx>=.012 else (-.5 if ndx<=-.02 else 0)
-        if np.isfinite(sox): score += 1.25 if sox>=.02 else (-.75 if sox<=-.03 else 0)
-        sox_ok=np.isfinite(sox) and sox>0
-        aux=sum([float(r.get("RSI_D3",-99))>=2,float(r.get("DIST10_D3",-99))>=.015,bool(r.get("ENV_REENTRY",False)),np.isfinite(r.get("MA5",np.nan)) and float(r.get("KOKORE",0))>=float(r["MA5"])])
-        need=int(p.get("aux_need",1)); confirmed=sox_ok and aux>=need; strong=sox_ok and aux>=min(4,need+1)
-        if confirmed: score+=1.5
-        if strong: score+=1.0
-        if bool(r.get("ENV_BELOW",False)): score+=p["env_w"]
-        if bool(r.get("ENV_REENTRY",False)): score+=p["reentry_w"]
-        L=p["levels"]
-        target=0.0 if score<1.5 else L[0] if score<2.5 else L[1] if score<3.5 else L[2] if score<4.5 else L[3]
-        target=min(target,p["entry_cap"] if not confirmed else p["confirm_cap"] if not strong else p["strong_cap"])
-        return min(float(target),.90)
-
-    def bt_v5(df,p,initial_cash=10_000_000.0,fee=.00015,max_hold=180,trade_start=None):
-        d=features_v5(df,p["env_lower"]).dropna(subset=["BASE"]).copy()
-        cash=float(initial_cash); shares=0.0; entry=None; peak_base=None
-        rows=[]; trades=[]; sells=0; buys=0; hold_days_list=[]; completed_cycles=0
-        trade_start_ts=pd.Timestamp(trade_start) if trade_start is not None else None
-
-        for i in range(1,len(d)):
-            dt=d.index[i]
-            if trade_start_ts is not None and pd.Timestamp(dt) < trade_start_ts:
-                continue
-
-            px=float(d["BASE"].iloc[i]); prev=d.iloc[i-1]
-            eq0=cash+shares*px
-            exp0=shares*px/eq0 if eq0>0 else 0.0
-
-            # 반드시 먼저 기본 목표비중을 계산한다.
-            target=target_v5(prev,p,exp0)
-
-            # 전 거래일 확정 데이터로 위험 OFF 판정 (look-ahead 방지)
-            risk_mode=p.get("risk_mode","NONE")
-            risk_cap=float(p.get("risk_cap",1.0))
-            risk_off=False
-            if risk_mode=="BASE_MA120":
-                v=prev.get("BASE_MA120",np.nan)
-                risk_off=np.isfinite(v) and float(prev["BASE"]) < float(v)
-            elif risk_mode=="BASE_MA200":
-                v=prev.get("BASE_MA200",np.nan)
-                risk_off=np.isfinite(v) and float(prev["BASE"]) < float(v)
-            elif risk_mode=="KOKORE_MA120":
-                v=prev.get("KOKORE_MA120",np.nan)
-                risk_off=np.isfinite(v) and float(prev["KOKORE"]) < float(v)
-            elif risk_mode=="SOX_MA120":
-                v=prev.get("SOX_MA120",np.nan)
-                risk_off=np.isfinite(v) and float(prev["SOX"]) < float(v)
-            elif risk_mode=="VIX30":
-                risk_off=np.isfinite(prev.get("VIX",np.nan)) and float(prev["VIX"]) >= 30.0
-            elif risk_mode=="BASE120_OR_VIX30":
-                ma=prev.get("BASE_MA120",np.nan); vx=prev.get("VIX",np.nan)
-                risk_off=(np.isfinite(ma) and float(prev["BASE"]) < float(ma)) or (np.isfinite(vx) and float(vx)>=30.0)
-
-            raw_target=float(target)
-            if risk_off:
-                target=min(target,risk_cap)
-
-            if shares>0: peak_base=max(float(peak_base or px),px)
-            else: peak_base=None
-
-            forced=entry is not None and max_hold and (pd.Timestamp(dt)-pd.Timestamp(entry)).days>=int(max_hold)
-            desired=eq0*target; diff=desired-shares*px
-
-            if diff<0 and shares>0 and not forced:
-                mode=p["exit_mode"]; hold=False
-                if mode=="MA5":
-                    hold=np.isfinite(prev.get("MA5",np.nan)) and float(prev["KOKORE"])>=float(prev["MA5"])
-                elif mode=="MA10":
-                    hold=np.isfinite(prev.get("MA10",np.nan)) and float(prev["KOKORE"])>=float(prev["MA10"])
-                elif mode=="TRAIL6":
-                    hold=peak_base is not None and px>=float(peak_base)*.94
-                if hold: diff=0.0
-            if forced: diff=-shares*px
-
-            rebalance_gap=float(p.get("rebalance_gap",.01))
-            action="대기"; traded_pct=0.0
-            if diff>max(eq0*rebalance_gap,1):
-                spend=min(diff,cash); qty=(spend*(1-fee))/px
-                if qty>0:
-                    before=shares
-                    shares+=qty; cash-=spend; buys+=1
-                    entry=dt if entry is None else entry
-                    peak_base=px if peak_base is None else max(peak_base,px)
-                    action="매수"; traded_pct=spend/eq0 if eq0>0 else 0
-            elif diff<-max(eq0*rebalance_gap,1):
-                qty=min(shares,(-diff)/px)
-                if qty>0:
-                    cash+=qty*px*(1-fee); shares-=qty; sells+=1
-                    action="매도"; traded_pct=qty*px/eq0 if eq0>0 else 0
-                if shares*px<eq0*.01:
-                    if entry is not None:
-                        hold_days_list.append((pd.Timestamp(dt)-pd.Timestamp(entry)).days)
-                        completed_cycles+=1
-                    entry=None; peak_base=None
-
-            eq=cash+shares*px
-            exposure=shares*px/eq if eq>0 else 0
-            rows.append((dt,eq,exposure,target))
-            if action!="대기":
-                trades.append({
-                    "Date":dt,"구분":action,"BASE가격":px,"거래비중":traded_pct,
-                    "거래후투입":exposure,"원목표":raw_target,"필터후목표":target,
-                    "RiskOFF":risk_off,"RiskMode":risk_mode,
-                    "KOKORE":float(prev.get("KOKORE",np.nan)),
-                    "RSI14":float(prev.get("RSI14",np.nan)),
-                    "DIST20":float(prev.get("DIST20",np.nan)),
-                })
-
-        eq=pd.DataFrame(rows,columns=["Date","Equity","Exposure","Target"]).set_index("Date")
-        if eq.empty: raise ValueError("백테스트 구간이 너무 짧습니다.")
-        years=max((eq.index[-1]-eq.index[0]).days/365.25,1/365.25)
-        final=float(eq["Equity"].iloc[-1]); cagr=(final/initial_cash)**(1/years)-1
-        mdd=float((eq["Equity"]/eq["Equity"].cummax()-1).min())
-        avg_hold=float(np.mean(hold_days_list)) if hold_days_list else np.nan
-        max_hold_actual=float(np.max(hold_days_list)) if hold_days_list else 0.0
-        if entry is not None:
-            ongoing=(pd.Timestamp(eq.index[-1])-pd.Timestamp(entry)).days
-            max_hold_actual=max(max_hold_actual,float(ongoing))
-        trade_df=pd.DataFrame(trades)
-        return dict(cagr=cagr,mdd=mdd,final=final,avg_exp=float(eq["Exposure"].mean()),max_exp=float(eq["Exposure"].max()),
-                    buys=buys,sells=sells,cycles=completed_cycles,years=years,
-                    buys_per_year=buys/years,sells_per_year=sells/years,cycles_per_year=completed_cycles/years,
-                    avg_hold=avg_hold,max_hold_actual=max_hold_actual,equity=eq,trades=trade_df)
-
-    def candidates_v5():
-        out=[]
-        base=dict(levels=(.12,.30,.50,.75),env_lower=-.10,env_w=1.0,reentry_w=1.5,exit_mode="MA10",rebalance_gap=.15,risk_mode="BASE_MA200",risk_cap=.40)
-        for e in (.20,.30):
-            for need in (1,2):
-                for c in (.50,.60):
-                    for strong in (.60,.75):
-                        out.append(dict(base_name=f"중간형 E{e:.0%}-SOX+A{need}-C{c:.0%}-S{strong:.0%}",entry_cap=e,aux_need=need,confirm_cap=c,strong_cap=strong,**base))
-        return out
-
-    a,b,c=st.columns(3)
-    initial=a.number_input("초기 투자금(원)",min_value=1_000_000,value=10_000_000,step=1_000_000,key="k5_initial")
-    start_year=b.number_input("시작연도",min_value=2016,max_value=date.today().year,value=2016,step=1,key="k5_start")
-    hold_days=c.selectbox("최대 보유기간",[60,90,120,180,365],index=3,format_func=lambda x:f"{x}일",key="k5_hold")
-    blind=st.checkbox("🧪 2026 블라인드 검증",value=True,key="k5_blind",help="2016~2025에서 1위를 고른 뒤 2026년은 파라미터를 고정해 별도 검증합니다.")
-
-    if st.button("🧬 V5.8 중간형 탐색 시작",type="primary",use_container_width=True,key="run_k5"):
+    def _kr_fdr():
         try:
-            with st.spinner("16개 중간형 후보 계산 중 · CAGR 우선 · 2026은 선택에 사용하지 않습니다..."):
-                kd=download_kosdaq_research_data(); kd=kd.loc[kd.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy(); train=kd.loc[kd.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd
-                rows=[]; sims=[]
-                for j,p in enumerate(candidates_v5(),1):
-                    r=bt_v5(train,p,float(initial),max_hold=int(hold_days)); eff=r["cagr"]/max(abs(r["mdd"]),1e-9); dd_pen=max(0.0,abs(r["mdd"])-.30); hard_pen=max(0.0,abs(r["mdd"])-.40); score=1.80*r["cagr"]+.15*eff-.25*dd_pen-1.25*hard_pen
-                    rows.append({"후보":j,"초기상한":p.get("entry_cap",1.0),"SOX필수":"Y","보조확인":p.get("aux_need",0),"확인후상한":p.get("confirm_cap",1.0),"강반등상한":p.get("strong_cap",.9),"생존필터":p["base_name"],"OFF최대투입":p.get("risk_cap",1.0),"엔벨로프":f"20일 {p['env_lower']:.0%}","매도":p["exit_mode"],"최소변화폭":p["rebalance_gap"],"CAGR":r["cagr"],"MDD":r["mdd"],"효율":eff,"점수":score,"평균투입":r["avg_exp"],"최대투입":r["max_exp"],"총매수":r["buys"],"총매도":r["sells"],"연매수":r["buys_per_year"],"연매도":r["sells_per_year"],"연왕복":r["cycles_per_year"],"평균보유일":r["avg_hold"],"최대보유일":r["max_hold_actual"],"최종자산":r["final"]}); sims.append((p,r))
-                rank=pd.DataFrame(rows).sort_values(["점수","CAGR"],ascending=False).reset_index(drop=True); best_id=int(rank.iloc[0]["후보"])-1
-                st.session_state["k5_rank"]=rank; st.session_state["k5_best_p"],st.session_state["k5_best_r"]=sims[best_id]
-                if blind:
-                    test=kd.copy()
-                    st.session_state["k5_test"]=bt_v5(test,sims[best_id][0],float(initial),max_hold=int(hold_days),trade_start="2026-01-01") if len(test.loc[test.index>=pd.Timestamp("2026-01-01")])>5 else None
-        except Exception as e: st.error(f"V5 탐색 실패: {e}")
-
-    if st.session_state.get("k5_rank") is not None:
-        rank=st.session_state["k5_rank"].copy(); st.subheader("🧬 V5.8 2016~2025 SOX필수 중간형 결과")
-        show=rank.head(10).copy()
-        for col in ["CAGR","MDD","평균투입","최대투입"]: show[col]=show[col].map(lambda x:f"{x:.2%}")
-        show["최소변화폭"]=show["최소변화폭"].map(lambda x:f"{x:.1%}")
-        if "OFF최대투입" in show.columns: show["OFF최대투입"]=show["OFF최대투입"].map(lambda x:f"{x:.0%}")
-        show["효율"]=show["효율"].map(lambda x:f"{x:.3f}"); show["점수"]=show["점수"].map(lambda x:f"{x:.4f}"); show["최종자산"]=show["최종자산"].map(lambda x:f"₩{x:,.0f}")
-        st.dataframe(show,use_container_width=True,hide_index=True)
-        br=st.session_state["k5_best_r"]; bp=st.session_state["k5_best_p"]
-        m1,m2,m3,m4=st.columns(4); m1.metric("1위 CAGR",f"{br['cagr']:.2%}"); m2.metric("MDD",f"{br['mdd']:.2%}"); m3.metric("연평균 매수",f"{br['buys_per_year']:.1f}회"); m4.metric("연평균 매도",f"{br['sells_per_year']:.1f}회")
-        h1,h2,h3=st.columns(3); h1.metric("연평균 왕복",f"{br['cycles_per_year']:.1f}회"); h2.metric("평균 보유일",("-" if not np.isfinite(br['avg_hold']) else f"{br['avg_hold']:.1f}일")); h3.metric("최대 보유일",f"{br['max_hold_actual']:.0f}일")
-        st.line_chart((br["equity"]["Equity"]/br["equity"]["Equity"].iloc[0]*100).rename("V5 1위"))
-        if blind and st.session_state.get("k5_test") is not None:
-            tr=st.session_state["k5_test"]; st.subheader("🧪 2026 블라인드 결과")
-            q1,q2,q3=st.columns(3); q1.metric("2026 CAGR",f"{tr['cagr']:.2%}"); q2.metric("2026 MDD",f"{tr['mdd']:.2%}"); q3.metric("2026 최대투입",f"{tr['max_exp']:.1%}")
-            q4,q5,q6=st.columns(3); q4.metric("2026 연환산 매수",f"{tr['buys_per_year']:.1f}회"); q5.metric("2026 연환산 매도",f"{tr['sells_per_year']:.1f}회"); q6.metric("2026 최대 보유",f"{tr['max_hold_actual']:.0f}일")
-            st.markdown("#### 🔎 2026 손실 원인 추적")
-            td=tr.get("trades",pd.DataFrame()).copy()
-            if not td.empty:
-                td["Date"]=pd.to_datetime(td["Date"]).dt.strftime("%Y-%m-%d")
-                for cc in ["거래비중","거래후투입","원목표","필터후목표"]:
-                    td[cc]=td[cc].map(lambda x:f"{x:.1%}")
-                td["BASE가격"]=td["BASE가격"].map(lambda x:f"{x:,.0f}")
-                td["RSI14"]=td["RSI14"].map(lambda x:f"{x:.1f}")
-                td["DIST20"]=td["DIST20"].map(lambda x:f"{x:.1%}")
-                st.dataframe(td,use_container_width=True,hide_index=True)
-                st.caption("매수·매도 날짜, 거래 후 총투입률, 생존필터 작동 여부를 직접 확인할 수 있습니다.")
-            else:
-                st.info("2026 구간에 실제 리밸런싱 거래가 없습니다.")
-        st.subheader("📅 선택된 필터의 과거 연도별 성과")
-        # Rebuild the two locked strategies on the same training window.
-        try:
-            kd_all=download_kosdaq_research_data()
-            kd_all=kd_all.loc[kd_all.index>=pd.Timestamp(f"{int(start_year)}-01-01")].copy()
-            train_all=kd_all.loc[kd_all.index<=pd.Timestamp("2025-12-31")].copy() if blind else kd_all
-            ys=[]
-            p2=st.session_state.get("k5_best_p")
-            if p2 is not None:
-                rr=bt_v5(train_all,p2,float(initial),max_hold=int(hold_days))
-                yy=yearly_stats_v54(rr["equity"])
-                yy["전략"]=p2["base_name"]
-                ys.append(yy)
-            yd=pd.concat(ys,ignore_index=True) if ys else pd.DataFrame()
-            focus=yd[yd["연도"].isin([2018,2020,2022,2023,2024,2025])].copy()
-            if not focus.empty:
-                pv=focus.pivot(index="연도",columns="전략",values="수익률").reset_index()
-                for c in pv.columns[1:]: pv[c]=pv[c].map(lambda x:f"{x:.2%}")
-                st.dataframe(pv,use_container_width=True,hide_index=True)
-            with st.expander("전체 연도 상세 보기"):
-                detail=yd.copy()
-                for c in ["수익률","연중MDD","평균투입","최대투입"]:
-                    detail[c]=detail[c].map(lambda x:f"{x:.2%}")
-                st.dataframe(detail,use_container_width=True,hide_index=True)
+            import FinanceDataReader as fdr
+            return fdr
         except Exception as e:
-            st.warning(f"연도별 표 계산 실패: {e}")
+            raise RuntimeError("FinanceDataReader가 필요합니다. requirements.txt에 finance-datareader를 확인하세요.") from e
 
-        st.caption("중요: 필터 선택과 순위는 2016~2025 데이터로만 결정합니다. 2026 수치는 순위 계산에 절대 들어가지 않고, 선택 완료 후 블라인드 검증으로만 표시됩니다.")
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def _kr_universe(limit):
+        fdr = _kr_fdr()
+        listing = fdr.StockListing("KRX")
+        if listing is None or listing.empty:
+            raise ValueError("KRX 종목목록을 받지 못했습니다.")
+        d = listing.copy()
+        code_col = next((c for c in ["Code","Symbol"] if c in d.columns), None)
+        name_col = next((c for c in ["Name","Company"] if c in d.columns), None)
+        if code_col is None or name_col is None:
+            raise ValueError("KRX 종목코드/종목명 열을 찾지 못했습니다.")
+        # 현재 시총 상위는 빠른 1차 로직 검증용 표본이다. 최종 검증은 역사적 유니버스로 별도 진행한다.
+        if "Marcap" in d.columns:
+            d["Marcap"] = pd.to_numeric(d["Marcap"], errors="coerce")
+            d = d.sort_values("Marcap", ascending=False)
+        d = d[[code_col,name_col]].dropna().drop_duplicates(code_col).head(int(limit))
+        return [(str(r[code_col]).zfill(6), str(r[name_col])) for _,r in d.iterrows()]
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def _kr_price(code):
+        fdr = _kr_fdr()
+        d = fdr.DataReader(str(code), "2015-01-01", "2023-12-31")
+        if d is None or d.empty:
+            return pd.DataFrame()
+        d = d.copy()
+        d.index = pd.to_datetime(d.index).tz_localize(None)
+        need = ["Open","High","Low","Close","Volume"]
+        if any(c not in d.columns for c in need):
+            return pd.DataFrame()
+        for c in need:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        return d.dropna(subset=need).sort_index()
+
+    def _leader_events(d):
+        x=d.copy()
+        x["R20"]=x["Close"].pct_change(20)
+        x["R40"]=x["Close"].pct_change(40)
+        x["R60"]=x["Close"].pct_change(60)
+        x["R1"]=x["Close"].pct_change()
+        x["AmountProxy"]=x["Close"]*x["Volume"]
+        x["Amt20"]=x["AmountProxy"].rolling(20).mean()
+        x["AmtRatio"]=x["AmountProxy"]/x["Amt20"].replace(0,np.nan)
+        x["BigUp"]=(x["R1"]>=.12).astype(int)
+        x["BigUp20"]=x["BigUp"].rolling(20).sum()
+        # 점수는 미래정보 없이 해당일 이전 데이터만 사용한다.
+        x["LeaderScore"]=(
+            (x["R20"]>=.25).astype(int)*2 +
+            (x["R40"]>=.45).astype(int)*2 +
+            (x["R60"]>=.70).astype(int)*2 +
+            (x["AmountProxy"]>=50_000_000_000).astype(int) +
+            (x["AmountProxy"]>=150_000_000_000).astype(int) +
+            (x["AmtRatio"]>=2).astype(int) +
+            (x["BigUp20"]>=2).astype(int)
+        )
+        return x
+
+    def _scan_one(code,name,d):
+        if len(d)<180: return []
+        x=_leader_events(d)
+        rows=[]; last_signal=None
+        for i in range(120,len(x)-21):
+            dt=x.index[i]
+            if dt.year<2016 or dt.year>2023: continue
+            # 최근 120거래일 안에 Leader Score 6+였던 가장 강한 시점/고점을 찾는다.
+            hist=x.iloc[max(0,i-120):i+1]
+            leaders=hist[hist["LeaderScore"]>=6]
+            if leaders.empty: continue
+            lead_dt=leaders["LeaderScore"].idxmax()
+            after=x.loc[lead_dt:dt]
+            if after.empty: continue
+            peak=float(after["High"].max())
+            close=float(x["Close"].iloc[i])
+            dd=close/peak-1 if peak>0 else np.nan
+            if not np.isfinite(dd) or not (-.65<=dd<=-.25): continue
+            # W/Higher-Low: 최근 35일 전반 저점과 후반 저점 비교. 두 번째 저점이 첫 저점의 -3% 아래를 깨지 않음.
+            w=x.iloc[max(0,i-35):i+1]
+            if len(w)<25: continue
+            split=max(10,len(w)//2)
+            low1=float(w["Low"].iloc[:split].min()); low2=float(w["Low"].iloc[split:].min())
+            w_ok=(low2>=low1*.97) and (low2<=low1*1.18)
+            # 추세전환: 전일 기준 10일 고가 돌파 + 20일선 회복 중 하나.
+            prev10=float(x["High"].iloc[max(0,i-10):i].max())
+            ma20=float(x["Close"].iloc[max(0,i-19):i+1].mean())
+            trend_ok=(close>prev10) or (close>=ma20 and float(x["Close"].iloc[i-1])<float(x["Close"].iloc[max(0,i-20):i].mean()))
+            vol20=float(x["Volume"].iloc[max(0,i-20):i].mean())
+            vol_ok=vol20>0 and float(x["Volume"].iloc[i])>=vol20*1.3
+            # 신호가 연속 발생하면 같은 파동을 중복 집계하지 않는다.
+            if last_signal is not None and (dt-last_signal).days<15: continue
+            entry=float(x["Open"].iloc[i+1])
+            if entry<=0: continue
+            resistance=float(x["High"].iloc[max(0,i-60):i+1].max())
+            upside=resistance/entry-1
+            def rr(n): return float(x["Close"].iloc[i+n]/entry-1) if i+n<len(x) else np.nan
+            rows.append({"Code":code,"Name":name,"SignalDate":dt,"LeaderScore":float(leaders["LeaderScore"].max()),"Drawdown":dd,
+                         "W_HL":bool(w_ok),"Trend":bool(trend_ok),"VolumeConfirm":bool(vol_ok),"Entry":entry,"Resistance":resistance,
+                         "UpsideToResistance":upside,"R5":rr(5),"R10":rr(10),"R20":rr(20)})
+            last_signal=dt
+        return rows
+
+    def _stage_summary(sig):
+        stages=[("① 대장+낙폭",pd.Series(True,index=sig.index)),
+                ("② +W/Higher Low",sig["W_HL"]),
+                ("③ +추세전환",sig["W_HL"] & sig["Trend"]),
+                ("④ +거래량확인",sig["W_HL"] & sig["Trend"] & sig["VolumeConfirm"]),
+                ("⑤ +저항여력15%",sig["W_HL"] & sig["Trend"] & sig["VolumeConfirm"] & (sig["UpsideToResistance"]>=.15))]
+        out=[]
+        for label,mask in stages:
+            z=sig.loc[mask].copy(); row={"단계":label,"신호수":len(z)}
+            for n in (5,10,20):
+                s=z[f"R{n}"].dropna(); row[f"{n}일 승률"]=float((s>0).mean()) if len(s) else np.nan
+                row[f"{n}일 평균"]=float(s.mean()) if len(s) else np.nan
+                row[f"{n}일 중앙값"]=float(s.median()) if len(s) else np.nan
+            out.append(row)
+        return pd.DataFrame(out)
+
+    c1,c2=st.columns(2)
+    sample_n=c1.selectbox("1차 검증 종목 수",[50,100,200],index=1,key="leader_sample_n")
+    c2.metric("개발구간","2016–2023")
+    st.caption("100종목은 현재 KRX 시가총액 상위 표본을 이용한 로직 탐색용입니다. 최종 성과 판단에는 역사적 종목 유니버스/상장폐지 종목까지 포함해 생존편향을 다시 검증해야 합니다.")
+
+    if st.button("🔬 V2 단계별 백테스트 실행",type="primary",use_container_width=True,key="run_leader_v2"):
+        try:
+            universe=_kr_universe(int(sample_n)); all_rows=[]
+            bar=st.progress(0.0,text=f"0/{len(universe)} 종목 준비")
+            started=time.time()
+            for k,(code,name) in enumerate(universe,1):
+                try:
+                    d=_kr_price(code)
+                    if not d.empty: all_rows.extend(_scan_one(code,name,d))
+                except Exception:
+                    pass
+                elapsed=time.time()-started; eta=(elapsed/k)*(len(universe)-k) if k else 0
+                bar.progress(k/len(universe),text=f"{k}/{len(universe)} · {name} · 예상 남은시간 {eta/60:.1f}분")
+            bar.empty()
+            sig=pd.DataFrame(all_rows)
+            st.session_state["leader_v2_signals"]=sig
+            st.session_state["leader_v2_summary"]=_stage_summary(sig) if not sig.empty else pd.DataFrame()
+        except Exception as e:
+            st.error(f"V2 실행 실패: {e}")
+
+    summary=st.session_state.get("leader_v2_summary")
+    sig=st.session_state.get("leader_v2_signals")
+    if isinstance(summary,pd.DataFrame) and not summary.empty:
+        st.subheader("📊 조건을 하나씩 붙였을 때")
+        show=summary.copy(); pct=[c for c in show.columns if "승률" in c or "평균" in c or "중앙값" in c]
+        st.dataframe(show.style.format({c:"{:.2%}" for c in pct},na_rep="-"),use_container_width=True,hide_index=True)
+        st.caption("좋아지는 단계만 남기고, 신호 수만 줄면서 성과가 개선되지 않는 조건은 제거합니다.")
+    if isinstance(sig,pd.DataFrame) and not sig.empty:
+        final=sig[sig["W_HL"] & sig["Trend"] & sig["VolumeConfirm"] & (sig["UpsideToResistance"]>=.15)].copy()
+        st.subheader("🔎 최종 조건 포착 사례")
+        if final.empty:
+            st.info("현재 최종 조건을 모두 통과한 사례가 없습니다. 위 단계별 표에서 어느 필터에서 신호가 사라지는지 확인하세요.")
+        else:
+            final=final.sort_values(["SignalDate","LeaderScore"],ascending=[False,False])
+            show=final[["SignalDate","Code","Name","LeaderScore","Drawdown","Entry","Resistance","UpsideToResistance","R5","R10","R20"]].head(200).copy()
+            for c in ["Drawdown","UpsideToResistance","R5","R10","R20"]: show[c]=show[c]*100
+            st.dataframe(show.style.format({"Drawdown":"{:.1f}%","UpsideToResistance":"{:.1f}%","R5":"{:.1f}%","R10":"{:.1f}%","R20":"{:.1f}%","Entry":"{:,.0f}","Resistance":"{:,.0f}"},na_rep="-"),use_container_width=True,hide_index=True)
+
 
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
