@@ -381,6 +381,53 @@ if page == "🇰🇷 대장주 낙폭반등":
             mime="application/gzip", use_container_width=True,
             key="kr_a_ohlc_download"
         )
+
+        # 분석환경 호환용: pandas/pyarrow 객체를 넣지 않고 파이썬 기본형만 저장합니다.
+        # 기존 체크포인트를 복원한 뒤 이 파일만 내려받으면 OHLC를 다시 구축할 필요가 없습니다.
+        def _kr_a_portable_bytes(ckpt):
+            portable_ohlc = {}
+            raw_ohlc = ckpt.get("ohlc", {}) if isinstance(ckpt, dict) else {}
+            for code, frame in raw_ohlc.items():
+                if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                    continue
+                q = frame.reset_index().copy()
+                date_col = q.columns[0]
+                records = []
+                for _, rr in q.iterrows():
+                    dt = pd.Timestamp(rr[date_col])
+                    records.append({
+                        "Date": dt.strftime("%Y-%m-%d"),
+                        "Open": float(rr["Open"]),
+                        "High": float(rr["High"]),
+                        "Low": float(rr["Low"]),
+                        "Close": float(rr["Close"]),
+                        "Volume": float(rr["Volume"]),
+                    })
+                portable_ohlc[str(code)] = records
+            payload = {
+                "format": "kr_candidate_a_ohlc_portable_v1",
+                "done": {str(k): (int(v) if isinstance(v, (int, np.integer)) else str(v)) for k, v in (ckpt.get("done", {}) or {}).items()},
+                "ohlc": portable_ohlc,
+                "candidate_rule": str(ckpt.get("candidate_rule", "A_v1")),
+                "candidate_signal_count": int(ckpt.get("candidate_signal_count", 0) or 0),
+                "candidate_code_count": int(ckpt.get("candidate_code_count", 0) or 0),
+                "development_period": str(ckpt.get("development_period", "2016-2023")),
+                "blind_period": str(ckpt.get("blind_period", "2024-2026")),
+            }
+            return gzip.compress(pickle.dumps(payload, protocol=4), compresslevel=3)
+
+        try:
+            portable_bytes = _kr_a_portable_bytes(a_ck)
+            st.download_button(
+                "📦 분석용 호환 파일 내려받기 (이 파일을 보내주세요)",
+                data=portable_bytes,
+                file_name="kr_leader_candidate_a_ohlc_portable.pkl.gz",
+                mime="application/gzip", use_container_width=True,
+                key="kr_a_ohlc_portable_download"
+            )
+            st.caption("기존 OHLC를 다시 구축하지 않습니다. 체크포인트 복원 후 이 호환 파일만 내려받아 보내면 됩니다.")
+        except Exception as e:
+            st.error(f"분석용 호환 파일 변환 실패: {e}")
         if a_codes and a_processed >= len(a_codes):
             ok_codes = sum(isinstance(v, (int, np.integer)) for c, v in a_done.items() if c in a_codes)
             st.success(f"후보 A OHLC 구축 완료 · 정상 데이터 {ok_codes:,}/{len(a_codes):,}종목")
