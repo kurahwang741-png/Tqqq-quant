@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 from io import StringIO
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(
     page_title="SOXL QUANT V32 DUAL",
@@ -28,12 +29,12 @@ page = st.sidebar.radio(
 )
 
 if page == "🇰🇷 대장주 낙폭반등":
-    st.title("🇰🇷 대장주 낙폭반등 V2.1 · 전 종목")
-    st.caption("전 종목 1차 스캔 → 과거 대장 후보만 정밀분석 → 결과 저장 · 2016~2023 개발구간 전용")
+    st.title("🇰🇷 대장주 낙폭반등 V2.2 · 전 종목 FAST")
+    st.caption("전 종목 유지 · 제한 병렬수집 → 과거 대장 후보만 정밀분석 → 체크포인트 저장 · 2016~2023 개발구간 전용")
     st.info("🔒 2024~2026은 봉인합니다. 실행 버튼을 누르기 전에는 KRX/과거가격을 조회하지 않습니다. SOXL 메뉴와 완전히 분리되어 있습니다.")
 
-    KR_CKPT = Path(".kr_leader_v21_checkpoint.pkl.gz")
-    KR_RESULT = Path("kr_leader_v21_signals.pkl.gz")
+    KR_CKPT = Path(".kr_leader_v22_checkpoint.pkl.gz")
+    KR_RESULT = Path("kr_leader_v22_signals.pkl.gz")
 
     def _kr_fdr():
         try:
@@ -152,55 +153,60 @@ if page == "🇰🇷 대장주 낙폭반등":
         return pd.DataFrame(out).sort_values(["Leader Score","낙폭"])
 
     c1,c2,c3=st.columns(3)
-    include_delisted=c1.checkbox("상장폐지 종목 포함",value=True,key="v21_delisted")
+    include_delisted=c1.checkbox("상장폐지 종목 포함",value=True,key="v22_delisted")
     c2.metric("개발구간","2016–2023")
     c3.metric("블라인드","2024–2026 🔒")
-    st.caption("100개 표본 제한을 제거했습니다. 1차는 전 종목에서 Leader Score 6+ 이력만 찾고, 통과 종목에만 낙폭반등 정밀분석을 수행합니다. 같은 서버 인스턴스에서는 체크포인트로 이어받을 수 있습니다.")
+    workers=st.select_slider("동시 조회 수",options=[1,2,3,4],value=3,key="v22_workers",help="Streamlit/FDR 과부하를 피하려고 최대 4개로 제한합니다. 3개 권장.")
+    st.caption("전체시장 표본은 그대로 유지합니다. V2.2는 여러 종목의 가격 수집만 제한적으로 병렬화하고, 각 종목 내부 계산은 동일합니다. 완료 종목은 체크포인트에 저장되어 다시 받지 않습니다.")
 
-    if st.button("🚀 전 종목 V2.1 구축/이어받기",type="primary",use_container_width=True,key="run_leader_v21"):
+    def _fetch_analyze(item):
+        code,name,source=item
+        try:
+            d=_kr_price(code)
+            if d.empty: return code,name,"데이터없음",0,[]
+            ok,mx=_is_leader_candidate(d)
+            if not ok: return code,name,f"1차탈락(score {mx:.0f})",0,[]
+            rows=_scan_one(code,name,d,source)
+            return code,name,f"대장후보(score {mx:.0f})",1,rows
+        except Exception:
+            return code,name,"조회실패",0,[]
+
+    if st.button("🚀 전 종목 V2.2 FAST 구축/이어받기",type="primary",use_container_width=True,key="run_leader_v22"):
         try:
             u=_kr_full_universe(include_delisted)
             ck=_load_gz(KR_CKPT,{"done":{},"rows":[],"candidates":0})
             done=ck.get("done",{}); all_rows=ck.get("rows",[]); candidates=int(ck.get("candidates",0))
             total=len(u); started=time.time(); processed_now=0
-            bar=st.progress(0.0,text=f"전체 {total:,}종목 준비")
+            todo=[(str(r.Code),str(r.Name),str(r.Source)) for _,r in u.iterrows() if str(r.Code) not in done]
+            bar=st.progress(len(done)/max(total,1),text=f"전체 {total:,}종목 · 남은 {len(todo):,}종목")
             stat=st.empty()
-            for pos,r in u.iterrows():
-                code,name,source=str(r.Code),str(r.Name),str(r.Source)
-                if code in done: continue
-                t0=time.time(); status="데이터없음"
-                try:
-                    d=_kr_price(code)
-                    if not d.empty:
-                        ok,mx=_is_leader_candidate(d)
-                        if ok:
-                            candidates+=1; all_rows.extend(_scan_one(code,name,d,source)); status=f"대장후보(score {mx:.0f})"
-                        else: status=f"1차탈락(score {mx:.0f})"
-                except Exception as e:
-                    status="조회실패"
-                done[code]=status; processed_now+=1
-                if processed_now%10==0:
-                    _save_gz(KR_CKPT,{"done":done,"rows":all_rows,"candidates":candidates})
-                completed=len(done); elapsed=time.time()-started
-                rate=processed_now/elapsed if elapsed>0 else 0; remain=max(total-completed,0); eta=remain/rate if rate>0 else 0
-                bar.progress(min(completed/max(total,1),1.0),text=f"{completed:,}/{total:,} · {name} · {status}")
-                stat.caption(f"대장 후보 {candidates:,}개 · 신호 {len(all_rows):,}개 · 이번 실행 {processed_now:,}종목 · 예상 남은시간 {eta/60:.1f}분")
+            with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+                futures={ex.submit(_fetch_analyze,item):item for item in todo}
+                for fut in as_completed(futures):
+                    code,name,status,cand,rows=fut.result()
+                    candidates+=cand; all_rows.extend(rows); done[code]=status; processed_now+=1
+                    if processed_now%25==0:
+                        _save_gz(KR_CKPT,{"done":done,"rows":all_rows,"candidates":candidates})
+                    completed=len(done); elapsed=time.time()-started
+                    rate=processed_now/elapsed if elapsed>0 else 0; remain=max(total-completed,0); eta=remain/rate if rate>0 else 0
+                    bar.progress(min(completed/max(total,1),1.0),text=f"{completed:,}/{total:,} · {name} · {status}")
+                    stat.caption(f"동시조회 {workers} · 대장후보 {candidates:,}개 · 신호 {len(all_rows):,}개 · 처리속도 {rate:.2f}종목/초 · 예상 남은시간 {eta/60:.1f}분")
             _save_gz(KR_CKPT,{"done":done,"rows":all_rows,"candidates":candidates})
             sig=pd.DataFrame(all_rows); _save_gz(KR_RESULT,sig)
-            st.session_state["leader_v21_signals"]=sig
+            st.session_state["leader_v22_signals"]=sig
             bar.empty(); stat.success(f"완료 · 전체 {total:,}종목 / 대장후보 {candidates:,}개 / 신호 {len(sig):,}개")
-        except Exception as e: st.error(f"V2.1 실행 실패: {e}")
+        except Exception as e: st.error(f"V2.2 실행 실패: {e}")
 
-    if st.button("📂 저장 결과 불러오기",use_container_width=True,key="load_leader_v21"):
+    if st.button("📂 저장 결과 불러오기",use_container_width=True,key="load_leader_v22"):
         sig=_load_gz(KR_RESULT,pd.DataFrame())
-        if isinstance(sig,pd.DataFrame) and not sig.empty: st.session_state["leader_v21_signals"]=sig
+        if isinstance(sig,pd.DataFrame) and not sig.empty: st.session_state["leader_v22_signals"]=sig
         else: st.warning("저장된 완료 결과가 아직 없습니다.")
 
-    sig=st.session_state.get("leader_v21_signals")
+    sig=st.session_state.get("leader_v22_signals")
     if not isinstance(sig,pd.DataFrame) or sig.empty:
         ck=_load_gz(KR_CKPT,None)
         if isinstance(ck,dict) and ck.get("done"):
-            st.caption(f"💾 체크포인트: {len(ck['done']):,}종목 완료 · 대장후보 {ck.get('candidates',0):,}개 · 신호 {len(ck.get('rows',[])):,}개")
+            st.caption(f"💾 V2.2 체크포인트: {len(ck['done']):,}종목 완료 · 대장후보 {ck.get('candidates',0):,}개 · 신호 {len(ck.get('rows',[])):,}개")
     else:
         st.subheader("📊 Leader Score × 낙폭구간")
         bs=_bucket_summary(sig); pct=[c for c in bs.columns if "승률" in c or "평균" in c or "중앙값" in c]
