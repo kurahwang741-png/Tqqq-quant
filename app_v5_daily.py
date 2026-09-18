@@ -847,6 +847,174 @@ if page == "🇰🇷 대장주 낙폭반등":
             st.success("🎯 V2 연구 데이터 구축 완료. 분석용 파일을 내려받아 보내주세요.")
         st.caption("전체 시장을 다시 받지 않습니다. Candidate A가 실제 발생한 종목만 처리합니다.")
 
+    # ------------------------------------------------------------
+    # ⑦ V2 C형 전체시장 구축
+    # 개발구간 2016~2023에서 구조적 C형 후보를 넓게 수집합니다.
+    # C형: 과거 대장 → 큰 낙폭 → 저점 → 첫 반등 → 재조정에서 저점 방어 → 재상승
+    # ------------------------------------------------------------
+    st.subheader("⑦ V2 C형 전체시장 구축")
+    st.caption("2016~2023 전체시장(상폐 포함 가능)에서 C형 구조를 넓게 수집합니다. 숫자 최적화가 아니라 구조 연구용 원자료입니다.")
+
+    KR_V2C_CKPT = Path("kr_v2c_2016_2023_checkpoint.pkl.gz")
+    KR_V2C_PORTABLE = Path("kr_v2c_2016_2023_portable.pkl.gz")
+
+    def _kr_v2c_scan(code, name, source, d):
+        if d is None or len(d) < 220:
+            return []
+        x = _kr_leader_events(d)
+        out, last_signal = [], None
+        # 넓은 사전 범위: 구조를 먼저 수집하고 결과 분석에서 견고성을 확인
+        for i in range(180, len(x) - 21):
+            dt = x.index[i]
+            if not 2016 <= dt.year <= 2023:
+                continue
+            hist = x.iloc[max(0, i-180):i+1]
+            leaders = hist[hist.LeaderScore >= 6]
+            if leaders.empty:
+                continue
+            lead_dt = leaders.LeaderScore.idxmax()
+            lead_pos = x.index.get_loc(lead_dt)
+            if isinstance(lead_pos, slice):
+                lead_pos = lead_pos.start
+            if i - int(lead_pos) < 25:
+                continue
+            seg = x.iloc[int(lead_pos):i+1]
+            peak_pos_rel = int(np.argmax(seg.High.to_numpy()))
+            peak_pos = int(lead_pos) + peak_pos_rel
+            if i - peak_pos < 15:
+                continue
+            post_peak = x.iloc[peak_pos:i+1]
+            low_pos_rel = int(np.argmin(post_peak.Low.to_numpy()))
+            low1_pos = peak_pos + low_pos_rel
+            if i - low1_pos < 6:
+                continue
+            peak = float(x.High.iloc[peak_pos]); low1 = float(x.Low.iloc[low1_pos])
+            if peak <= 0 or low1 <= 0:
+                continue
+            peak_to_low = low1 / peak - 1
+            # 큰 낙폭만 넓게 수집: -30~-70%
+            if not (-.70 <= peak_to_low <= -.30):
+                continue
+            # 첫 반등: 저점 뒤 최소 3일 이후의 고점, 최소 +8%
+            search_end = min(i-3, low1_pos+45)
+            if search_end <= low1_pos + 2:
+                continue
+            bounce_slice = x.iloc[low1_pos+1:search_end+1]
+            bounce_rel = int(np.argmax(bounce_slice.High.to_numpy()))
+            bounce_pos = low1_pos + 1 + bounce_rel
+            bounce_high = float(x.High.iloc[bounce_pos])
+            bounce_pct = bounce_high / low1 - 1
+            if bounce_pct < .08:
+                continue
+            # 재조정: 첫 반등 이후 최소 2일 지난 구간의 저점
+            if i - bounce_pos < 3:
+                continue
+            pull = x.iloc[bounce_pos+1:i+1]
+            low2_rel = int(np.argmin(pull.Low.to_numpy()))
+            low2_pos = bounce_pos + 1 + low2_rel
+            low2 = float(x.Low.iloc[low2_pos])
+            # 저점 방어를 넓게 정의: 1차 저점 대비 -3% 이상 붕괴하지 않음
+            defense = low2 / low1 - 1
+            if defense < -.03:
+                continue
+            # 재상승 확인: 현재 종가가 2차 저점 대비 +5% 이상, 최근 5일 고점권
+            close = float(x.Close.iloc[i])
+            rebound2 = close / low2 - 1 if low2 > 0 else np.nan
+            if not np.isfinite(rebound2) or rebound2 < .05:
+                continue
+            recent5 = x.iloc[max(low2_pos, i-4):i+1]
+            if close < float(recent5.High.max()) * .94:
+                continue
+            if last_signal is not None and (dt - last_signal).days < 20:
+                continue
+            entry = float(x.Open.iloc[i+1])
+            if entry <= 0:
+                continue
+            vol20 = float(x.Volume.iloc[max(0,i-19):i+1].mean())
+            vol5 = float(x.Volume.iloc[max(0,i-4):i+1].mean())
+            resistance = float(x.High.iloc[max(0,i-60):i+1].max())
+            def rr(n):
+                return float(x.Close.iloc[i+n] / entry - 1) if i+n < len(x) else np.nan
+            out.append({
+                "Code": str(code), "Name": str(name), "Source": str(source), "SignalDate": dt,
+                "LeaderScore": float(leaders.LeaderScore.max()),
+                "LeaderDate": lead_dt, "PeakDate": x.index[peak_pos], "Low1Date": x.index[low1_pos],
+                "BounceDate": x.index[bounce_pos], "Low2Date": x.index[low2_pos],
+                "PeakToLow1": peak_to_low, "PeakToLowDays": int(low1_pos-peak_pos),
+                "Low1ToBounceDays": int(bounce_pos-low1_pos), "BouncePct": bounce_pct,
+                "PullbackFromBounce": low2/bounce_high-1, "Low2Defense": defense,
+                "Low2ToSignalDays": int(i-low2_pos), "Rebound2": rebound2,
+                "Vol5To20": vol5/vol20 if vol20 > 0 else np.nan,
+                "Entry": entry, "Resistance": resistance,
+                "UpsideToResistance": resistance/entry-1 if entry > 0 else np.nan,
+                "R5": rr(5), "R10": rr(10), "R20": rr(20),
+            })
+            last_signal = dt
+        return out
+
+    def _kr_v2c_portable_bytes(ckpt):
+        rows0 = []
+        for r in (ckpt.get("rows", []) or []):
+            q = dict(r)
+            for k in ["SignalDate","LeaderDate","PeakDate","Low1Date","BounceDate","Low2Date"]:
+                if k in q and q[k] is not None:
+                    q[k] = pd.Timestamp(q[k]).strftime("%Y-%m-%d")
+            for k, v in list(q.items()):
+                if isinstance(v, (np.floating, np.integer)):
+                    q[k] = v.item()
+                elif isinstance(v, float) and not np.isfinite(v):
+                    q[k] = None
+            rows0.append(q)
+        payload = {
+            "format": "kr_v2c_structure_portable_v1", "development_period": "2016-2023",
+            "definition": "leader>=6; peak-to-low -30~-70%; first bounce>=8%; low2 defense>=-3%; second rebound>=5%; near recent5 high",
+            "include_delisted": bool(ckpt.get("include_delisted", True)),
+            "processed_count": len(ckpt.get("done", {}) or {}), "signals": rows0,
+        }
+        return gzip.compress(pickle.dumps(payload, protocol=4), compresslevel=3)
+
+    v2c_delisted = st.checkbox("V2 C형: 상장폐지 종목 포함", value=True, key="kr_v2c_delisted")
+    v2c_batch = st.select_slider("V2 C형 한 번에 처리할 종목 수", options=[50,100,200,300,400,500], value=300, key="kr_v2c_batch")
+    v2c_restore = st.file_uploader("V2 C형 체크포인트가 있으면 복원", type=["gz"], key="kr_v2c_restore")
+    if v2c_restore is not None and st.button("V2 C형 체크포인트 복원", use_container_width=True, key="kr_v2c_restore_btn"):
+        KR_V2C_CKPT.write_bytes(v2c_restore.getvalue()); st.success("V2 C형 체크포인트를 복원했습니다."); st.rerun()
+    try:
+        v2c_u = _kr_universe(v2c_delisted)
+    except Exception as e:
+        v2c_u = pd.DataFrame(columns=["Code","Name","Source"]); st.error(f"V2 C형 종목 목록 오류: {e}")
+    v2c_ck = _kr_load(KR_V2C_CKPT, {"done":{},"rows":[],"include_delisted":v2c_delisted})
+    v2c_done = v2c_ck.get("done", {}) if isinstance(v2c_ck, dict) else {}
+    v2c_rows = v2c_ck.get("rows", []) if isinstance(v2c_ck, dict) else []
+    v2c_total, v2c_processed = len(v2c_u), len(v2c_done)
+    q1,q2,q3 = st.columns(3); q1.metric("전체 종목", f"{v2c_total:,}"); q2.metric("처리 완료", f"{v2c_processed:,}"); q3.metric("C형 신호", f"{len(v2c_rows):,}")
+    if v2c_total:
+        st.progress(min(v2c_processed/v2c_total,1.0), text=f"V2 C형 {v2c_processed:,}/{v2c_total:,} ({v2c_processed/v2c_total:.1%})")
+    if st.button(f"▶ V2 C형 다음 {v2c_batch}종목 구축", type="primary", use_container_width=True, disabled=(not v2c_total or v2c_processed>=v2c_total), key="kr_v2c_build"):
+        pending = v2c_u[~v2c_u.Code.astype(str).isin(v2c_done)].head(v2c_batch)
+        bar=st.progress(0.0,text="V2 C형 구축 시작"); status=st.empty(); t0=time.time()
+        for j,(_,r) in enumerate(pending.iterrows(),1):
+            code=str(r.Code)
+            try:
+                d=_kr_price(code); add=_kr_v2c_scan(code,str(r.Name),str(r.Source),d) if not d.empty else []
+                v2c_rows.extend(add); v2c_done[code]=len(add)
+            except Exception as e:
+                v2c_done[code]=f"ERR:{type(e).__name__}"
+            if j%10==0 or j==len(pending):
+                _kr_save(KR_V2C_CKPT,{"done":v2c_done,"rows":v2c_rows,"include_delisted":v2c_delisted,"definition":"C_v1_structural"})
+            elapsed=time.time()-t0; rate=j/elapsed if elapsed else 0; eta=(len(pending)-j)/rate if rate else 0
+            bar.progress(j/max(len(pending),1),text=f"이번 묶음 {j}/{len(pending)}"); status.caption(f"현재 {r.Name} ({code}) · {rate:.2f}종목/초 · 남은시간 약 {eta/60:.1f}분")
+        st.success("이번 V2 C형 묶음 구축 완료"); st.rerun()
+    if KR_V2C_CKPT.exists():
+        st.download_button("💾 V2 C형 체크포인트 내려받기", data=KR_V2C_CKPT.read_bytes(), file_name="kr_v2c_2016_2023_checkpoint.pkl.gz", mime="application/gzip", use_container_width=True, key="kr_v2c_ckpt_dl")
+        try:
+            now=_kr_load(KR_V2C_CKPT,v2c_ck); pb=_kr_v2c_portable_bytes(now)
+            st.download_button("📦 V2 C형 분석용 파일 내려받기 (완료 후 보내주세요)", data=pb, file_name="kr_v2c_2016_2023_portable.pkl.gz", mime="application/gzip", use_container_width=True, key="kr_v2c_portable_dl")
+        except Exception as e:
+            st.error(f"V2 C형 분석용 변환 실패: {e}")
+    if v2c_total and v2c_processed>=v2c_total:
+        st.success(f"🎯 V2 C형 전체시장 구축 완료 · {len(v2c_rows):,}신호")
+    st.caption("완료 전 결과는 부분 표본입니다. 전체 구축 후 2016~2019 / 2020~2021 / 2022~2023 구간별 재현성을 비교합니다.")
+
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
