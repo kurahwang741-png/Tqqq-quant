@@ -700,6 +700,153 @@ if page == "🇰🇷 대장주 낙폭반등":
         st.success(f"🎯 블라인드 전체시장 구축 완료 · 후보 A {len(blind_rows):,}신호. 분석용 파일을 내려받아 보내주세요.")
     st.caption("중간에 Streamlit이 재부팅될 수 있으므로 각 묶음 뒤 체크포인트를 내려받아 보관하세요. 완료 전 분석용 파일은 부분 데이터입니다.")
 
+
+    # ------------------------------------------------------------
+    # ⑥ V2 연구 데이터 구축
+    # 블라인드 Candidate A 종목만 신호 이전 120거래일 + 이후 60거래일을 확보합니다.
+    # 2024~2026은 이미 열린 진단 구간이며, 이 데이터는 V2 가설 연구용입니다.
+    # ------------------------------------------------------------
+    st.subheader("⑥ V2 연구 데이터 구축")
+    st.info("Candidate A가 발생한 종목만 다시 받습니다. 각 신호 전 약 120거래일 + 후 약 60거래일 OHLC를 저장합니다.")
+
+    KR_V2_RESEARCH_CKPT = Path("kr_v2_research_checkpoint.pkl.gz")
+    KR_V2_RESEARCH_PORTABLE = Path("kr_v2_research_portable.pkl.gz")
+    KR_V2_LOOKBACK_START = "2023-01-01"
+
+    def _kr_v2_target_signals():
+        # 가장 신뢰할 수 있는 원천은 ⑤에서 만든 체크포인트입니다.
+        if KR_BLIND_CKPT.exists():
+            z = _kr_load(KR_BLIND_CKPT, {})
+            rows = z.get("rows", []) if isinstance(z, dict) else []
+            if rows:
+                return rows
+        return []
+
+    def _kr_v2_window(d, signal_dates):
+        if d is None or d.empty:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        parts = []
+        for sd in pd.to_datetime(list(signal_dates)):
+            pos = int(d.index.searchsorted(sd, side="left"))
+            lo = max(0, pos - 125)   # 신호 전 120거래일보다 약간 여유
+            hi = min(len(d), pos + 62)  # 신호 후 약 60거래일
+            w = d.iloc[lo:hi][["Open", "High", "Low", "Close", "Volume"]]
+            if not w.empty:
+                parts.append(w)
+        if not parts:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        out = pd.concat(parts).sort_index()
+        return out.loc[~out.index.duplicated(keep="first")]
+
+    def _kr_v2_portable_bytes(ckpt, signals):
+        portable_ohlc = {}
+        for code, frame in (ckpt.get("ohlc", {}) or {}).items():
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            records = []
+            for dt, rr in frame.iterrows():
+                records.append({
+                    "Date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                    "Open": float(rr["Open"]), "High": float(rr["High"]),
+                    "Low": float(rr["Low"]), "Close": float(rr["Close"]),
+                    "Volume": float(rr["Volume"]),
+                })
+            portable_ohlc[str(code)] = records
+        portable_signals = []
+        for r in signals:
+            q = dict(r)
+            q["SignalDate"] = pd.Timestamp(q["SignalDate"]).strftime("%Y-%m-%d")
+            for k in ["LeaderScore", "Drawdown", "Entry", "Resistance", "UpsideToResistance", "R5", "R10", "R20"]:
+                if k in q:
+                    v = q[k]
+                    q[k] = None if pd.isna(v) else float(v)
+            portable_signals.append(q)
+        payload = {
+            "format": "kr_v2_research_portable_v1",
+            "purpose": "Candidate A success/failure diagnostics; pre-signal path research",
+            "source_rule": "LeaderScore 6~7; Drawdown -55~-50%; UpsideToResistance >=50%",
+            "research_period": f"2024-01-01~{KR_BLIND_END_STR}",
+            "lookback_trading_days": 125,
+            "forward_trading_days": 61,
+            "processed_count": len(ckpt.get("done", {}) or {}),
+            "signals": portable_signals,
+            "ohlc": portable_ohlc,
+        }
+        return gzip.compress(pickle.dumps(payload, protocol=4), compresslevel=3)
+
+    v2_signals = _kr_v2_target_signals()
+    if not v2_signals:
+        st.warning("⑤ 블라인드 체크포인트가 현재 서버에 없습니다. 먼저 ⑤에서 완성된 블라인드 체크포인트를 복원해 주세요.")
+    else:
+        v2_sig_df = pd.DataFrame(v2_signals)
+        v2_sig_df["Code"] = v2_sig_df["Code"].astype(str)
+        v2_codes = sorted(v2_sig_df["Code"].unique().tolist())
+        v2_ck = _kr_load(KR_V2_RESEARCH_CKPT, {"done": {}, "ohlc": {}})
+        v2_done = v2_ck.get("done", {}) if isinstance(v2_ck, dict) else {}
+        v2_ohlc = v2_ck.get("ohlc", {}) if isinstance(v2_ck, dict) else {}
+
+        v2_restore = st.file_uploader("V2 연구 체크포인트가 있으면 복원", type=["gz"], key="kr_v2_restore")
+        if v2_restore is not None and st.button("V2 연구 체크포인트 복원", use_container_width=True, key="kr_v2_restore_btn"):
+            KR_V2_RESEARCH_CKPT.write_bytes(v2_restore.getvalue())
+            st.success("V2 연구 체크포인트를 복원했습니다.")
+            st.rerun()
+
+        v2_batch = st.select_slider("V2 한 번에 처리할 종목 수", options=[20, 50, 100, 150, 200], value=100, key="kr_v2_batch")
+        v2_total = len(v2_codes)
+        v2_processed = sum(1 for c in v2_codes if c in v2_done)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("V2 대상 종목", f"{v2_total:,}")
+        c2.metric("처리 완료", f"{v2_processed:,}")
+        c3.metric("원본 후보 A 신호", f"{len(v2_signals):,}")
+        if v2_total:
+            st.progress(min(v2_processed / v2_total, 1.0), text=f"V2 {v2_processed:,} / {v2_total:,} ({v2_processed/v2_total:.1%})")
+
+        if st.button(f"▶ V2 다음 {v2_batch}종목 구축", type="primary", use_container_width=True,
+                     disabled=(v2_processed >= v2_total), key="kr_v2_build"):
+            pending = [c for c in v2_codes if c not in v2_done][:v2_batch]
+            pbar = st.progress(0.0, text="V2 연구 데이터 구축 시작")
+            pstatus = st.empty()
+            t0 = time.time()
+            for j, code in enumerate(pending, 1):
+                try:
+                    d = _kr_blind_price(code)
+                    sds = v2_sig_df.loc[v2_sig_df.Code == code, "SignalDate"].tolist()
+                    w = _kr_v2_window(d, sds)
+                    if not w.empty:
+                        v2_ohlc[code] = w
+                    v2_done[code] = len(w)
+                except Exception as e:
+                    v2_done[code] = f"ERR:{type(e).__name__}"
+                if j % 10 == 0 or j == len(pending):
+                    _kr_save(KR_V2_RESEARCH_CKPT, {
+                        "done": v2_done, "ohlc": v2_ohlc,
+                        "source_rule": "A_v1", "research_period": f"2024-01-01~{KR_BLIND_END_STR}",
+                    })
+                elapsed = time.time() - t0
+                rate = j / elapsed if elapsed else 0
+                eta = (len(pending) - j) / rate if rate else 0
+                pbar.progress(j / max(len(pending), 1), text=f"이번 묶음 {j}/{len(pending)}")
+                pstatus.caption(f"현재 {code} · {rate:.2f}종목/초 · 이번 묶음 남은시간 약 {eta/60:.1f}분")
+            st.success("이번 V2 연구 묶음 구축이 끝났습니다.")
+            st.rerun()
+
+        if KR_V2_RESEARCH_CKPT.exists():
+            st.download_button("💾 V2 연구 체크포인트 내려받기", data=KR_V2_RESEARCH_CKPT.read_bytes(),
+                               file_name="kr_v2_research_checkpoint.pkl.gz", mime="application/gzip",
+                               use_container_width=True, key="kr_v2_ckpt_download")
+            try:
+                v2_ck_now = _kr_load(KR_V2_RESEARCH_CKPT, v2_ck)
+                v2_portable = _kr_v2_portable_bytes(v2_ck_now, v2_signals)
+                st.download_button("📦 V2 연구 분석용 파일 내려받기 (완료 후 이 파일을 보내주세요)",
+                                   data=v2_portable, file_name="kr_v2_research_portable.pkl.gz",
+                                   mime="application/gzip", use_container_width=True, key="kr_v2_portable_download")
+            except Exception as e:
+                st.error(f"V2 연구 분석용 파일 변환 실패: {e}")
+
+        if v2_total and v2_processed >= v2_total:
+            st.success("🎯 V2 연구 데이터 구축 완료. 분석용 파일을 내려받아 보내주세요.")
+        st.caption("전체 시장을 다시 받지 않습니다. Candidate A가 실제 발생한 종목만 처리합니다.")
+
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
