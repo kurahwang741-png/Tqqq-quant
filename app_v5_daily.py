@@ -1015,6 +1015,176 @@ if page == "🇰🇷 대장주 낙폭반등":
         st.success(f"🎯 V2 C형 전체시장 구축 완료 · {len(v2c_rows):,}신호")
     st.caption("완료 전 결과는 부분 표본입니다. 전체 구축 후 2016~2019 / 2020~2021 / 2022~2023 구간별 재현성을 비교합니다.")
 
+
+    # ------------------------------------------------------------
+    # ⑧ C형 2024~2026 스트레스 테스트
+    # ⑦에서 정의한 C_v1 구조를 변경하지 않고 2024년 이후에 그대로 적용합니다.
+    # 동시에 사전 고정 하위그룹: Leader 6~7 / PeakToLow1 <= -52.5% / 저항여력 >=35%
+    # ------------------------------------------------------------
+    st.subheader("⑧ C형 2024~2026 스트레스 테스트")
+    st.warning("🔒 규칙 고정 테스트입니다. 결과를 본 뒤 이 화면에서 조건을 변경하지 않습니다.")
+    st.caption("원형 C형 전체와 사전 고정 하위그룹을 동시에 기록합니다. 2023년은 2024년 초 계산용 워밍업으로만 사용합니다.")
+
+    KR_V2C_STRESS_CKPT = Path("kr_v2c_stress_2024_2026_checkpoint.pkl.gz")
+    KR_V2C_STRESS_START = pd.Timestamp("2024-01-01")
+    KR_V2C_STRESS_END_STR = datetime.now().strftime("%Y-%m-%d")
+    KR_V2C_STRESS_END = pd.Timestamp(KR_V2C_STRESS_END_STR)
+
+    def _kr_v2c_stress_scan(code, name, source, d):
+        if d is None or len(d) < 220:
+            return []
+        x = _kr_leader_events(d)
+        out, last_signal = [], None
+        for i in range(180, len(x) - 21):
+            dt = x.index[i]
+            if dt < KR_V2C_STRESS_START or dt > KR_V2C_STRESS_END:
+                continue
+            hist = x.iloc[max(0, i-180):i+1]
+            leaders = hist[hist.LeaderScore >= 6]
+            if leaders.empty:
+                continue
+            lead_dt = leaders.LeaderScore.idxmax()
+            lead_pos = x.index.get_loc(lead_dt)
+            if isinstance(lead_pos, slice):
+                lead_pos = lead_pos.start
+            if i - int(lead_pos) < 25:
+                continue
+            seg = x.iloc[int(lead_pos):i+1]
+            peak_pos = int(lead_pos) + int(np.argmax(seg.High.to_numpy()))
+            if i - peak_pos < 15:
+                continue
+            post_peak = x.iloc[peak_pos:i+1]
+            low1_pos = peak_pos + int(np.argmin(post_peak.Low.to_numpy()))
+            if i - low1_pos < 6:
+                continue
+            peak = float(x.High.iloc[peak_pos]); low1 = float(x.Low.iloc[low1_pos])
+            if peak <= 0 or low1 <= 0:
+                continue
+            peak_to_low = low1 / peak - 1
+            if not (-.70 <= peak_to_low <= -.30):
+                continue
+            search_end = min(i-3, low1_pos+45)
+            if search_end <= low1_pos + 2:
+                continue
+            bounce_slice = x.iloc[low1_pos+1:search_end+1]
+            bounce_pos = low1_pos + 1 + int(np.argmax(bounce_slice.High.to_numpy()))
+            bounce_high = float(x.High.iloc[bounce_pos])
+            bounce_pct = bounce_high / low1 - 1
+            if bounce_pct < .08:
+                continue
+            if i - bounce_pos < 3:
+                continue
+            pull = x.iloc[bounce_pos+1:i+1]
+            low2_pos = bounce_pos + 1 + int(np.argmin(pull.Low.to_numpy()))
+            low2 = float(x.Low.iloc[low2_pos])
+            defense = low2 / low1 - 1
+            if defense < -.03:
+                continue
+            close = float(x.Close.iloc[i])
+            rebound2 = close / low2 - 1 if low2 > 0 else np.nan
+            if not np.isfinite(rebound2) or rebound2 < .05:
+                continue
+            recent5 = x.iloc[max(low2_pos, i-4):i+1]
+            if close < float(recent5.High.max()) * .94:
+                continue
+            if last_signal is not None and (dt - last_signal).days < 20:
+                continue
+            entry = float(x.Open.iloc[i+1])
+            if entry <= 0:
+                continue
+            vol20 = float(x.Volume.iloc[max(0,i-19):i+1].mean())
+            vol5 = float(x.Volume.iloc[max(0,i-4):i+1].mean())
+            resistance = float(x.High.iloc[max(0,i-60):i+1].max())
+            upside = resistance/entry-1 if entry > 0 else np.nan
+            leader_score = float(leaders.LeaderScore.max())
+            locked_subgroup = bool(6 <= leader_score < 8 and peak_to_low <= -.525 and np.isfinite(upside) and upside >= .35)
+            def rr(n):
+                return float(x.Close.iloc[i+n] / entry - 1) if i+n < len(x) else np.nan
+            out.append({
+                "Code": str(code), "Name": str(name), "Source": str(source), "SignalDate": dt,
+                "LeaderScore": leader_score, "LeaderDate": lead_dt, "PeakDate": x.index[peak_pos],
+                "Low1Date": x.index[low1_pos], "BounceDate": x.index[bounce_pos], "Low2Date": x.index[low2_pos],
+                "PeakToLow1": peak_to_low, "PeakToLowDays": int(low1_pos-peak_pos),
+                "Low1ToBounceDays": int(bounce_pos-low1_pos), "BouncePct": bounce_pct,
+                "PullbackFromBounce": low2/bounce_high-1, "Low2Defense": defense,
+                "Low2ToSignalDays": int(i-low2_pos), "Rebound2": rebound2,
+                "Vol5To20": vol5/vol20 if vol20 > 0 else np.nan,
+                "Entry": entry, "Resistance": resistance, "UpsideToResistance": upside,
+                "LockedSubgroup": locked_subgroup, "R5": rr(5), "R10": rr(10), "R20": rr(20),
+            })
+            last_signal = dt
+        return out
+
+    def _kr_v2c_stress_portable_bytes(ckpt):
+        rows0 = []
+        for r in (ckpt.get("rows", []) or []):
+            q = dict(r)
+            for k in ["SignalDate","LeaderDate","PeakDate","Low1Date","BounceDate","Low2Date"]:
+                if k in q and q[k] is not None:
+                    q[k] = pd.Timestamp(q[k]).strftime("%Y-%m-%d")
+            for k, v in list(q.items()):
+                if isinstance(v, (np.floating, np.integer)):
+                    q[k] = v.item()
+                elif isinstance(v, float) and not np.isfinite(v):
+                    q[k] = None
+            rows0.append(q)
+        payload = {
+            "format": "kr_v2c_stress_portable_v1",
+            "period": f"2024-01-01~{KR_V2C_STRESS_END_STR}",
+            "definition": "C_v1 unchanged: leader>=6; peak-to-low -30~-70%; first bounce>=8%; low2 defense>=-3%; second rebound>=5%; near recent5 high",
+            "locked_subgroup": "LeaderScore 6~7; PeakToLow1 <= -52.5%; UpsideToResistance >=35%",
+            "include_delisted": bool(ckpt.get("include_delisted", True)),
+            "processed_count": len(ckpt.get("done", {}) or {}),
+            "signals": rows0,
+        }
+        return gzip.compress(pickle.dumps(payload, protocol=4), compresslevel=3)
+
+    v2cs_delisted = st.checkbox("C형 스트레스: 상장폐지 종목 포함", value=True, key="kr_v2cs_delisted")
+    v2cs_batch = st.select_slider("C형 스트레스 한 번에 처리할 종목 수", options=[50,100,200,300,400,500], value=300, key="kr_v2cs_batch")
+    v2cs_restore = st.file_uploader("C형 스트레스 체크포인트가 있으면 복원", type=["gz"], key="kr_v2cs_restore")
+    if v2cs_restore is not None and st.button("C형 스트레스 체크포인트 복원", use_container_width=True, key="kr_v2cs_restore_btn"):
+        KR_V2C_STRESS_CKPT.write_bytes(v2cs_restore.getvalue()); st.success("C형 스트레스 체크포인트를 복원했습니다."); st.rerun()
+    try:
+        v2cs_u = _kr_universe(v2cs_delisted)
+    except Exception as e:
+        v2cs_u = pd.DataFrame(columns=["Code","Name","Source"]); st.error(f"C형 스트레스 종목 목록 오류: {e}")
+    v2cs_ck = _kr_load(KR_V2C_STRESS_CKPT, {"done":{},"rows":[],"include_delisted":v2cs_delisted})
+    v2cs_done = v2cs_ck.get("done", {}) if isinstance(v2cs_ck, dict) else {}
+    v2cs_rows = v2cs_ck.get("rows", []) if isinstance(v2cs_ck, dict) else []
+    v2cs_total, v2cs_processed = len(v2cs_u), len(v2cs_done)
+    locked_now = sum(bool(r.get("LockedSubgroup", False)) for r in v2cs_rows)
+    s1,s2,s3,s4 = st.columns(4)
+    s1.metric("전체 종목", f"{v2cs_total:,}"); s2.metric("처리 완료", f"{v2cs_processed:,}")
+    s3.metric("원형 C형", f"{len(v2cs_rows):,}"); s4.metric("고정 하위그룹", f"{locked_now:,}")
+    if v2cs_total:
+        st.progress(min(v2cs_processed/v2cs_total,1.0), text=f"C형 스트레스 {v2cs_processed:,}/{v2cs_total:,} ({v2cs_processed/v2cs_total:.1%})")
+    if st.button(f"▶ C형 스트레스 다음 {v2cs_batch}종목 구축", type="primary", use_container_width=True,
+                 disabled=(not v2cs_total or v2cs_processed>=v2cs_total), key="kr_v2cs_build"):
+        pending = v2cs_u[~v2cs_u.Code.astype(str).isin(v2cs_done)].head(v2cs_batch)
+        bar=st.progress(0.0,text="C형 2024~2026 스트레스 구축 시작"); status=st.empty(); t0=time.time()
+        for j,(_,r) in enumerate(pending.iterrows(),1):
+            code=str(r.Code)
+            try:
+                d=_kr_blind_price(code); add=_kr_v2c_stress_scan(code,str(r.Name),str(r.Source),d) if not d.empty else []
+                v2cs_rows.extend(add); v2cs_done[code]=len(add)
+            except Exception as e:
+                v2cs_done[code]=f"ERR:{type(e).__name__}"
+            if j%10==0 or j==len(pending):
+                _kr_save(KR_V2C_STRESS_CKPT,{"done":v2cs_done,"rows":v2cs_rows,"include_delisted":v2cs_delisted,"definition":"C_v1_frozen","locked_subgroup":"LS6_7_DD52.5_UP35"})
+            elapsed=time.time()-t0; rate=j/elapsed if elapsed else 0; eta=(len(pending)-j)/rate if rate else 0
+            bar.progress(j/max(len(pending),1),text=f"이번 묶음 {j}/{len(pending)}"); status.caption(f"현재 {r.Name} ({code}) · {rate:.2f}종목/초 · 남은시간 약 {eta/60:.1f}분")
+        st.success("이번 C형 스트레스 묶음 구축 완료"); st.rerun()
+    if KR_V2C_STRESS_CKPT.exists():
+        st.download_button("💾 C형 스트레스 체크포인트 내려받기", data=KR_V2C_STRESS_CKPT.read_bytes(), file_name="kr_v2c_stress_2024_2026_checkpoint.pkl.gz", mime="application/gzip", use_container_width=True, key="kr_v2cs_ckpt_dl")
+        try:
+            now=_kr_load(KR_V2C_STRESS_CKPT,v2cs_ck); pb=_kr_v2c_stress_portable_bytes(now)
+            st.download_button("📦 C형 스트레스 분석용 파일 내려받기 (완료 후 보내주세요)", data=pb, file_name="kr_v2c_stress_2024_2026_portable.pkl.gz", mime="application/gzip", use_container_width=True, key="kr_v2cs_portable_dl")
+        except Exception as e:
+            st.error(f"C형 스트레스 분석용 변환 실패: {e}")
+    if v2cs_total and v2cs_processed>=v2cs_total:
+        st.success(f"🎯 C형 2024~2026 스트레스 전체시장 구축 완료 · 원형 {len(v2cs_rows):,}신호 / 고정 하위그룹 {locked_now:,}신호")
+    st.caption("완료 후 분석용 파일을 보내주세요. 원형 C형과 고정 하위그룹을 연도별 승률·평균·중앙값으로 그대로 비교합니다.")
+
 if page == "📈 SOXL 퀀트":
     st.title("📈 SOXL QUANT V32 DUAL")
     st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
