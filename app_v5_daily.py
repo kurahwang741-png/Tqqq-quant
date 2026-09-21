@@ -20,6 +20,216 @@ st.set_page_config(
     layout="centered",
 )
 
+
+page = st.sidebar.radio(
+    "메뉴",
+    ["📈 SOXL 퀀트", "🇰🇷 반복 지지구간 V1"],
+    index=0,
+    key="main_page_support_v1",
+)
+
+if page == "🇰🇷 반복 지지구간 V1":
+    st.title("🇰🇷 반복 지지구간 V1")
+    st.caption("강했던 종목이 같은 가격대를 반복 테스트하는 자리부터 검증 · 일봉 1차 연구")
+    st.info("개발 2016~2021 / 검증 2022~2023 고정. 2024년 이후는 이번 V1 구축에서 사용하지 않습니다.")
+
+    try:
+        import FinanceDataReader as fdr
+    except Exception as e:
+        st.error("FinanceDataReader가 필요합니다. requirements.txt에 finance-datareader를 추가해 주세요.")
+        st.exception(e)
+        st.stop()
+
+    SUPPORT_START, SUPPORT_END = "2015-01-01", "2023-12-31"
+    SUPPORT_CKPT = Path("kr_support_v1_checkpoint.pkl.gz")
+    SUPPORT_RESULT = Path("kr_support_v1_signals.pkl.gz")
+
+    def _sv1_save(path, obj):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with gzip.open(tmp, "wb", compresslevel=3) as f:
+            pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+
+    def _sv1_load(path, default):
+        try:
+            with gzip.open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return default
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def _sv1_universe(include_delisted=True):
+        def norm(d, source):
+            if d is None or d.empty:
+                return pd.DataFrame(columns=["Code", "Name", "Source"])
+            cc = next((c for c in ["Code", "Symbol"] if c in d.columns), None)
+            nn = next((c for c in ["Name", "Company"] if c in d.columns), None)
+            if not cc or not nn:
+                return pd.DataFrame(columns=["Code", "Name", "Source"])
+            q = pd.DataFrame({"Code": d[cc].astype(str).str.zfill(6), "Name": d[nn].astype(str), "Source": source})
+            return q[q.Code.str.fullmatch(r"\d{6}", na=False)].drop_duplicates("Code")
+        frames = [norm(fdr.StockListing("KRX"), "현재상장")]
+        if include_delisted:
+            try:
+                frames.append(norm(fdr.StockListing("KRX-DELISTING"), "상장폐지"))
+            except Exception:
+                pass
+        return pd.concat(frames, ignore_index=True).drop_duplicates("Code", keep="first").reset_index(drop=True)
+
+    def _sv1_price(code):
+        d = fdr.DataReader(str(code), SUPPORT_START, SUPPORT_END)
+        if d is None or d.empty:
+            return pd.DataFrame()
+        d = d.copy()
+        d.index = pd.to_datetime(d.index).tz_localize(None)
+        need = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in need):
+            return pd.DataFrame()
+        for c in need:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        return d.dropna(subset=need).sort_index()
+
+    def _sv1_scan(code, name, source, d):
+        """V1: 강한 상승 뒤 ±2% 지지존을 2~4번째 재시험하는 일봉 신호를 수집한다."""
+        if len(d) < 100:
+            return []
+        x = d.copy()
+        x["R20"] = x.Close.pct_change(20)
+        x["R60"] = x.Close.pct_change(60)
+        x["Amount"] = x.Close * x.Volume
+        x["Amt20"] = x.Amount.rolling(20).mean()
+        rows = []
+        last_signal = None
+        for i in range(80, len(x) - 21):
+            dt = x.index[i]
+            if not 2016 <= dt.year <= 2023:
+                continue
+            # 최근 60거래일 안에 '강했던 종목' 흔적: 20일 +30% 또는 60일 +60%
+            pre = x.iloc[max(0, i-60):i+1]
+            strong = bool((pre.R20 >= .30).any() or (pre.R60 >= .60).any())
+            if not strong:
+                continue
+            # 오늘 이전 60거래일의 저점 후보. 오늘 가격과 ±2%인 과거 저점들을 지지존 접촉으로 본다.
+            cur_low = float(x.Low.iloc[i]); cur_close = float(x.Close.iloc[i])
+            if cur_low <= 0:
+                continue
+            hist = x.iloc[max(0, i-60):i]
+            lows = hist.Low.astype(float)
+            near_idx = [j for j, v in enumerate(lows.values) if v > 0 and abs(v / cur_low - 1) <= .02]
+            if not near_idx:
+                continue
+            # 서로 5거래일 이상 떨어진 접촉만 독립 테스트로 계산하고, 접촉 후 5일 내 +5% 반등이 있었는지 확인
+            touches = []
+            last_j = -99
+            for j in near_idx:
+                if j - last_j < 5:
+                    continue
+                abs_j = max(0, i-60) + j
+                end_j = min(i, abs_j + 6)
+                base = float(x.Low.iloc[abs_j])
+                bounced = end_j > abs_j + 1 and float(x.High.iloc[abs_j+1:end_j].max()) / base - 1 >= .05
+                if bounced:
+                    touches.append(abs_j)
+                    last_j = j
+            test_no = len(touches) + 1
+            if test_no not in (2, 3, 4):
+                continue
+            support = float(np.median([float(x.Low.iloc[j]) for j in touches] + [cur_low]))
+            # 현재도 지지존 근처에서 끝났는지. 완전 붕괴 종목은 제외하되 언더컷은 기록한다.
+            if not (support * .95 <= cur_close <= support * 1.08):
+                continue
+            if last_signal is not None and (dt - last_signal).days < 10:
+                continue
+            entry = float(x.Open.iloc[i+1])
+            if entry <= 0:
+                continue
+            undercut = cur_low / support - 1
+            amount20 = float(x.Amt20.iloc[i]) if np.isfinite(x.Amt20.iloc[i]) else np.nan
+            def rr(n):
+                return float(x.Close.iloc[i+n] / entry - 1) if i+n < len(x) else np.nan
+            rows.append({
+                "Code": str(code), "Name": str(name), "Source": str(source), "SignalDate": dt,
+                "TestNo": int(test_no), "Support": support, "Undercut": undercut,
+                "Entry": entry, "StrongR20Max": float(pre.R20.max()), "StrongR60Max": float(pre.R60.max()),
+                "Amount20": amount20, "R5": rr(5), "R10": rr(10), "R20": rr(20),
+                "Period": "개발" if dt.year <= 2021 else "검증",
+            })
+            last_signal = dt
+        return rows
+
+    def _sv1_summary(df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = []
+        for (period, testno), g in df.groupby(["Period", "TestNo"]):
+            r = {"구간": period, "지지테스트": f"{int(testno)}번째", "신호수": len(g)}
+            for n in (5, 10, 20):
+                z = pd.to_numeric(g[f"R{n}"], errors="coerce").dropna()
+                r[f"R{n} 승률"] = float((z > 0).mean()) if len(z) else np.nan
+                r[f"R{n} 평균"] = float(z.mean()) if len(z) else np.nan
+                r[f"R{n} 중앙값"] = float(z.median()) if len(z) else np.nan
+            out.append(r)
+        return pd.DataFrame(out).sort_values(["구간", "지지테스트"])
+
+    include_delisted = st.checkbox("상장폐지 종목 포함", value=True, key="sv1_delisted")
+    batch = st.select_slider("한 번에 처리할 종목 수", options=[50,100,200,300,400,500], value=300, key="sv1_batch")
+    restore = st.file_uploader("V1 체크포인트 복원", type=["gz"], key="sv1_restore")
+    if restore is not None and st.button("체크포인트 복원", use_container_width=True, key="sv1_restore_btn"):
+        SUPPORT_CKPT.write_bytes(restore.getvalue()); st.success("복원했습니다."); st.rerun()
+
+    try:
+        universe = _sv1_universe(include_delisted)
+    except Exception as e:
+        st.error(f"종목 목록 로드 실패: {e}"); universe = pd.DataFrame(columns=["Code","Name","Source"])
+    ck = _sv1_load(SUPPORT_CKPT, {"done": {}, "rows": [], "include_delisted": include_delisted})
+    done = ck.get("done", {}) if isinstance(ck, dict) else {}
+    rows = ck.get("rows", []) if isinstance(ck, dict) else []
+    total = len(universe); processed = len(done)
+    a,b,c = st.columns(3); a.metric("전체 종목", f"{total:,}"); b.metric("완료", f"{processed:,}"); c.metric("신호", f"{len(rows):,}")
+    if total:
+        st.progress(min(processed/total,1.0), text=f"{processed:,}/{total:,} ({processed/total:.1%})")
+
+    if st.button(f"▶ 다음 {batch}종목 구축", type="primary", use_container_width=True, disabled=(not total or processed>=total), key="sv1_build"):
+        pending = universe[~universe.Code.astype(str).isin(done)].head(batch)
+        bar=st.progress(0.0); status=st.empty(); t0=time.time()
+        for k,(_,r) in enumerate(pending.iterrows(),1):
+            code=str(r.Code)
+            try:
+                d=_sv1_price(code); add=_sv1_scan(code,str(r.Name),str(r.Source),d) if not d.empty else []
+                rows.extend(add); done[code]=len(add)
+            except Exception as e:
+                done[code]=f"ERR:{type(e).__name__}"
+            if k%10==0 or k==len(pending):
+                _sv1_save(SUPPORT_CKPT,{"done":done,"rows":rows,"include_delisted":include_delisted,"rule":"support_v1_locked"})
+            elapsed=time.time()-t0; rate=k/elapsed if elapsed else 0; eta=(len(pending)-k)/rate if rate else 0
+            bar.progress(k/max(len(pending),1), text=f"이번 묶음 {k}/{len(pending)}")
+            status.caption(f"현재 {r.Name} ({code}) · {rate:.2f}종목/초 · 약 {eta/60:.1f}분 남음")
+        if len(done)>=total:
+            _sv1_save(SUPPORT_RESULT,pd.DataFrame(rows))
+        st.success("이번 묶음 완료"); st.rerun()
+
+    if SUPPORT_CKPT.exists():
+        st.download_button("💾 V1 체크포인트 내려받기", data=SUPPORT_CKPT.read_bytes(), file_name="kr_support_v1_checkpoint.pkl.gz", mime="application/gzip", use_container_width=True)
+    sig = pd.DataFrame(rows)
+    if not sig.empty:
+        sm = _sv1_summary(sig)
+        fm = {c:"{:.2%}" for c in sm.columns if "승률" in c or "평균" in c or "중앙값" in c}
+        st.subheader("현재 결과 · 2/3/4번째 지지 테스트")
+        st.dataframe(sm.style.format(fm, na_rep="-"), use_container_width=True, hide_index=True)
+        payload={"format":"kr_support_v1_portable_v1","rule":"강한상승→±2% 반복지지→2/3/4번째 테스트","development":"2016-2021","validation":"2022-2023","signals":[]}
+        for r in rows:
+            q=dict(r); q["SignalDate"]=pd.Timestamp(q["SignalDate"]).strftime("%Y-%m-%d")
+            for key,val in list(q.items()):
+                if isinstance(val,(np.integer,)): q[key]=int(val)
+                elif isinstance(val,(np.floating,)): q[key]=None if pd.isna(val) else float(val)
+            payload["signals"].append(q)
+        portable=gzip.compress(pickle.dumps(payload,protocol=4),compresslevel=3)
+        st.download_button("📦 V1 분석용 파일 내려받기", data=portable, file_name="kr_support_v1_portable.pkl.gz", mime="application/gzip", use_container_width=True)
+        st.caption("먼저 반복 지지 자체의 엣지만 봅니다. 대장주·테마·분봉 조건은 V1 결과를 본 뒤 별도로 추가합니다.")
+    else:
+        st.info("첫 묶음을 구축하면 2·3·4번째 지지 테스트 성과가 표시됩니다.")
+    st.stop()
+
 st.title("📈 SOXL QUANT V32 DUAL")
 st.caption("C-ORIGINAL 원본 역추적 / C-ALPHA 장기 CAGR 연구를 분리 · 실전 체결관리 · 기록 복구")
 
