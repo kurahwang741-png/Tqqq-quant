@@ -23,10 +23,155 @@ st.set_page_config(
 
 page = st.sidebar.radio(
     "메뉴",
-    ["📈 SOXL 퀀트", "🇰🇷 반복 지지구간 V1"],
+    ["📈 SOXL 퀀트", "🇰🇷 반복 지지구간 V1", "🇰🇷 반복 지지구간 V2 · 대장주"],
     index=0,
     key="main_page_support_v1",
 )
+
+if page == "🇰🇷 반복 지지구간 V2 · 대장주":
+    st.title("🇰🇷 반복 지지구간 V2 · 대장주")
+    st.caption("V1 지지선 공식은 고정 · 이번에는 '누구의 지지선인가'만 검증")
+    st.info("중요: 이 V2의 '대장'은 과거 테마명이 아니라 같은 날 강세 후보들 사이의 상대강도·거래대금·신고가 근접도로 만든 동적 대장 프록시입니다. 결과가 살아남아야 실제 섹터/테마 데이터를 붙입니다.")
+
+    try:
+        import FinanceDataReader as fdr
+    except Exception as e:
+        st.error("FinanceDataReader가 필요합니다. requirements.txt에 finance-datareader를 추가해 주세요.")
+        st.exception(e); st.stop()
+
+    V2_START, V2_END = "2015-01-01", "2023-12-31"
+    V1_CKPT = Path("kr_support_v1_checkpoint.pkl.gz")
+    V2_CKPT = Path("kr_support_v2_leader_checkpoint.pkl.gz")
+
+    def _v2_save(path, obj):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with gzip.open(tmp, "wb", compresslevel=3) as f: pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+
+    def _v2_load(path, default):
+        try:
+            with gzip.open(path, "rb") as f: return pickle.load(f)
+        except Exception: return default
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def _v2_universe():
+        def norm(d, src):
+            if d is None or d.empty: return pd.DataFrame(columns=["Code","Name","Source"])
+            cc=next((c for c in ["Code","Symbol"] if c in d.columns),None)
+            nn=next((c for c in ["Name","Company"] if c in d.columns),None)
+            if not cc or not nn: return pd.DataFrame(columns=["Code","Name","Source"])
+            q=pd.DataFrame({"Code":d[cc].astype(str).str.zfill(6),"Name":d[nn].astype(str),"Source":src})
+            return q[q.Code.str.fullmatch(r"\d{6}",na=False)].drop_duplicates("Code")
+        fs=[norm(fdr.StockListing("KRX"),"현재상장")]
+        try: fs.append(norm(fdr.StockListing("KRX-DELISTING"),"상장폐지"))
+        except Exception: pass
+        return pd.concat(fs,ignore_index=True).drop_duplicates("Code",keep="first").reset_index(drop=True)
+
+    def _v2_price(code):
+        d=fdr.DataReader(str(code),V2_START,V2_END)
+        if d is None or d.empty: return pd.DataFrame()
+        d=d.copy(); d.index=pd.to_datetime(d.index).tz_localize(None)
+        need=["Open","High","Low","Close","Volume"]
+        if any(c not in d.columns for c in need): return pd.DataFrame()
+        for c in need: d[c]=pd.to_numeric(d[c],errors="coerce")
+        return d.dropna(subset=need).sort_index()
+
+    def _v2_lead_events(code,name,source,d):
+        if len(d)<130: return []
+        x=d.copy(); x["R1"]=x.Close.pct_change(); x["R20"]=x.Close.pct_change(20)
+        x["Amount"]=x.Close*x.Volume; x["H120"]=x.High.rolling(120,min_periods=60).max()
+        x["HighProx"]=x.Close/x.H120
+        # 넓게 수집: 당일 강세 또는 최근 20일 강한 상승. 순위는 전체 구축 후 날짜별로 계산.
+        m=((x.R1>=.08)|(x.R20>=.30)) & (x.index.year>=2015) & (x.index.year<=2023)
+        out=[]
+        for dt,r in x.loc[m,["R1","R20","Amount","HighProx"]].iterrows():
+            out.append({"Code":str(code),"Name":str(name),"Source":str(source),"Date":dt,
+                        "R1":float(r.R1) if np.isfinite(r.R1) else np.nan,
+                        "R20":float(r.R20) if np.isfinite(r.R20) else np.nan,
+                        "Amount":float(r.Amount) if np.isfinite(r.Amount) else np.nan,
+                        "HighProx":float(r.HighProx) if np.isfinite(r.HighProx) else np.nan})
+        return out
+
+    v1_restore=st.file_uploader("① 완성된 V1 체크포인트 복원",type=["gz"],key="sv2_v1_restore")
+    if v1_restore is not None and st.button("V1 체크포인트 복원",use_container_width=True,key="sv2_v1_btn"):
+        V1_CKPT.write_bytes(v1_restore.getvalue()); st.success("V1 체크포인트를 복원했습니다."); st.rerun()
+    v1=_v2_load(V1_CKPT,{})
+    v1rows=v1.get("rows",[]) if isinstance(v1,dict) else []
+    if not v1rows:
+        st.warning("먼저 완성된 kr_support_v1_checkpoint.pkl.gz를 복원해 주세요."); st.stop()
+
+    universe=_v2_universe()
+    batch=st.select_slider("한 번에 처리할 종목 수",options=[50,100,200,300,400,500],value=300,key="sv2_batch")
+    v2_restore=st.file_uploader("② V2 구축 체크포인트 복원",type=["gz"],key="sv2_restore")
+    if v2_restore is not None and st.button("V2 체크포인트 복원",use_container_width=True,key="sv2_restore_btn"):
+        V2_CKPT.write_bytes(v2_restore.getvalue()); st.success("V2 체크포인트를 복원했습니다."); st.rerun()
+    ck=_v2_load(V2_CKPT,{"done":{},"events":[]})
+    done=ck.get("done",{}); events=ck.get("events",[])
+    total=len(universe); processed=len(done)
+    a,b,c=st.columns(3); a.metric("전체 종목",f"{total:,}"); b.metric("완료",f"{processed:,}"); c.metric("강세 이벤트",f"{len(events):,}")
+    st.progress(min(processed/max(total,1),1.0),text=f"{processed:,}/{total:,}")
+
+    if st.button(f"▶ 다음 {batch}종목 대장 데이터 구축",type="primary",use_container_width=True,disabled=(processed>=total),key="sv2_build"):
+        pending=universe[~universe.Code.astype(str).isin(done)].head(batch); bar=st.progress(0.0); status=st.empty(); t0=time.time()
+        for k,(_,r) in enumerate(pending.iterrows(),1):
+            code=str(r.Code)
+            try:
+                d=_v2_price(code); add=_v2_lead_events(code,str(r.Name),str(r.Source),d) if not d.empty else []
+                events.extend(add); done[code]=len(add)
+            except Exception as e: done[code]=f"ERR:{type(e).__name__}"
+            if k%10==0 or k==len(pending): _v2_save(V2_CKPT,{"done":done,"events":events,"rule":"support_v2_dynamic_leader_proxy_locked"})
+            elapsed=time.time()-t0; rate=k/elapsed if elapsed else 0; eta=(len(pending)-k)/rate if rate else 0
+            bar.progress(k/max(len(pending),1),text=f"이번 묶음 {k}/{len(pending)}"); status.caption(f"{r.Name} ({code}) · {rate:.2f}종목/초 · 약 {eta/60:.1f}분")
+        st.success("이번 묶음 완료"); st.rerun()
+
+    if V2_CKPT.exists():
+        st.download_button("💾 V2 체크포인트 내려받기",data=V2_CKPT.read_bytes(),file_name="kr_support_v2_leader_checkpoint.pkl.gz",mime="application/gzip",use_container_width=True)
+
+    if processed>=total and events:
+        ev=pd.DataFrame(events); ev["Date"]=pd.to_datetime(ev.Date)
+        # 날짜별 상대 순위. 절대 거래대금 컷 대신 같은 날 후보군 내 순위를 사용한다.
+        ev["R1Rank"]=ev.groupby("Date")["R1"].rank(pct=True)
+        ev["AmtRank"]=ev.groupby("Date")["Amount"].rank(pct=True)
+        ev["HighRank"]=ev.groupby("Date")["HighProx"].rank(pct=True)
+        ev["LeaderScore"]=(ev.R1Rank.fillna(0)*.40+ev.AmtRank.fillna(0)*.40+ev.HighRank.fillna(0)*.20)
+        ev["LeaderTier"]=np.select([ev.LeaderScore>=.90,ev.LeaderScore>=.70],["대장 후보","2~3등 후보"],default="일반 강세주")
+        bycode={k:g.sort_values("Date") for k,g in ev.groupby("Code")}
+        matched=[]
+        for r in v1rows:
+            q=dict(r); code=str(q.get("Code","")); sd=pd.Timestamp(q.get("SignalDate"))
+            g=bycode.get(code)
+            tier="대장 이력 없음"; score=np.nan; lead_date=pd.NaT; days=np.nan
+            if g is not None and not g.empty:
+                h=g[(g.Date<sd)&(g.Date>=sd-pd.Timedelta(days=120))]
+                if not h.empty:
+                    z=h.sort_values(["LeaderScore","Date"],ascending=[False,False]).iloc[0]
+                    tier=str(z.LeaderTier); score=float(z.LeaderScore); lead_date=pd.Timestamp(z.Date); days=int((sd-lead_date).days)
+            q.update({"LeaderTier":tier,"DynamicLeaderScore":score,"LeaderEventDate":lead_date,"DaysFromLeaderEvent":days})
+            matched.append(q)
+        md=pd.DataFrame(matched)
+        st.subheader("V2 결과 · 누구의 지지선인가")
+        out=[]
+        for (period,tier),g in md.groupby(["Period","LeaderTier"]):
+            z=pd.to_numeric(g.R20,errors="coerce").dropna()
+            out.append({"구간":period,"분류":tier,"신호수":len(g),"R20 승률":float((z>0).mean()) if len(z) else np.nan,"R20 평균":float(z.mean()) if len(z) else np.nan,"R20 중앙값":float(z.median()) if len(z) else np.nan})
+        sm=pd.DataFrame(out).sort_values(["구간","분류"])
+        st.dataframe(sm.style.format({"R20 승률":"{:.2%}","R20 평균":"{:.2%}","R20 중앙값":"{:.2%}"},na_rep="-"),use_container_width=True,hide_index=True)
+        payload={"format":"kr_support_v2_leader_portable_v1","definition":"same-day dynamic leader proxy: R1 40% + Amount rank 40% + 120d-high proximity 20%","development":"2016-2021","validation":"2022-2023","signals":[]}
+        for r in matched:
+            q=dict(r)
+            for key in ["SignalDate","LeaderEventDate"]:
+                if key in q and pd.notna(q[key]): q[key]=pd.Timestamp(q[key]).strftime("%Y-%m-%d")
+                elif key in q: q[key]=None
+            for key,val in list(q.items()):
+                if isinstance(val,np.integer): q[key]=int(val)
+                elif isinstance(val,np.floating): q[key]=None if pd.isna(val) else float(val)
+            payload["signals"].append(q)
+        portable=gzip.compress(pickle.dumps(payload,protocol=4),compresslevel=3)
+        st.download_button("📦 V2 분석용 파일 내려받기",data=portable,file_name="kr_support_v2_leader_portable.pkl.gz",mime="application/gzip",use_container_width=True)
+        st.caption("V1 지지선 규칙은 변경하지 않았습니다. V2는 대장 이력 분류만 추가합니다. 이 단계에서는 실제 테마명을 사용하지 않습니다.")
+    else:
+        st.info("전체 종목 구축이 끝나면 날짜별 상대순위를 계산해 V1 신호를 대장/2~3등/일반으로 자동 분류합니다.")
+    st.stop()
 
 if page == "🇰🇷 반복 지지구간 V1":
     st.title("🇰🇷 반복 지지구간 V1")
