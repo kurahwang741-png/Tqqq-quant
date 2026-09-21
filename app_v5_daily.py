@@ -1075,7 +1075,7 @@ def trade_log_checksum(records):
 BLIND_TEST_PATH = Path("soxl_blind_20d.csv")
 
 def load_blind_test():
-    cols=["date","our1","our2","original1","original2","match1","match2","err1_pct","err2_pct","any_exact"]
+    cols=["date","our1","our2","original1","original2","original_weight1","original_weight2","match1","match2","err1_pct","err2_pct","any_exact"]
     try:
         if BLIND_TEST_PATH.exists() and BLIND_TEST_PATH.stat().st_size:
             df=pd.read_csv(BLIND_TEST_PATH)
@@ -1090,12 +1090,12 @@ def lock_blind_prices(trade_date, our1, our2):
     d=str(trade_date); df=load_blind_test()
     if len(df) and (df["date"].astype(str)==d).any(): return df
     row={"date":d,"our1":round(float(our1),2),"our2":round(float(our2),2),
-         "original1":np.nan,"original2":np.nan,"match1":np.nan,"match2":np.nan,
+         "original1":np.nan,"original2":np.nan,"original_weight1":np.nan,"original_weight2":np.nan,"match1":np.nan,"match2":np.nan,
          "err1_pct":np.nan,"err2_pct":np.nan,"any_exact":False}
     df=pd.concat([df,pd.DataFrame([row])],ignore_index=True)
     df.to_csv(BLIND_TEST_PATH,index=False); return df
 
-def save_blind_original(trade_date, original1, original2):
+def save_blind_original(trade_date, original1, original2, original_weight1=np.nan, original_weight2=np.nan):
     d=str(trade_date); df=load_blind_test(); mask=df["date"].astype(str)==d
     if not mask.any(): return df
     i=df.index[mask][-1]
@@ -1104,6 +1104,7 @@ def save_blind_original(trade_date, original1, original2):
     m1,m2=(y,x) if abs(a-y)+abs(b-x)<abs(a-x)+abs(b-y) else (x,y)
     e1=abs(a-m1)/m1 if m1 else np.nan; e2=abs(b-m2)/m2 if m2 else np.nan
     df.at[i,"original1"],df.at[i,"original2"]=x,y
+    df.at[i,"original_weight1"],df.at[i,"original_weight2"]=float(original_weight1),float(original_weight2)
     df.at[i,"match1"],df.at[i,"match2"]=m1,m2
     df.at[i,"err1_pct"],df.at[i,"err2_pct"]=e1,e2
     df.at[i,"any_exact"]=(round(a,2)==round(m1,2)) or (round(b,2)==round(m2,2))
@@ -2308,8 +2309,11 @@ try:
                     _b1,_b2=st.columns(2)
                     _o1=_b1.number_input("원본 LOC 1",min_value=0.0,step=0.01,format="%.2f",key=f"blind_o1_{_blind_date}")
                     _o2=_b2.number_input("원본 LOC 2",min_value=0.0,step=0.01,format="%.2f",key=f"blind_o2_{_blind_date}")
-                    if st.button("원본 가격 검증 저장",key=f"blind_save_{_blind_date}",use_container_width=True,disabled=(_o1<=0 or _o2<=0)):
-                        save_blind_original(_blind_date,_o1,_o2); st.rerun()
+                    _w1c,_w2c=st.columns(2)
+                    _ow1=_w1c.number_input("원본 비중 1 (%)",min_value=0.0,max_value=100.0,step=0.5,format="%.1f",key=f"blind_w1_{_blind_date}")
+                    _ow2=_w2c.number_input("원본 비중 2 (%)",min_value=0.0,max_value=100.0,step=0.5,format="%.1f",key=f"blind_w2_{_blind_date}")
+                    if st.button("원본 가격·비중 검증 저장",key=f"blind_save_{_blind_date}",use_container_width=True,disabled=(_o1<=0 or _o2<=0)):
+                        save_blind_original(_blind_date,_o1,_o2,_ow1,_ow2); st.rerun()
                     _done=load_blind_test().sort_values("date").tail(20).dropna(subset=["original1","original2"]).copy()
                     if len(_done):
                         _errs=pd.concat([pd.to_numeric(_done["err1_pct"],errors="coerce"),pd.to_numeric(_done["err2_pct"],errors="coerce")]).dropna()
@@ -2322,8 +2326,9 @@ try:
                         _show=_done.tail(20).copy()
                         _show["우리 LOC"]=_show.apply(lambda r:f"${float(r.our1):.2f} / ${float(r.our2):.2f}",axis=1)
                         _show["원본 LOC"]=_show.apply(lambda r:f"${float(r.original1):.2f} / ${float(r.original2):.2f}",axis=1)
+                        _show["원본 비중"]=_show.apply(lambda r:f"{float(r.original_weight1):.1f}% / {float(r.original_weight2):.1f}%" if pd.notna(r.original_weight1) and pd.notna(r.original_weight2) else "-",axis=1)
                         _show["오차"]=_show.apply(lambda r:f"{float(r.err1_pct):.3%} / {float(r.err2_pct):.3%}",axis=1)
-                        st.dataframe(_show[["date","우리 LOC","원본 LOC","오차"]],use_container_width=True,hide_index=True)
+                        st.dataframe(_show[["date","우리 LOC","원본 LOC","원본 비중","오차"]],use_container_width=True,hide_index=True)
                     else:
                         st.info("원본 가격을 입력하면 통계가 자동으로 쌓입니다.")
 
