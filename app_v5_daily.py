@@ -726,19 +726,33 @@ for key in ["backtest_result", "backtest_sims", "backtest_params"]:
 
 @st.cache_data(ttl=900)
 def download_close(symbols, market_day_key=None):
-    # market_day_key is intentionally part of the cache key.
-    # It forces a fresh Yahoo request when the U.S. calendar day changes.
-    raw = yf.download(
-        symbols,
-        period="max",
+    """장기 일봉 + 최근 14일 별도 재조회. 최근 데이터가 있으면 장기 데이터의 끝부분을 덮어쓴다."""
+    common = dict(
         interval="1d",
         auto_adjust=True,
         progress=False,
         group_by="column",
     )
 
-    if raw.empty:
+    raw_long = yf.download(symbols, period="max", **common)
+    # period=max 응답의 최신 구간이 늦는 경우가 있어 최근 구간을 별도로 재조회한다.
+    raw_recent = yf.download(
+        symbols,
+        period="14d",
+        **common,
+    )
+
+    if (raw_long is None or raw_long.empty) and (raw_recent is None or raw_recent.empty):
         raise ValueError("가격 데이터를 받지 못했습니다.")
+
+    if raw_long is None or raw_long.empty:
+        raw = raw_recent.copy()
+    elif raw_recent is None or raw_recent.empty:
+        raw = raw_long.copy()
+    else:
+        # 같은 날짜는 recent가 우선하도록 합친다.
+        raw = pd.concat([raw_long, raw_recent])
+        raw = raw[~raw.index.duplicated(keep="last")].sort_index()
 
     if isinstance(raw.columns, pd.MultiIndex):
         if "Close" in raw.columns.get_level_values(0):
@@ -755,7 +769,8 @@ def download_close(symbols, market_day_key=None):
     if isinstance(close, pd.Series):
         close = close.to_frame()
 
-    return close
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    return close.sort_index()
 
 
 
@@ -2299,6 +2314,28 @@ try:
                 f"상태 **{_fast_plan['state']}** · 위험점수 {_fast_plan.get('risk_score','-')}/10 · "
                 f"확정종가 ${_fast_prev:,.2f} · 추정 현재투입 {_fast_exp:.1%}"
             )
+
+            # 실전 안전장치: 평일 미국 장 시작 전인데 최신 일봉이 2일 이상 뒤처지면
+            # 오래된 주문가격을 정상 신호처럼 표시하지 않는다.
+            _stale_daily = False
+            try:
+                from zoneinfo import ZoneInfo
+                _fresh_now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+                _fresh_last = pd.Timestamp(_soxl_fast.index[-1]).date()
+                _gap = (_fresh_now_et.date() - _fresh_last).days
+                if _fresh_now_et.weekday() < 5 and _gap >= 2:
+                    _stale_daily = True
+            except Exception:
+                pass
+
+            if _stale_daily:
+                st.error(
+                    f"⛔ 최신 확정 일봉이 {_fresh_last}에 머물러 있어 오늘 실전 주문값을 잠갔습니다. "
+                    "최근 14일 데이터까지 별도 재조회했지만 최신 거래일을 받지 못했습니다. "
+                    "데이터가 갱신된 뒤 다시 확인하세요."
+                )
+                st.stop()
+
             _fast_rows = []
             _remaining_cash = _fast_cash
             for _i, (_px, _w) in enumerate(zip(_fast_buy, _fast_weights), 1):
