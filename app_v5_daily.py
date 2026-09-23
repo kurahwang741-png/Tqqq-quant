@@ -773,6 +773,72 @@ def download_close(symbols, market_day_key=None):
     return close.sort_index()
 
 
+@st.cache_data(ttl=300)
+def download_recent_intraday_daily_closes(symbols, market_day_key=None):
+    """최근 7일 1시간봉을 미국 거래일별 마지막 정규장 가격로 집계해 일봉 종가 보완용으로 사용."""
+    frames = {}
+    for symbol in symbols:
+        try:
+            h = yf.Ticker(symbol).history(
+                period="7d", interval="1h", prepost=False, auto_adjust=True
+            )
+            if h is None or h.empty or "Close" not in h.columns:
+                continue
+            s = h["Close"].dropna()
+            if s.empty:
+                continue
+            idx = pd.DatetimeIndex(s.index)
+            # yfinance US symbols normally return America/New_York-aware timestamps.
+            try:
+                if idx.tz is None:
+                    idx = idx.tz_localize("America/New_York")
+                else:
+                    idx = idx.tz_convert("America/New_York")
+            except Exception:
+                pass
+            tmp = pd.DataFrame({"Close": s.to_numpy()}, index=idx)
+            tmp["TradeDate"] = pd.DatetimeIndex(tmp.index).date
+            daily = tmp.groupby("TradeDate")["Close"].last()
+            daily.index = pd.to_datetime(daily.index)
+            frames[symbol] = daily
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.DataFrame(frames).sort_index()
+
+def merge_recent_fallback(close, symbols, market_day_key=None):
+    """일봉이 늦으면 최근 1시간봉 집계값으로 누락 거래일만 보완한다."""
+    base = close.copy()
+    recent = download_recent_intraday_daily_closes(symbols, market_day_key)
+    if recent is None or recent.empty:
+        return base, False, None
+    common = [s for s in symbols if s in recent.columns]
+    if len(common) != len(symbols):
+        return base, False, None
+    complete = recent[common].dropna()
+    if complete.empty:
+        return base, False, None
+
+    # 진행 중인 오늘 ET 거래일은 절대 보완하지 않는다. 전일까지의 완결된 거래일만 사용.
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+        complete = complete[pd.DatetimeIndex(complete.index).date < now_et.date()]
+    except Exception:
+        pass
+    if complete.empty:
+        return base, False, None
+
+    before = pd.Timestamp(base.dropna().index[-1]).date() if len(base.dropna()) else None
+    for dt, row in complete.iterrows():
+        for s in symbols:
+            base.loc[pd.Timestamp(dt), s] = float(row[s])
+    base = base.sort_index()
+    after = pd.Timestamp(base[common].dropna().index[-1]).date()
+    return base, (after != before), after
+
+
 
 def confirmed_us_daily_series(series):
     """미국 정규장 종료(ET 16:00) 전에는 오늘 진행 중인 일봉을 절대 신호에 사용하지 않는다."""
@@ -1895,6 +1961,10 @@ try:
         except Exception:
             _market_day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         close = download_close(symbols, _market_day_key).dropna()
+        close, _used_intraday_fallback, _fallback_last_date = merge_recent_fallback(
+            close, symbols, _market_day_key
+        )
+        close = close.dropna()
 
         # SOXL 연구용 원천 일봉을 한 번 저장해두면 이후에는 ChatGPT 쪽에서
         # Streamlit 재실행 없이 같은 데이터로 C-ORIGINAL / C-ALPHA를 반복 검증할 수 있습니다.
@@ -2255,6 +2325,17 @@ try:
             _fast_tp = 0.06 if soxl_track.startswith("C-ORIGINAL") else 0.05
             _fast_sell = [x * (1.0 + _fast_tp) for x in _fast_buy]
 
+            if st.session_state.get("_used_intraday_notice") is None:
+                st.session_state["_used_intraday_notice"] = False
+            try:
+                if _used_intraday_fallback:
+                    st.success(
+                        f"🛟 일봉 지연 보완 성공 · 최근 1시간봉을 거래일별 종가로 집계해 "
+                        f"{_fallback_last_date}까지 보완했습니다."
+                    )
+            except Exception:
+                pass
+
             _refresh_col1, _refresh_col2 = st.columns([2, 1])
             with _refresh_col2:
                 if st.button("🔄 오늘 데이터 강제 새로고침", use_container_width=True, key="force_daily_refresh"):
@@ -2331,8 +2412,8 @@ try:
             if _stale_daily:
                 st.error(
                     f"⛔ 최신 확정 일봉이 {_fresh_last}에 머물러 있어 오늘 실전 주문값을 잠갔습니다. "
-                    "최근 14일 데이터까지 별도 재조회했지만 최신 거래일을 받지 못했습니다. "
-                    "데이터가 갱신된 뒤 다시 확인하세요."
+                    "일봉 재조회와 최근 1시간봉 보완까지 시도했지만 최신 거래일을 확보하지 못했습니다. "
+                    "오래된 데이터로 주문하지 않도록 차단했습니다."
                 )
                 st.stop()
 
