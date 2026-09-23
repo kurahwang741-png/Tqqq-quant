@@ -725,7 +725,9 @@ for key in ["backtest_result", "backtest_sims", "backtest_params"]:
 
 
 @st.cache_data(ttl=900)
-def download_close(symbols):
+def download_close(symbols, market_day_key=None):
+    # market_day_key is intentionally part of the cache key.
+    # It forces a fresh Yahoo request when the U.S. calendar day changes.
     raw = yf.download(
         symbols,
         period="max",
@@ -1870,7 +1872,14 @@ try:
     # ------------------------------------------------------------
     if market.startswith("🇺🇸"):
         symbols = [us_product, "QQQ"] if us_product == "TQQQ" else ["SOXL", "QQQ", "SMH"]
-        close = download_close(symbols).dropna()
+        try:
+            from zoneinfo import ZoneInfo
+            _market_day_key = datetime.now(timezone.utc).astimezone(
+                ZoneInfo("America/New_York")
+            ).strftime("%Y-%m-%d")
+        except Exception:
+            _market_day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        close = download_close(symbols, _market_day_key).dropna()
 
         # SOXL 연구용 원천 일봉을 한 번 저장해두면 이후에는 ChatGPT 쪽에서
         # Streamlit 재실행 없이 같은 데이터로 C-ORIGINAL / C-ALPHA를 반복 검증할 수 있습니다.
@@ -2231,6 +2240,15 @@ try:
             _fast_tp = 0.06 if soxl_track.startswith("C-ORIGINAL") else 0.05
             _fast_sell = [x * (1.0 + _fast_tp) for x in _fast_buy]
 
+            _refresh_col1, _refresh_col2 = st.columns([2, 1])
+            with _refresh_col2:
+                if st.button("🔄 오늘 데이터 강제 새로고침", use_container_width=True, key="force_daily_refresh"):
+                    st.cache_data.clear()
+                    st.session_state["_force_refresh_done"] = True
+                    st.rerun()
+            if st.session_state.pop("_force_refresh_done", False):
+                st.success("최신 Yahoo 일봉 데이터를 다시 요청했습니다.")
+
             st.markdown("## ⚡ 오늘 SOXL 주문값 — 확정 일봉 잠금 🔒")
             st.caption("미국 정규장 종료 전에는 진행 중인 오늘 일봉을 제외합니다. 같은 확정 일봉 기준에서는 새로고침해도 주문가격이 바뀌지 않습니다.")
 
@@ -2260,11 +2278,20 @@ try:
                         f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
                     )
                 else:
-                    st.info(
-                        f"🟢 장 마감 전 · 최신 확정 일봉 {_last_bar_date} 기준 주문값 · "
-                        f"미국장 마감 후 다시 확인하면 다음 거래일 주문값이 갱신됩니다. "
-                        f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
-                    )
+                    # 장 마감 전이라도 전 거래일 데이터가 아직 Yahoo 응답에 없으면 사용자가 즉시 알 수 있게 한다.
+                    _days_gap = (_ny_now.date() - _last_bar_date).days
+                    if _ny_now.weekday() < 5 and _days_gap >= 2:
+                        st.warning(
+                            f"⚠️ 최신 확정 일봉이 {_last_bar_date}에 머물러 있습니다. "
+                            f"위의 '오늘 데이터 강제 새로고침'을 눌러 다시 받아보세요. "
+                            f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
+                        )
+                    else:
+                        st.info(
+                            f"🟢 장 마감 전 · 최신 확정 일봉 {_last_bar_date} 기준 주문값 · "
+                            f"미국장 마감 후 다시 확인하면 다음 거래일 주문값이 갱신됩니다. "
+                            f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
+                        )
             except Exception as _status_e:
                 st.caption(f"데이터 확정상태 확인 불가: {_status_e}")
 
