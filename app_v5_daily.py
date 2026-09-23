@@ -2300,11 +2300,21 @@ try:
             st.dataframe(pd.DataFrame(_fast_rows), use_container_width=True, hide_index=True)
 
             if len(_fast_buy) >= 2:
-                _blind_date=pd.Timestamp(_soxl_fast.index[-1]).date()
+                # 확정 일봉 날짜와 실제 주문일을 분리한다.
+                try:
+                    from zoneinfo import ZoneInfo
+                    _blind_now_et=datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+                    _last_signal_bar=pd.Timestamp(_soxl_fast.index[-1]).date()
+                    if _blind_now_et.weekday()<5 and _blind_now_et.date()>_last_signal_bar:
+                        _blind_date=_blind_now_et.date()
+                    else:
+                        _blind_date=_last_signal_bar
+                except Exception:
+                    _blind_date=pd.Timestamp(_soxl_fast.index[-1]).date()
                 _blind_df=lock_blind_prices(_blind_date,_fast_buy[0],_fast_buy[1])
                 _tb=_blind_df[_blind_df["date"].astype(str)==str(_blind_date)].iloc[-1]
                 with st.expander("🧪 20거래일 블라인드 검증", expanded=False):
-                    st.caption("우리 LOC는 그날 최초 계산값으로 잠깁니다. 원본 공개 후 원본 가격 2개만 입력하세요.")
+                    st.caption(f"주문일 {_blind_date} · 계산 기준 확정 일봉 {pd.Timestamp(_soxl_fast.index[-1]).date()} · 우리 LOC는 주문일 최초값으로 잠깁니다.")
                     st.write(f"🔒 잠긴 우리 LOC · **${float(_tb['our1']):,.2f} / ${float(_tb['our2']):,.2f}**")
                     _b1,_b2=st.columns(2)
                     _o1=_b1.number_input("원본 LOC 1",min_value=0.0,step=0.01,format="%.2f",key=f"blind_o1_{_blind_date}")
