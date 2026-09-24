@@ -1171,7 +1171,19 @@ def load_blind_test():
 
 def lock_blind_prices(trade_date, our1, our2, sell1=np.nan, sell2=np.nan, our_weight1=np.nan, our_weight2=np.nan):
     d=str(trade_date); df=load_blind_test()
-    if len(df) and (df["date"].astype(str)==d).any(): return df
+    _new_cols={"our_sell1":np.nan,"our_sell2":np.nan,"our_weight1":np.nan,"our_weight2":np.nan,
+               "original_sell1":np.nan,"original_sell2":np.nan,"original_sell_weight1":np.nan,
+               "original_sell_weight2":np.nan,"sell_err1_pct":np.nan,"sell_err2_pct":np.nan,"sell_any_exact":False}
+    for _c,_v in _new_cols.items():
+        if _c not in df.columns: df[_c]=_v
+    if len(df) and (df["date"].astype(str)==d).any():
+        _i=df.index[df["date"].astype(str)==d][-1]
+        df.at[_i,"our_sell1"]=round(float(sell1),2) if pd.notna(sell1) else np.nan
+        df.at[_i,"our_sell2"]=round(float(sell2),2) if pd.notna(sell2) else np.nan
+        df.at[_i,"our_weight1"]=float(our_weight1) if pd.notna(our_weight1) else np.nan
+        df.at[_i,"our_weight2"]=float(our_weight2) if pd.notna(our_weight2) else np.nan
+        df.to_csv(BLIND_TEST_PATH,index=False)
+        return df
     row={"date":d,"our1":round(float(our1),2),"our2":round(float(our2),2),
          "our_sell1":round(float(sell1),2) if pd.notna(sell1) else np.nan,
          "our_sell2":round(float(sell2),2) if pd.notna(sell2) else np.nan,
@@ -2460,6 +2472,15 @@ try:
                     "예상수량": f"{float(_fast_qty):g}주",
                 })
 
+            # 포지션과 무관한 블라인드용 매도 신호도 상단 주문표에 항상 표시
+            if len(_fast_buy) >= 2:
+                _display_sell=[float(_fast_buy[0])*(1.0+_fast_tp), float(_fast_buy[1])*(1.0+_fast_tp)]
+                for _j,_spx in enumerate(_display_sell):
+                    _sw=float(_fast_weights[_j]) if _j < len(_fast_weights) else 0.0
+                    _fast_rows.append({
+                        "주문":f"매도 {_j+1}","방식":"LOC","가격":f"${_spx:,.2f}",
+                        "실제 비중":f"{_sw:.1%}","주문금액":"블라인드","예상수량":"포지션 무관"
+                    })
             st.dataframe(pd.DataFrame(_fast_rows), use_container_width=True, hide_index=True)
 
             if len(_fast_buy) >= 2:
