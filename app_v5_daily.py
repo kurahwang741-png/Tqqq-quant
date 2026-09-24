@@ -1169,16 +1169,24 @@ def load_blind_test():
         pass
     return pd.DataFrame(columns=cols)
 
-def lock_blind_prices(trade_date, our1, our2):
+def lock_blind_prices(trade_date, our1, our2, sell1=np.nan, sell2=np.nan, our_weight1=np.nan, our_weight2=np.nan):
     d=str(trade_date); df=load_blind_test()
     if len(df) and (df["date"].astype(str)==d).any(): return df
     row={"date":d,"our1":round(float(our1),2),"our2":round(float(our2),2),
-         "original1":np.nan,"original2":np.nan,"original_weight1":np.nan,"original_weight2":np.nan,"match1":np.nan,"match2":np.nan,
-         "err1_pct":np.nan,"err2_pct":np.nan,"any_exact":False}
+         "our_sell1":round(float(sell1),2) if pd.notna(sell1) else np.nan,
+         "our_sell2":round(float(sell2),2) if pd.notna(sell2) else np.nan,
+         "our_weight1":float(our_weight1) if pd.notna(our_weight1) else np.nan,
+         "our_weight2":float(our_weight2) if pd.notna(our_weight2) else np.nan,
+         "original1":np.nan,"original2":np.nan,"original_weight1":np.nan,"original_weight2":np.nan,
+         "original_sell1":np.nan,"original_sell2":np.nan,"original_sell_weight1":np.nan,"original_sell_weight2":np.nan,
+         "match1":np.nan,"match2":np.nan,"err1_pct":np.nan,"err2_pct":np.nan,
+         "sell_err1_pct":np.nan,"sell_err2_pct":np.nan,"any_exact":False,"sell_any_exact":False}
     df=pd.concat([df,pd.DataFrame([row])],ignore_index=True)
     df.to_csv(BLIND_TEST_PATH,index=False); return df
 
-def save_blind_original(trade_date, original1, original2, original_weight1=np.nan, original_weight2=np.nan):
+def save_blind_original(trade_date, original1, original2, original_weight1=np.nan, original_weight2=np.nan,
+                        original_sell1=np.nan, original_sell2=np.nan,
+                        original_sell_weight1=np.nan, original_sell_weight2=np.nan):
     d=str(trade_date); df=load_blind_test(); mask=df["date"].astype(str)==d
     if not mask.any(): return df
     i=df.index[mask][-1]
@@ -1191,6 +1199,16 @@ def save_blind_original(trade_date, original1, original2, original_weight1=np.na
     df.at[i,"match1"],df.at[i,"match2"]=m1,m2
     df.at[i,"err1_pct"],df.at[i,"err2_pct"]=e1,e2
     df.at[i,"any_exact"]=(round(a,2)==round(m1,2)) or (round(b,2)==round(m2,2))
+
+    if pd.notna(original_sell1) and pd.notna(original_sell2) and float(original_sell1)>0 and float(original_sell2)>0:
+        sa,sb=float(df.at[i,"our_sell1"]),float(df.at[i,"our_sell2"])
+        sx,sy=float(original_sell1),float(original_sell2)
+        sm1,sm2=(sy,sx) if abs(sa-sy)+abs(sb-sx)<abs(sa-sx)+abs(sb-sy) else (sx,sy)
+        df.at[i,"original_sell1"],df.at[i,"original_sell2"]=sx,sy
+        df.at[i,"original_sell_weight1"],df.at[i,"original_sell_weight2"]=float(original_sell_weight1),float(original_sell_weight2)
+        df.at[i,"sell_err1_pct"]=abs(sa-sm1)/sm1 if sm1 else np.nan
+        df.at[i,"sell_err2_pct"]=abs(sb-sm2)/sm2 if sm2 else np.nan
+        df.at[i,"sell_any_exact"]=(round(sa,2)==round(sm1,2)) or (round(sb,2)==round(sm2,2))
     df.to_csv(BLIND_TEST_PATH,index=False); return df
 
 def load_position_state():
@@ -2456,19 +2474,34 @@ try:
                         _blind_date=_last_signal_bar
                 except Exception:
                     _blind_date=pd.Timestamp(_soxl_fast.index[-1]).date()
-                _blind_df=lock_blind_prices(_blind_date,_fast_buy[0],_fast_buy[1])
+                # 블라인드용 매도 신호는 실제 보유 LOT와 무관하게 매일 계산/잠금한다.
+                _blind_sell=[float(_fast_buy[0])*(1.0+_fast_tp), float(_fast_buy[1])*(1.0+_fast_tp)]
+                _blind_df=lock_blind_prices(
+                    _blind_date,_fast_buy[0],_fast_buy[1],
+                    _blind_sell[0],_blind_sell[1],
+                    float(_fast_weights[0])*100.0,float(_fast_weights[1])*100.0
+                )
                 _tb=_blind_df[_blind_df["date"].astype(str)==str(_blind_date)].iloc[-1]
                 with st.expander("🧪 20거래일 블라인드 검증", expanded=False):
                     st.caption(f"주문일 {_blind_date} · 계산 기준 확정 일봉 {pd.Timestamp(_soxl_fast.index[-1]).date()} · 우리 LOC는 주문일 최초값으로 잠깁니다.")
-                    st.write(f"🔒 잠긴 우리 LOC · **${float(_tb['our1']):,.2f} / ${float(_tb['our2']):,.2f}**")
+                    st.write(f"🔒 잠긴 우리 매수 LOC · **${float(_tb['our1']):,.2f} / ${float(_tb['our2']):,.2f}**")
+                    st.write(f"🔒 잠긴 우리 매도 LOC · **${float(_tb['our_sell1']):,.2f} / ${float(_tb['our_sell2']):,.2f}** · 보유 포지션과 무관")
+                    st.caption(f"우리 예측 매수비중 · {float(_tb['our_weight1']):.1f}% / {float(_tb['our_weight2']):.1f}%")
                     _b1,_b2=st.columns(2)
                     _o1=_b1.number_input("원본 LOC 1",min_value=0.0,step=0.01,format="%.2f",key=f"blind_o1_{_blind_date}")
                     _o2=_b2.number_input("원본 LOC 2",min_value=0.0,step=0.01,format="%.2f",key=f"blind_o2_{_blind_date}")
                     _w1c,_w2c=st.columns(2)
                     _ow1=_w1c.number_input("원본 비중 1 (%)",min_value=0.0,max_value=100.0,step=0.5,format="%.1f",key=f"blind_w1_{_blind_date}")
                     _ow2=_w2c.number_input("원본 비중 2 (%)",min_value=0.0,max_value=100.0,step=0.5,format="%.1f",key=f"blind_w2_{_blind_date}")
-                    if st.button("원본 가격·비중 검증 저장",key=f"blind_save_{_blind_date}",use_container_width=True,disabled=(_o1<=0 or _o2<=0)):
-                        save_blind_original(_blind_date,_o1,_o2,_ow1,_ow2); st.rerun()
+                    st.markdown("**원본 매도 신호**")
+                    _s1c,_s2c=st.columns(2)
+                    _os1=_s1c.number_input("원본 매도 LOC 1",min_value=0.0,step=0.01,format="%.2f",key=f"blind_s1_{_blind_date}")
+                    _os2=_s2c.number_input("원본 매도 LOC 2",min_value=0.0,step=0.01,format="%.2f",key=f"blind_s2_{_blind_date}")
+                    _sw1c,_sw2c=st.columns(2)
+                    _osw1=_sw1c.number_input("원본 매도 비중 1 (%)",min_value=0.0,max_value=100.0,step=0.5,format="%.1f",key=f"blind_sw1_{_blind_date}")
+                    _osw2=_sw2c.number_input("원본 매도 비중 2 (%)",min_value=0.0,max_value=100.0,step=0.5,format="%.1f",key=f"blind_sw2_{_blind_date}")
+                    if st.button("원본 매수·매도 가격/비중 검증 저장",key=f"blind_save_{_blind_date}",use_container_width=True,disabled=(_o1<=0 or _o2<=0)):
+                        save_blind_original(_blind_date,_o1,_o2,_ow1,_ow2,_os1,_os2,_osw1,_osw2); st.rerun()
                     _done=load_blind_test().sort_values("date").tail(20).dropna(subset=["original1","original2"]).copy()
                     if len(_done):
                         _errs=pd.concat([pd.to_numeric(_done["err1_pct"],errors="coerce"),pd.to_numeric(_done["err2_pct"],errors="coerce")]).dropna()
@@ -2481,9 +2514,13 @@ try:
                         _show=_done.tail(20).copy()
                         _show["우리 LOC"]=_show.apply(lambda r:f"${float(r.our1):.2f} / ${float(r.our2):.2f}",axis=1)
                         _show["원본 LOC"]=_show.apply(lambda r:f"${float(r.original1):.2f} / ${float(r.original2):.2f}",axis=1)
+                        _show["우리 비중"]=_show.apply(lambda r:f"{float(r.our_weight1):.1f}% / {float(r.our_weight2):.1f}%" if pd.notna(r.get("our_weight1")) and pd.notna(r.get("our_weight2")) else "-",axis=1)
                         _show["원본 비중"]=_show.apply(lambda r:f"{float(r.original_weight1):.1f}% / {float(r.original_weight2):.1f}%" if pd.notna(r.original_weight1) and pd.notna(r.original_weight2) else "-",axis=1)
-                        _show["오차"]=_show.apply(lambda r:f"{float(r.err1_pct):.3%} / {float(r.err2_pct):.3%}",axis=1)
-                        st.dataframe(_show[["date","우리 LOC","원본 LOC","원본 비중","오차"]],use_container_width=True,hide_index=True)
+                        _show["매수오차"]=_show.apply(lambda r:f"{float(r.err1_pct):.3%} / {float(r.err2_pct):.3%}",axis=1)
+                        _show["우리 매도"]=_show.apply(lambda r:f"${float(r.our_sell1):.2f} / ${float(r.our_sell2):.2f}" if pd.notna(r.get("our_sell1")) and pd.notna(r.get("our_sell2")) else "-",axis=1)
+                        _show["원본 매도"]=_show.apply(lambda r:f"${float(r.original_sell1):.2f} / ${float(r.original_sell2):.2f}" if pd.notna(r.get("original_sell1")) and pd.notna(r.get("original_sell2")) else "-",axis=1)
+                        _show["매도오차"]=_show.apply(lambda r:f"{float(r.sell_err1_pct):.3%} / {float(r.sell_err2_pct):.3%}" if pd.notna(r.get("sell_err1_pct")) and pd.notna(r.get("sell_err2_pct")) else "-",axis=1)
+                        st.dataframe(_show[["date","우리 LOC","원본 LOC","우리 비중","원본 비중","매수오차","우리 매도","원본 매도","매도오차"]],use_container_width=True,hide_index=True)
                     else:
                         st.info("원본 가격을 입력하면 통계가 자동으로 쌓입니다.")
 
