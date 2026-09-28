@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 import time
 import json
 import hashlib
@@ -2405,8 +2405,12 @@ try:
                     )
                 else:
                     # 장 마감 전이라도 전 거래일 데이터가 아직 Yahoo 응답에 없으면 사용자가 즉시 알 수 있게 한다.
-                    _days_gap = (_ny_now.date() - _last_bar_date).days
-                    if _ny_now.weekday() < 5 and _days_gap >= 2:
+                    _expected_prev = _ny_now.date()
+                    while True:
+                        _expected_prev -= timedelta(days=1)
+                        if _expected_prev.weekday() < 5:
+                            break
+                    if _last_bar_date < _expected_prev:
                         st.warning(
                             f"⚠️ 최신 확정 일봉이 {_last_bar_date}에 머물러 있습니다. "
                             f"위의 '오늘 데이터 강제 새로고침'을 눌러 다시 받아보세요. "
@@ -2433,15 +2437,19 @@ try:
                 from zoneinfo import ZoneInfo
                 _fresh_now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
                 _fresh_last = pd.Timestamp(_soxl_fast.index[-1]).date()
-                _gap = (_fresh_now_et.date() - _fresh_last).days
-                if _fresh_now_et.weekday() < 5 and _gap >= 2:
+                _expected = _fresh_now_et.date()
+                while True:
+                    _expected -= timedelta(days=1)
+                    if _expected.weekday() < 5:
+                        break
+                if _fresh_last < _expected:
                     _stale_daily = True
             except Exception:
                 pass
 
             if _stale_daily:
                 st.error(
-                    f"⛔ 최신 확정 일봉이 {_fresh_last}에 머물러 있어 오늘 실전 주문값을 잠갔습니다. "
+                    f"⛔ 최신 확정 일봉 {_fresh_last} / 기대 직전 거래일 {_expected} · 오늘 실전 주문값을 잠갔습니다. "
                     "일봉 재조회와 최근 1시간봉 보완까지 시도했지만 최신 거래일을 확보하지 못했습니다. "
                     "오래된 데이터로 주문하지 않도록 차단했습니다."
                 )
