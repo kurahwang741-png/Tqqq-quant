@@ -1473,6 +1473,7 @@ def simulate_soxl_reverse(
     slippage_pct=0.0,
     fx_cost_pct=0.0,
     deployment_ratio=1.0,
+    trade_start=None,
 ):
     """SOXL DUAL 백테스트 엔진.
 
@@ -1527,6 +1528,8 @@ def simulate_soxl_reverse(
                 alpha_rebound = True
                 alpha_boost_left = 3
 
+        _trade_enabled = trade_start is None or pd.Timestamp(dt).normalize() >= pd.Timestamp(trade_start).normalize()
+
         # 1) 기존 블록 청산
         remaining = []
         for lot in lots:
@@ -1547,7 +1550,7 @@ def simulate_soxl_reverse(
             hit_tp = px >= target
             forced = max_hold_days is not None and age >= int(max_hold_days)
             alpha_cash = soxl_track.startswith("C-ALPHA") and (alpha_fast or alpha_bear)
-            if hit_tp or forced or alpha_cash:
+            if _trade_enabled and (hit_tp or forced or alpha_cash):
                 sell_px = px * (1 - slippage_pct)
                 proceeds = lot["qty"] * sell_px * (1 - fee_pct - fx_cost_pct)
                 cash += proceeds
@@ -1569,7 +1572,7 @@ def simulate_soxl_reverse(
         lots = remaining
 
         # 2) 오늘 주문은 반드시 전일까지의 상태만 사용
-        if i > 0:
+        if i > 0 and _trade_enabled:
             mark_value = sum(lot["qty"] * px for lot in lots)
             equity_now = cash + mark_value
             max_invested = equity_now * float(deployment_ratio)
@@ -2601,6 +2604,83 @@ try:
             "4+4 / 5+5 / 6+6 / 7+7 매수비중을 자동 전환합니다. VIX는 제외했습니다. "
             "LOC 가격 격자는 V31과 동일하게 유지해 C타입 상태판단 자체의 효과를 먼저 비교합니다."
         )
+
+    st.markdown("---")
+    st.subheader("📈 1년 실전 모의검증 · Forward Test")
+    st.caption(
+        "실제 돈 없이 2026-09-30부터 현재 로직을 가상 $10,000로 전진검증합니다. "
+        "과거 데이터는 지표 계산에만 쓰고, 가상 매매는 시작일 이후에만 발생합니다."
+    )
+    _fwd_start = pd.Timestamp("2026-09-30")
+    _fwd_end = pd.Timestamp("2027-09-30")
+    _fwd_initial = 10000.0
+    try:
+        _fwd_df = pd.DataFrame({
+            "TRADE": close["SOXL"].astype(float),
+            "QQQ": close["QQQ"].astype(float),
+            "SMH": close["SMH"].astype(float),
+        }).dropna()
+
+        if len(_fwd_df) and pd.Timestamp(_fwd_df.index[-1]).normalize() >= _fwd_start:
+            _fwd_sim = simulate_soxl_reverse(
+                _fwd_df,
+                initial_cash=_fwd_initial,
+                base_unit=0.06,
+                take_profit=(0.06 if soxl_track.startswith("C-ORIGINAL") else 0.05),
+                max_hold_days=180,
+                fee_pct=0.0,
+                slippage_pct=0.0,
+                fx_cost_pct=0.0,
+                deployment_ratio=1.0,
+                trade_start=_fwd_start,
+            )
+            _fwd_eq = _fwd_sim["equity"].copy()
+            _fwd_eq = _fwd_eq[(_fwd_eq.index >= _fwd_start) & (_fwd_eq.index <= _fwd_end)]
+            if len(_fwd_eq):
+                _fv=float(_fwd_eq["Equity"].iloc[-1])
+                _fr=_fv/_fwd_initial-1.0
+                _peak=_fwd_eq["Equity"].cummax()
+                _fmdd=float((_fwd_eq["Equity"]/_peak-1.0).min())
+                _last=pd.Timestamp(_fwd_eq.index[-1]).date()
+                _cash=float(_fwd_eq["Cash"].iloc[-1])
+                _shares=float(_fwd_eq["Shares"].iloc[-1])
+                _exp=float(_fwd_eq["Exposure"].iloc[-1])
+
+                _bench_px=_fwd_df["TRADE"].loc[_fwd_df.index >= _fwd_start]
+                _bench_px=_bench_px.loc[_bench_px.index <= _fwd_eq.index[-1]]
+                _bhr=float(_bench_px.iloc[-1]/_bench_px.iloc[0]-1.0) if len(_bench_px)>=2 else 0.0
+
+                _c1,_c2,_c3,_c4=st.columns(4)
+                _c1.metric("가상자산",f"${_fv:,.2f}",f"{_fr:+.2%}")
+                _c2.metric("Forward MDD",f"{_fmdd:.2%}")
+                _c3.metric("SOXL Buy&Hold",f"{_bhr:+.2%}")
+                _c4.metric("현재 투입",f"{_exp:.1%}")
+                st.caption(
+                    f"시작 {_fwd_start.date()} · 종료 {_fwd_end.date()} · 최신 반영 {_last} · "
+                    f"현금 ${_cash:,.2f} · 가상 보유 {_shares:,.4f}주 · 트랙 {soxl_track}"
+                )
+
+                _chart=_fwd_eq[["Equity"]].copy()
+                _chart["SOXL Buy&Hold"]=_fwd_initial
+                if len(_bench_px):
+                    _bench_curve=(_bench_px/_bench_px.iloc[0])*_fwd_initial
+                    _chart["SOXL Buy&Hold"]=_bench_curve.reindex(_chart.index).ffill()
+                st.line_chart(_chart, use_container_width=True)
+
+                _fwd_trades=_fwd_sim.get("trades",pd.DataFrame())
+                if isinstance(_fwd_trades,pd.DataFrame) and len(_fwd_trades):
+                    _fwd_trades=_fwd_trades[pd.to_datetime(_fwd_trades["매도일"]) >= _fwd_start]
+                    with st.expander(f"📒 모의 체결/청산 기록 {_fwd_trades.shape[0]}건", expanded=False):
+                        st.dataframe(_fwd_trades.sort_values("매도일",ascending=False),use_container_width=True,hide_index=True)
+                else:
+                    st.info("아직 완료된 모의 매매가 없습니다. 거래일이 쌓이면 자동으로 누적됩니다.")
+            else:
+                st.info("Forward Test 시작일 이후 확정 일봉을 기다리는 중입니다.")
+        else:
+            st.info("2026-09-30 확정 데이터부터 1년 모의검증이 시작됩니다.")
+    except Exception as _fwd_e:
+        st.warning(f"Forward Test 계산 실패: {_fwd_e}")
+
     st.subheader("🏆 과거 백테스트 / 전략 자동 비교 (오늘 주문 확인에는 불필요)")
     if market.startswith("🇺🇸") and us_product == "SOXL":
         if soxl_track.startswith("C-ORIGINAL"):
