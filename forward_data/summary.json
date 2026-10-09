@@ -1,0 +1,17 @@
+{
+  "strategy": "C-ALPHA V1 (frozen 2026-10-09)",
+  "execution_model": "DAILY_CLOSE_PROXY_NOT_TRUE_LOC",
+  "start": "2026-09-30",
+  "end": "2027-09-30",
+  "initial_cash": 10000.0,
+  "last_bar": "2026-10-08",
+  "updated_at": "2026-10-09T14:56:02.317912+00:00",
+  "equity": 9605.536898029648,
+  "cash": 4064.657510456997,
+  "shares": 38.877906409404396,
+  "exposure": 0.576842236555172,
+  "return_pct": -3.944631019703515,
+  "mdd_pct": -5.414128800782225,
+  "buy_hold_return_pct": -3.611521923338057,
+  "closed_trades": 2
+}
