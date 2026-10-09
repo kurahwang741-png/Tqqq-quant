@@ -2606,6 +2606,31 @@ try:
         )
 
     st.markdown("---")
+    st.subheader("🤖 C-ALPHA V1 자동 모의투자 기록")
+    _auto_path = Path(__file__).resolve().parent / "forward_data" / "summary.json"
+    if _auto_path.exists():
+        try:
+            _auto = json.loads(_auto_path.read_text(encoding="utf-8"))
+            _aa, _bb, _cc = st.columns(3)
+            _aa.metric("가상자산", f"${_auto['equity']:,.2f}", f"{_auto['return_pct']:+.2f}%")
+            _bb.metric("MDD", f"{_auto['mdd_pct']:.2f}%")
+            _cc.metric("SOXL 단순보유", f"{_auto['buy_hold_return_pct']:+.2f}%")
+            st.caption(f"마지막 확정 일봉: {_auto['last_bar']} · 현금 ${_auto['cash']:,.2f} · "
+                       f"보유 {_auto['shares']:,.4f}주 · 체결모델: 종가 근사 (실제 LOC 체결 아님)")
+            _eq_path = _auto_path.parent / "equity.csv"
+            if _eq_path.exists():
+                _eq_auto = pd.read_csv(_eq_path, parse_dates=["Date"]).set_index("Date")
+                st.line_chart(_eq_auto[["Equity", "BuyHoldEquity"]].dropna(), use_container_width=True)
+            _tr_path = _auto_path.parent / "closed_trades.csv"
+            if _tr_path.exists():
+                with st.expander("자동 모의매매 청산 기록"):
+                    st.dataframe(pd.read_csv(_tr_path), use_container_width=True)
+        except Exception as _err:
+            st.warning(f"자동 모의투자 기록 읽기 실패: {_err}")
+    else:
+        st.info("아직 자동 기록이 없습니다. GitHub Actions에서 SOXL C-ALPHA V1 paper test를 한 번 실행하세요.")
+    st.caption("⚠️ 현재 V1은 기존 앱의 종가 체결 근사 엔진을 고정한 연구용 모의계좌입니다. 실제 LOC 주문 체결률과 다를 수 있습니다.")
+
     st.subheader("📈 1년 실전 모의검증 · Forward Test")
     st.caption(
         "실제 돈 없이 2026-09-30부터 현재 로직을 가상 $10,000로 전진검증합니다. "
