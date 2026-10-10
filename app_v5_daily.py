@@ -820,11 +820,16 @@ def merge_recent_fallback(close, symbols, market_day_key=None):
     if complete.empty:
         return base, False, None
 
-    # 진행 중인 오늘 ET 거래일은 절대 보완하지 않는다. 전일까지의 완결된 거래일만 사용.
+    # 장 마감 당일은 16:20 ET 이후에만 시간봉 종가 대용값을 허용한다.
+    # 주말에는 금요일 데이터를 정상적으로 허용한다.
     try:
         from zoneinfo import ZoneInfo
         now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
-        complete = complete[pd.DatetimeIndex(complete.index).date < now_et.date()]
+        cutoff = now_et.date()
+        if now_et.time() < datetime.strptime("16:20", "%H:%M").time():
+            complete = complete[pd.DatetimeIndex(complete.index).date < cutoff]
+        else:
+            complete = complete[pd.DatetimeIndex(complete.index).date <= cutoff]
     except Exception:
         pass
     if complete.empty:
@@ -2362,9 +2367,9 @@ try:
                 st.session_state["_used_intraday_notice"] = False
             try:
                 if _used_intraday_fallback:
-                    st.success(
-                        f"🛟 일봉 지연 보완 성공 · 최근 1시간봉을 거래일별 종가로 집계해 "
-                        f"{_fallback_last_date}까지 보완했습니다."
+                    st.warning(
+                        f"🛟 Yahoo 일봉 지연: {_fallback_last_date}까지 시간봉 마지막 가격으로 임시 보완했습니다. "
+                        "정식 일봉 종가와 차이가 있을 수 있으므로 LOC 주문 기준으로 사용하지 마세요."
                     )
             except Exception:
                 pass
@@ -2395,24 +2400,24 @@ try:
                 _after_close = (_ny_now.weekday() < 5 and _ny_now.time() >= datetime.strptime("16:00", "%H:%M").time())
                 _expected_today = _ny_now.date()
 
-                if _after_close and _last_bar_date >= _expected_today:
+                if _after_close and _last_bar_date >= _expected_today and not _used_intraday_fallback:
                     st.success(
                         f"✅ 오늘 데이터 확정됨 · SOXL 최신 일봉 {_last_bar_date} · "
                         f"한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M}"
                     )
-                elif _after_close:
+                elif _after_close and _last_bar_date < _expected_today:
                     st.warning(
                         f"⏳ 아직 오늘 일봉 업데이트 전 · 현재 최신 {_last_bar_date} · "
                         f"미국장 마감 후 데이터 반영을 기다리는 중입니다. "
                         f"(한국 {_kr_now:%H:%M} / 미국동부 {_ny_now:%H:%M})"
                     )
                 else:
-                    # 장 마감 전이라도 전 거래일 데이터가 아직 Yahoo 응답에 없으면 사용자가 즉시 알 수 있게 한다.
+                    # 주말/장 마감 전: 가장 최근 완료된 미국 거래일을 기준으로 확인한다.
                     _expected_prev = _ny_now.date()
-                    while True:
+                    if _ny_now.weekday() < 5 and _ny_now.time() < datetime.strptime("16:00", "%H:%M").time():
                         _expected_prev -= timedelta(days=1)
-                        if _expected_prev.weekday() < 5:
-                            break
+                    while _expected_prev.weekday() >= 5:
+                        _expected_prev -= timedelta(days=1)
                     if _last_bar_date < _expected_prev:
                         st.warning(
                             f"⚠️ 최신 확정 일봉이 {_last_bar_date}에 머물러 있습니다. "
@@ -2441,10 +2446,10 @@ try:
                 _fresh_now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
                 _fresh_last = pd.Timestamp(_soxl_fast.index[-1]).date()
                 _expected = _fresh_now_et.date()
-                while True:
+                if _fresh_now_et.weekday() < 5 and _fresh_now_et.time() < datetime.strptime("16:00", "%H:%M").time():
                     _expected -= timedelta(days=1)
-                    if _expected.weekday() < 5:
-                        break
+                while _expected.weekday() >= 5:
+                    _expected -= timedelta(days=1)
                 if _fresh_last < _expected:
                     _stale_daily = True
             except Exception:
